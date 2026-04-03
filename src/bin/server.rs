@@ -55,11 +55,51 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // Initialize direct API proxy (conservative: 1 concurrent request)
+    let proxy = match claude_agent::auth::get_oauth_token() {
+        Ok(token) => {
+            tracing::info!(
+                "OAuth token loaded (subscription: {:?}, tier: {:?})",
+                token.subscription_type, token.rate_limit_tier
+            );
+            Some(Arc::new(claude_agent::proxy::ProxyState::new(1)))
+        }
+        Err(e) => {
+            tracing::warn!("Direct API proxy disabled: {}", e);
+            None
+        }
+    };
+
+    // Run quota pre-check if proxy is enabled
+    if let Some(ref ps) = proxy {
+        claude_agent::proxy::check_quota_at_startup(ps).await;
+    }
+
+    let proxy_sessions = proxy.as_ref().map(|_| {
+        Arc::new(claude_agent::proxy_session::ProxySessionStore::new())
+    });
+
+    // Spawn proxy session cleanup task
+    if let Some(ref ps) = proxy_sessions {
+        let cleanup_store = ps.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                let removed = cleanup_store.cleanup().await;
+                if removed > 0 {
+                    tracing::info!("Cleaned up {} idle proxy session(s)", removed);
+                }
+            }
+        });
+    }
+
     let state = AppState {
         config: config.clone(),
         sessions,
         start_time: std::time::Instant::now(),
         stats: Arc::new(tokio::sync::Mutex::new(Stats::default())),
+        proxy,
+        proxy_sessions,
     };
 
     let app = api::build_router(state);

@@ -10,3 +10,7 @@ pub mod mcp;
 pub mod api;
 pub mod query;
 pub mod client;
+pub mod auth;
+pub mod models;
+pub mod proxy;
+pub mod proxy_session;
