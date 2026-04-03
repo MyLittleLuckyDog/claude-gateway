@@ -1,52 +1,50 @@
 # claude-gateway
 
 Claude Code CLI를 래핑하는 Rust 네이티브 REST API 게이트웨이.
-단일 바이너리로 배포되며, Claude Code 월정액 구독만으로 API 키 없이 동작합니다.
+단일 바이너리로 배포되며, Claude Code 구독만으로 API 키 없이 동작합니다.
 
-## 개요
+## 두 가지 모드
+
+| 모드 | 경로 | 설명 |
+|------|------|------|
+| **Proxy (Direct API)** | `/v1/*` | OAuth 토큰으로 Messages API 직접 호출. 빠르고 모델 선택 자유 |
+| **CLI Wrap** | `/query`, `/sessions` | Claude Code CLI를 subprocess로 실행. 도구 내장 |
 
 ```
-Client  ──HTTP/SSE──▶  claude-gateway  ──stdin/stdout──▶  claude CLI (subprocess)
+                          ┌─ /v1/*  ──▶  api.anthropic.com (OAuth Bearer)
+Client ──HTTP──▶ gateway ─┤
+                          └─ /query ──▶  claude CLI (subprocess)
 ```
-
-- **단일 바이너리**: Rust로 빌드, Node.js는 CLI 실행에만 필요
-- **세션 관리**: Multi-turn 대화, 세션 fork, 히스토리 조회
-- **실시간 스트리밍**: SSE(Server-Sent Events)로 응답 실시간 수신
-- **Hook 시스템**: 도구 실행 전 승인/차단/위임 제어
-- **MCP 지원**: 외부 MCP 서버 연결
 
 ## 사전 요구사항
 
 | 항목 | 설명 |
 |------|------|
-| **Claude Code CLI** | `npm install -g @anthropic-ai/claude-code` |
-| **Claude Code 구독** | 월정액 (API 키 불필요) |
-| **Node.js** | v18+ (CLI 실행용) |
+| **Claude Code** | 설치 + 로그인 완료 (`claude` 명령 실행 가능) |
+| **Claude Code 구독** | Max / Pro / Team / Enterprise |
+| **Node.js** | v18+ (CLI 모드 전용) |
 
 ```bash
-# CLI 설치 확인
-claude --version
+claude --version   # CLI 설치 확인
 ```
 
-## 빌드
+## 빌드 & 실행
 
 ```bash
 cargo build --release
+./target/release/claude-agent-rs                # 기본 127.0.0.1:8765
+./target/release/claude-agent-rs --port 9000    # 포트 변경
+./target/release/claude-agent-rs --check-cli    # CLI 확인만
 ```
 
-바이너리: `target/release/claude-agent-rs`
+서버 시작 시 자동으로:
+1. Keychain에서 OAuth 토큰 로드
+2. Quota 사전 확인 (rate limit 상태 캐시)
 
-## 실행
-
-```bash
-# 기본 (127.0.0.1:8765)
-./claude-agent-rs
-
-# 포트/호스트 지정
-./claude-agent-rs --port 9000 --host 0.0.0.0
-
-# CLI 설치 확인만
-./claude-agent-rs --check-cli
+```
+INFO OAuth token loaded (subscription: max, tier: default_claude_max_20x)
+INFO Quota pre-check complete: status=allowed, 5h=22%, 7d=2%
+INFO Starting claude-agent-rs on 127.0.0.1:8765
 ```
 
 ### 설정
@@ -65,26 +63,180 @@ session_idle_timeout_secs = 1800 # 30분
 ```
 
 환경변수: `CLAUDE_GATEWAY__SERVER__PORT=9000`
-
 로그: `RUST_LOG=debug ./claude-agent-rs`
 
-## API
+---
 
-### 관리
+## Proxy 모드 API (`/v1/*`)
+
+OAuth 토큰으로 Anthropic Messages API를 직접 호출합니다.
+CLI subprocess 오버헤드 없이 빠르고, Haiku/Sonnet/Opus 자유 선택 가능.
+
+### 모델 별칭
+
+| 별칭 | 정규 ID |
+|------|---------|
+| `haiku` | `claude-haiku-4-5-20251001` |
+| `sonnet` | `claude-sonnet-4-6` |
+| `sonnet4` | `claude-sonnet-4-20250514` |
+| `opus` | `claude-opus-4-6` |
+
+정규 ID를 직접 써도 됩니다.
+
+### 단일 요청 (Stateless)
 
 ```bash
-GET  /health    # 서버 상태
-GET  /stats     # 누적 통계 (tokens, cost)
-GET  /config    # 현재 설정
+# 동기 응답
+curl -X POST http://localhost:8765/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "haiku",
+    "max_tokens": 100,
+    "system": "계산기. 숫자만 답해.",
+    "messages": [{"role": "user", "content": "2+2"}]
+  }'
+
+# SSE 스트리밍
+curl -N -X POST http://localhost:8765/v1/messages/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "sonnet",
+    "max_tokens": 500,
+    "messages": [{"role": "user", "content": "Rust의 장점"}]
+  }'
 ```
+
+`max_tokens` 생략 시 기본값 8,000 적용.
+
+### 멀티턴 세션
+
+서버가 messages 배열을 관리합니다. 클라이언트는 매 턴 새 메시지만 보냅니다.
+
+```bash
+# 1. 세션 생성
+curl -X POST http://localhost:8765/v1/sessions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "haiku",
+    "system": "너는 수학 튜터. 간결하게 답해."
+  }'
+# → {"id": "abc-123", "model": "claude-haiku-4-5-20251001", ...}
+
+# 2. 메시지 전송 (이전 대화 자동 포함)
+curl -X POST http://localhost:8765/v1/sessions/abc-123/msg \
+  -H "Content-Type: application/json" \
+  -d '{"content": "피타고라스 정리가 뭐야?"}'
+
+# 3. 후속 질문 (대화 맥락 유지)
+curl -X POST http://localhost:8765/v1/sessions/abc-123/msg \
+  -H "Content-Type: application/json" \
+  -d '{"content": "그걸로 빗변 5, 한 변 3인 삼각형 풀어봐"}'
+
+# 4. 세션 상태 조회
+curl http://localhost:8765/v1/sessions/abc-123
+
+# 5. 세션 목록
+curl http://localhost:8765/v1/sessions
+
+# 6. 세션 삭제
+curl -X DELETE http://localhost:8765/v1/sessions/abc-123
+```
+
+#### 세션 생성 옵션
+
+```json
+{
+  "model": "haiku",
+  "system": "시스템 프롬프트",
+  "max_tokens": 1000,
+  "temperature": 0.7,
+  "tools": [{"name": "...", "description": "...", "input_schema": {...}}],
+  "tool_choice": {"type": "auto"},
+  "betas": ["extra-beta-header"]
+}
+```
+
+#### tool_use 라운드트립
+
+```bash
+# 1. tool 정의된 세션 생성
+curl -X POST http://localhost:8765/v1/sessions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "haiku",
+    "system": "Use get_weather when asked about weather.",
+    "tools": [{
+      "name": "get_weather",
+      "description": "Get weather for a city",
+      "input_schema": {
+        "type": "object",
+        "properties": {"city": {"type": "string"}},
+        "required": ["city"]
+      }
+    }]
+  }'
+
+# 2. 질문 → stop_reason: "tool_use" 응답
+curl -X POST http://localhost:8765/v1/sessions/{id}/msg \
+  -d '{"content": "서울 날씨 어때?"}'
+# → content: [{type: "tool_use", id: "toolu_xxx", name: "get_weather", input: {city: "서울"}}]
+
+# 3. tool 결과 반환
+curl -X POST http://localhost:8765/v1/sessions/{id}/msg \
+  -H "Content-Type: application/json" \
+  -d '{
+    "is_tool_result": true,
+    "content": [{
+      "type": "tool_result",
+      "tool_use_id": "toolu_xxx",
+      "content": "서울: 맑음, 18도"
+    }]
+  }'
+# → assistant가 tool 결과를 기반으로 자연어 응답
+```
+
+### 모니터링
+
+```bash
+# OAuth 토큰 상태
+curl http://localhost:8765/v1/auth_status
+# → {"authenticated": true, "subscription_type": "max", "token_valid": true, ...}
+
+# Rate limit 사용률
+curl http://localhost:8765/v1/rate_limit
+# → {"status": "allowed", "utilization_5h": 0.22, "utilization_7d": 0.02, ...}
+
+# 프록시 누적 통계
+curl http://localhost:8765/v1/proxy_stats
+# → {"total_requests": 15, "total_input_tokens": 3200, "total_output_tokens": 1500, ...}
+```
+
+### 트래픽 관리 규칙
+
+| 상황 | 동작 |
+|------|------|
+| 서버 시작 | Quota 사전 확인 (rate limit 상태 캐시) |
+| 매 요청 전 | 캐시된 상태 확인 → `rejected`면 API 호출 없이 거부 + 리셋 시간 안내 |
+| 리셋 시간 경과 | 자동 해제, 다음 요청 허용 |
+| 429 (rate limit) | 재시도 없이 즉시 반환 + 상태 캐시 |
+| 529 (overloaded) | 최대 3회 지수 백오프 재시도 (500ms base) |
+| 401 | 토큰 캐시 무효화 → `claude /login` 안내 |
+| 컨텍스트 200K 근접 | 세션 메시지 추가 거부 + 새 세션 안내 |
+| 세션 30분 미사용 | 자동 정리 |
+
+---
+
+## CLI Wrap 모드 (`/query`, `/sessions`)
+
+Claude Code CLI를 subprocess로 실행합니다. 파일 읽기/쓰기, bash 실행 등 CLI 도구가 필요할 때 사용.
 
 ### 단일 쿼리
 
 ```bash
-# 동기 응답
+# 동기
 curl -X POST http://localhost:8765/query \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "2+2는?", "options": {"max_turns": 1, "permission_mode": "plan"}}'
+  -d '{"prompt": "hello", "options": {"max_turns": 1, "permission_mode": "plan"}}'
 
 # SSE 스트리밍
 curl -N -X POST http://localhost:8765/query/stream \
@@ -97,21 +249,17 @@ curl -N -X POST http://localhost:8765/query/stream \
 ```bash
 # 생성
 curl -X POST http://localhost:8765/sessions \
-  -H "Content-Type: application/json" \
   -d '{"options": {"permission_mode": "plan"}}'
 
 # 메시지 전송
 curl -X POST http://localhost:8765/sessions/{id}/send \
-  -H "Content-Type: application/json" \
   -d '{"message": "내 이름은 Alex야"}'
 
 # SSE 구독 (히스토리 포함)
 curl -N http://localhost:8765/sessions/{id}/stream
 
-# 히스토리 조회
-curl "http://localhost:8765/sessions/{id}/messages?limit=50"
-
-# 세션 목록 / 삭제 / 분기 / 중단
+# 히스토리 / 목록 / 삭제 / 분기 / 중단
+GET    /sessions/{id}/messages?limit=50
 GET    /sessions
 DELETE /sessions/{id}
 POST   /sessions/{id}/fork
@@ -119,8 +267,6 @@ POST   /sessions/{id}/interrupt
 ```
 
 ### Hook 시스템
-
-세션 생성 시 서버사이드 규칙 설정:
 
 ```json
 {
@@ -134,69 +280,41 @@ POST   /sessions/{id}/interrupt
 }
 ```
 
-SSE로 수신한 `hook_request`에 30초 내 응답:
+### 관리 API
 
 ```bash
-curl -X POST http://localhost:8765/sessions/{id}/hook_response \
-  -H "Content-Type: application/json" \
-  -d '{"hook_id": "hook-001", "decision": "approve"}'
+GET /health     # 서버 상태
+GET /stats      # 누적 통계
+GET /config     # 현재 설정
 ```
 
-### MCP 서버 연결
-
-```json
-{
-  "options": {
-    "mcp_servers": {
-      "filesystem": {
-        "type": "stdio",
-        "command": "npx",
-        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-      }
-    }
-  }
-}
-```
+---
 
 ## 아키텍처
 
 ```
 src/
-├── bin/server.rs      # 엔트리포인트 (axum 서버)
-├── api/               # HTTP 핸들러 (sessions, hooks, query, admin)
-├── session/           # 세션 상태 관리 + store
-├── transport/         # CLI subprocess 통신 (stdin/stdout NDJSON)
-├── messages/          # 메시지 타입 (cli_input, cli_output, content)
-���── hooks/             # Hook 자동 규칙 + 타임아웃
-├── mcp/               # MCP 서버 설��� 파일 생성
-├── permissions/       # 권한 모드
-├── client.rs          # 세션 생성 + 이벤트 루프
-├── query.rs           # 단일 쿼리 / 스트리밍 쿼리
-├── config.rs          # 설정 로드 (TOML + 환경변수)
-├── options.rs         # ClaudeAgentOptions
-└── error.rs           # 에러 타입 + HTTP 매핑
+├── bin/server.rs          # 엔트리포인트 (axum 서버)
+├── api/
+│   ├── proxy.rs           # /v1/messages (Direct API)
+│   ├── proxy_sessions.rs  # /v1/sessions (Multi-turn)
+│   ├── sessions.rs        # /sessions (CLI wrap)
+│   ├── query.rs           # /query (CLI wrap)
+│   ├── hooks.rs           # /sessions/:id/hook_response
+│   └── admin.rs           # /health, /stats, /config
+├── auth.rs                # OAuth 토큰 (Keychain 읽기 전용)
+├── models.rs              # 모델 카탈로그, 상수, 별칭
+├── proxy.rs               # Messages API 프록시 + rate limit + retry
+├── proxy_session.rs       # 프록시 세션 store
+├── session/               # CLI wrap 세션
+├── transport/             # CLI subprocess 통신
+├── messages/              # CLI NDJSON 메시지 타입
+├── hooks/                 # Hook 규칙 + 타임아웃
+├── mcp/                   # MCP 서버 설정
+├── config.rs              # TOML + 환경변수 설정
+├── options.rs             # ClaudeAgentOptions
+└── error.rs               # 에러 타입
 ```
-
-## 에러 응답
-
-```json
-{
-  "error": {
-    "code": "session_not_found",
-    "message": "Session abc123 not found"
-  }
-}
-```
-
-| code | HTTP | 설명 |
-|------|------|------|
-| `cli_not_found` | 503 | claude CLI 미설치 |
-| `cli_connection` | 502 | subprocess spawn 실패 |
-| `process_error` | 502 | CLI 비정상 종료 |
-| `session_not_found` | 404 | 세션 없음 |
-| `invalid_state` | 409 | ���못된 상태 전이 |
-| `rate_limited` | 429 | 동시 세션 한도 초과 |
-| `hook_timeout` | 408 | hook 응답 30초 초과 |
 
 ## 라이선스
 
