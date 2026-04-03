@@ -1,0 +1,296 @@
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
+    routing::{delete, get, post},
+    Json, Router,
+};
+use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::AppState;
+use crate::client;
+use crate::error::{ErrorResponse, GatewayError};
+use crate::messages::Message;
+use crate::messages::cli_input::{CliInputMessage, CliUserInput, InputContent, ImageSource};
+use crate::options::ClaudeAgentOptions;
+use crate::session::SessionState;
+
+#[derive(Deserialize)]
+pub struct CreateSessionRequest {
+    #[serde(default)]
+    pub options: Option<ClaudeAgentOptions>,
+}
+
+#[derive(Serialize)]
+pub struct CreateSessionResponse {
+    pub session_id: String,
+    pub state: String,
+}
+
+#[derive(Deserialize)]
+pub struct SendRequest {
+    pub message: String,
+    #[serde(default)]
+    pub image_base64: Option<String>,
+    #[serde(default)]
+    pub image_media_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct MessagesQuery {
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+    #[serde(default)]
+    pub include_system: bool,
+}
+
+fn default_limit() -> usize { 50 }
+
+pub fn routes() -> Router<AppState> {
+    Router::new()
+        .route("/sessions", post(create_session))
+        .route("/sessions", get(list_sessions))
+        .route("/sessions/:id", delete(delete_session))
+        .route("/sessions/:id/send", post(send_message))
+        .route("/sessions/:id/stream", get(stream_session))
+        .route("/sessions/:id/messages", get(get_messages))
+        .route("/sessions/:id/fork", post(fork_session))
+}
+
+async fn create_session(
+    State(state): State<AppState>,
+    Json(req): Json<CreateSessionRequest>,
+) -> Response {
+    let options = req.options.unwrap_or_default();
+    match client::create_session(options, state.sessions.clone(), state.config.clone()).await {
+        Ok(session) => {
+            let resp = CreateSessionResponse {
+                session_id: session.id.clone(),
+                state: session.state.lock().await.to_string(),
+            };
+            (StatusCode::CREATED, Json(resp)).into_response()
+        }
+        Err(e) => error_response(&e),
+    }
+}
+
+async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
+    let sessions = state.sessions.list();
+    let mut list = Vec::new();
+    for s in sessions {
+        let st = s.state.lock().await.to_string();
+        list.push(serde_json::json!({
+            "session_id": s.id,
+            "state": st,
+            "created_at_secs": s.created_at.elapsed().as_secs(),
+        }));
+    }
+    Json(serde_json::json!(list))
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    if state.sessions.remove(&id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        error_response(&GatewayError::SessionNotFound(id))
+    }
+}
+
+async fn send_message(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SendRequest>,
+) -> Response {
+    let session = match state.sessions.get(&id) {
+        Ok(s) => s,
+        Err(e) => return error_response(&e),
+    };
+
+    // Atomic check-and-set: acquire lock once, verify state, transition to Running
+    {
+        let mut current_state = session.state.lock().await;
+        match &*current_state {
+            SessionState::Initializing | SessionState::Idle | SessionState::Completed => {
+                *current_state = SessionState::Running;
+            }
+            other => {
+                return error_response(&GatewayError::InvalidSessionState {
+                    expected: "initializing, idle, or completed".to_string(),
+                    actual: other.to_string(),
+                });
+            }
+        }
+    }
+
+    // Build message
+    let mut content = vec![InputContent::Text { text: req.message }];
+    if let (Some(data), Some(media_type)) = (req.image_base64, req.image_media_type) {
+        content.push(InputContent::Image {
+            source: ImageSource {
+                source_type: "base64".to_string(),
+                media_type,
+                data,
+            },
+        });
+    }
+
+    let msg = CliInputMessage::User {
+        message: CliUserInput {
+            role: "user".to_string(),
+            content,
+        },
+    };
+
+    let json = match serde_json::to_string(&msg) {
+        Ok(j) => j,
+        Err(e) => return error_response(&GatewayError::Internal(format!("JSON error: {}", e))),
+    };
+
+    // Lock-free activity timestamp
+    session.last_activity_ms.store(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+
+    match session.stdin_tx.send(json).await {
+        Ok(_) => (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response(),
+        Err(_) => error_response(&GatewayError::Internal("stdin closed".to_string())),
+    }
+}
+
+async fn stream_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let session = match state.sessions.get(&id) {
+        Ok(s) => s,
+        Err(e) => return error_response(&e),
+    };
+
+    // Clone Arc refs (cheap) not full Messages
+    let history: Vec<Arc<Message>> = session.history.lock().await.iter().cloned().collect();
+    let mut rx = session.event_tx.subscribe();
+
+    let stream = async_stream::stream! {
+        // Send history first
+        for (idx, msg) in history.iter().enumerate() {
+            if let Ok(data) = serde_json::to_string(msg.as_ref()) {
+                yield Ok::<_, axum::Error>(Event::default().id(idx.to_string()).data(data));
+            }
+        }
+
+        let mut current_idx = history.len();
+        loop {
+            match rx.recv().await {
+                Ok(msg) => {
+                    let is_terminal = matches!(msg.as_ref(), Message::Result { .. } | Message::Error { .. });
+                    if let Ok(data) = serde_json::to_string(msg.as_ref()) {
+                        yield Ok(Event::default().id(current_idx.to_string()).data(data));
+                    }
+                    current_idx += 1;
+                    if is_terminal {
+                        // Don't break for multi-turn — wait for more
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    let err = serde_json::json!({"type":"error","message":format!("Lagged: {} events skipped", n),"code":"stream_lagged"});
+                    yield Ok(Event::default().data(err.to_string()));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+}
+
+async fn get_messages(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(params): Query<MessagesQuery>,
+) -> Response {
+    let session = match state.sessions.get(&id) {
+        Ok(s) => s,
+        Err(e) => return error_response(&e),
+    };
+
+    let history = session.history.lock().await;
+    let filtered: Vec<&Message> = history.iter()
+        .map(|m| m.as_ref())
+        .filter(|m| {
+            if !params.include_system {
+                !matches!(m, Message::System { .. })
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let total = filtered.len();
+    let messages: Vec<_> = filtered.into_iter()
+        .skip(params.offset)
+        .take(params.limit)
+        .collect();
+
+    Json(serde_json::json!({
+        "session_id": id,
+        "total": total,
+        "messages": messages,
+    })).into_response()
+}
+
+async fn fork_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let session = match state.sessions.get(&id) {
+        Ok(s) => s,
+        Err(e) => return error_response(&e),
+    };
+
+    // Get the CLI session ID to use with --resume
+    let cli_session_id = session.cli_session_id.lock().await.clone();
+    let cli_session_id = match cli_session_id {
+        Some(id) => id,
+        None => {
+            return error_response(&GatewayError::InvalidSessionState {
+                expected: "session with CLI session ID".to_string(),
+                actual: "no CLI session ID (not yet initialized)".to_string(),
+            });
+        }
+    };
+
+    // Create new session with --resume pointing to the original CLI session
+    let mut new_options = session.options.clone();
+    new_options.resume = Some(cli_session_id);
+
+    match client::create_session(new_options, state.sessions.clone(), state.config.clone()).await {
+        Ok(new_session) => {
+            let resp = CreateSessionResponse {
+                session_id: new_session.id.clone(),
+                state: new_session.state.lock().await.to_string(),
+            };
+            (StatusCode::CREATED, Json(resp)).into_response()
+        }
+        Err(e) => error_response(&e),
+    }
+}
+
+fn error_response(e: &GatewayError) -> Response {
+    let status = axum::http::StatusCode::from_u16(e.http_status())
+        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(ErrorResponse::from(e))).into_response()
+}

@@ -1,0 +1,1 @@
+{"type":"hook_request","hook_id":"hook-uuid-001","session_id":"550e8400-e29b-41d4-a716-446655440000","hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{"file_path":"/src/main.rs","old_string":"fn main()","new_string":"fn main() -> Result<()>"}}

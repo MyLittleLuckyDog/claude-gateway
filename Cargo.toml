@@ -1,14 +1,65 @@
 [package]
-name = "claude-gateway"
+name = "claude-agent-rs"
 version = "0.1.0"
 edition = "2021"
-description = "Claude Code CLI 래핑 REST API 게이트웨이"
+description = "Claude Code CLI wrapper REST API gateway"
+
+[[bin]]
+name = "claude-agent-rs"
+path = "src/bin/server.rs"
+
+[lib]
+name = "claude_agent"
+path = "src/lib.rs"
 
 [dependencies]
-axum = "0.8"
+# Web
+axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
+
+# HTTP client (MCP HTTP client)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tower-http = { version = "0.6", features = ["cors"] }
+
+# Concurrency
+dashmap = "5"
+futures = "0.3"
+
+# Subprocess I/O
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Config
+config = "0.14"
+dotenvy = "0.15"
+
+# IDs
+uuid = { version = "1", features = ["v4"] }
+
+# CLI args
+clap = { version = "4", features = ["derive"] }
+
+# Logging
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error
+anyhow = "1"
+thiserror = "1"
+
+# Async trait
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
