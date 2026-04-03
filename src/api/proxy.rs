@@ -26,6 +26,46 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/auth_status", get(auth_status_handler))
 }
 
+/// Validate request body before forwarding. Returns error response or None if valid.
+fn validate_request(body: &serde_json::Value) -> Option<Response> {
+    let obj = match body.as_object() {
+        Some(o) => o,
+        None => return Some(error_response(400, "invalid_request", "Request body must be a JSON object")),
+    };
+
+    // model is required
+    if !obj.contains_key("model") {
+        return Some(error_response(400, "invalid_request", "Missing required field: model"));
+    }
+
+    // messages is required and must be non-empty array
+    match obj.get("messages") {
+        None => return Some(error_response(400, "invalid_request", "Missing required field: messages")),
+        Some(v) => {
+            if !v.is_array() {
+                return Some(error_response(400, "invalid_request", "messages must be an array"));
+            }
+            if v.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                return Some(error_response(400, "invalid_request", "messages must not be empty"));
+            }
+        }
+    }
+
+    // max_tokens sanity check
+    if let Some(mt) = obj.get("max_tokens") {
+        if let Some(n) = mt.as_u64() {
+            if n == 0 {
+                return Some(error_response(400, "invalid_request", "max_tokens must be > 0"));
+            }
+            if n > 128_000 {
+                return Some(error_response(400, "invalid_request", "max_tokens exceeds maximum (128000)"));
+            }
+        }
+    }
+
+    None
+}
+
 /// POST /v1/messages — synchronous Messages API proxy
 async fn messages_handler(
     State(state): State<AppState>,
@@ -35,6 +75,10 @@ async fn messages_handler(
         Some(ps) => ps,
         None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
     };
+
+    if let Some(err) = validate_request(&body) {
+        return err;
+    }
 
     // Extract optional beta headers from body
     let extra_betas = body.get("betas")
@@ -84,6 +128,10 @@ async fn messages_stream_handler(
         None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
     };
 
+    if let Some(err) = validate_request(&body) {
+        return err;
+    }
+
     let extra_betas = body.get("betas")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>());
@@ -92,7 +140,6 @@ async fn messages_stream_handler(
     if let Some(obj) = forward_body.as_object_mut() {
         obj.remove("betas");
 
-        // Normalize model alias → canonical ID + default max_tokens
         let model_str = obj.get("model").and_then(|v| v.as_str()).map(String::from);
         if let Some(model_val) = model_str {
             let canonical = crate::models::canonical_model_id(&model_val).to_string();

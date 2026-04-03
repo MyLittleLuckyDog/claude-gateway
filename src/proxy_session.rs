@@ -257,3 +257,8 @@ fn epoch_secs() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+/// Public version for use by other modules
+pub fn epoch_secs_pub() -> u64 {
+    epoch_secs()
+}

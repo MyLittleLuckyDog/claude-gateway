@@ -55,19 +55,26 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Initialize direct API proxy (conservative: 1 concurrent request)
-    let proxy = match claude_agent::auth::get_oauth_token() {
-        Ok(token) => {
-            tracing::info!(
-                "OAuth token loaded (subscription: {:?}, tier: {:?})",
-                token.subscription_type, token.rate_limit_tier
-            );
-            Some(Arc::new(claude_agent::proxy::ProxyState::new(1)))
+    // Initialize direct API proxy
+    let proxy = if config.proxy.enabled {
+        match claude_agent::auth::get_oauth_token() {
+            Ok(token) => {
+                tracing::info!(
+                    "OAuth token loaded (subscription: {:?}, tier: {:?})",
+                    token.subscription_type, token.rate_limit_tier
+                );
+                Some(Arc::new(claude_agent::proxy::ProxyState::new(
+                    config.proxy.max_concurrent,
+                )))
+            }
+            Err(e) => {
+                tracing::warn!("Direct API proxy disabled: {}", e);
+                None
+            }
         }
-        Err(e) => {
-            tracing::warn!("Direct API proxy disabled: {}", e);
-            None
-        }
+    } else {
+        tracing::info!("Direct API proxy disabled by config");
+        None
     };
 
     // Run quota pre-check if proxy is enabled
