@@ -11,6 +11,8 @@ pub mod api;
 pub mod query;
 pub mod client;
 pub mod auth;
+pub mod client_identity;
 pub mod models;
 pub mod proxy;
 pub mod proxy_session;
+pub mod sse;

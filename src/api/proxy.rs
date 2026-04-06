@@ -66,32 +66,23 @@ fn validate_request(body: &serde_json::Value) -> Option<Response> {
     None
 }
 
-/// POST /v1/messages — synchronous Messages API proxy
-async fn messages_handler(
-    State(state): State<AppState>,
-    Json(body): Json<serde_json::Value>,
-) -> Response {
-    let proxy_state = match state.proxy.as_ref() {
-        Some(ps) => ps,
-        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
-    };
-
-    if let Some(err) = validate_request(&body) {
-        return err;
+/// Common request preprocessing: validate, extract betas, normalize model,
+/// default max_tokens. Returns (forward_body, extra_betas) or an error Response.
+#[allow(clippy::result_large_err)]
+fn preprocess_request(body: &serde_json::Value) -> Result<(serde_json::Value, Option<Vec<String>>), Response> {
+    if let Some(err) = validate_request(body) {
+        return Err(err);
     }
 
-    // Extract optional beta headers from body
     let extra_betas = body.get("betas")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>());
 
-    // Remove gateway-only fields and normalize before forwarding
     let mut forward_body = body.clone();
     if let Some(obj) = forward_body.as_object_mut() {
         obj.remove("betas");
         obj.remove("stream");
 
-        // Normalize model alias → canonical ID + default max_tokens
         let model_str = obj.get("model").and_then(|v| v.as_str()).map(String::from);
         if let Some(model_val) = model_str {
             let canonical = crate::models::canonical_model_id(&model_val).to_string();
@@ -104,10 +95,31 @@ async fn messages_handler(
         }
     }
 
+    Ok((forward_body, extra_betas))
+}
+
+/// POST /v1/messages — synchronous Messages API proxy
+async fn messages_handler(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let proxy_state = match state.proxy.as_ref() {
+        Some(ps) => ps,
+        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
+    };
+
+    let (forward_body, extra_betas) = match preprocess_request(&body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+
+    let session_id = crate::client_identity::new_session_id();
+
     match proxy::messages_sync(
         proxy_state,
         forward_body,
         extra_betas.as_deref(),
+        &session_id,
     ).await {
         Ok((resp_body, upstream_status)) => {
             let status = StatusCode::from_u16(upstream_status)
@@ -128,34 +140,18 @@ async fn messages_stream_handler(
         None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
     };
 
-    if let Some(err) = validate_request(&body) {
-        return err;
-    }
+    let (forward_body, extra_betas) = match preprocess_request(&body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
 
-    let extra_betas = body.get("betas")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>());
-
-    let mut forward_body = body.clone();
-    if let Some(obj) = forward_body.as_object_mut() {
-        obj.remove("betas");
-
-        let model_str = obj.get("model").and_then(|v| v.as_str()).map(String::from);
-        if let Some(model_val) = model_str {
-            let canonical = crate::models::canonical_model_id(&model_val).to_string();
-            let needs_max_tokens = !obj.contains_key("max_tokens");
-            let default_mt = crate::models::default_max_tokens(&canonical);
-            obj.insert("model".to_string(), serde_json::Value::String(canonical));
-            if needs_max_tokens {
-                obj.insert("max_tokens".to_string(), serde_json::Value::Number(default_mt.into()));
-            }
-        }
-    }
+    let session_id = crate::client_identity::new_session_id();
 
     match proxy::messages_stream(
         proxy_state,
         forward_body,
         extra_betas.as_deref(),
+        &session_id,
     ).await {
         Ok((resp, upstream_status)) => {
             if upstream_status != 200 {
@@ -199,6 +195,9 @@ async fn rate_limit_handler(
         "utilization_7d": rl.utilization_7d,
         "resets_at": rl.resets_at,
         "fallback_available": rl.fallback_available,
+        "rate_limit_type": rl.rate_limit_type,
+        "overage_status": rl.overage_status,
+        "overage_disabled_reason": rl.overage_disabled_reason,
     })).into_response()
 }
 

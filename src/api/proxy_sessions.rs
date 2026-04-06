@@ -6,18 +6,21 @@
 //! GET    /v1/sessions/:id     — get session state
 //! DELETE /v1/sessions/:id     — delete session
 
+use std::sync::Arc;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
-use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::Mutex;
 
 use crate::api::AppState;
 use crate::proxy;
 use crate::proxy_session::SessionOptions;
+use crate::sse::{SseParser, StreamAccumulator};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -83,7 +86,7 @@ async fn get_session(
         None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
     };
 
-    match store.get(&id).await {
+    match store.get_snapshot(&id).await {
         Some(session) => Json(json!({
             "id": session.id,
             "model": session.model,
@@ -91,6 +94,8 @@ async fn get_session(
             "messages": session.messages,
             "total_input_tokens": session.total_input_tokens,
             "total_output_tokens": session.total_output_tokens,
+            "last_input_tokens": session.last_input_tokens,
+            "last_output_tokens": session.last_output_tokens,
             "estimated_context_tokens": session.estimated_context_tokens(),
             "context_near_limit": session.is_context_near_limit(),
             "created_at": session.created_at,
@@ -147,24 +152,6 @@ async fn send_message(
         None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
     };
 
-    // Get session
-    let mut session = match store.get(&id).await {
-        Some(s) => s,
-        None => return error_response(404, "session_not_found", &format!("Session {id} not found")),
-    };
-
-    // Check context limit
-    if session.is_context_near_limit() {
-        return error_response(
-            400,
-            "context_limit",
-            &format!(
-                "Session context near limit (~{}K tokens). Create a new session.",
-                session.estimated_context_tokens() / 1000
-            ),
-        );
-    }
-
     // Normalize content: string → content block
     let content = if req.content.is_string() {
         serde_json::json!([{"type": "text", "text": req.content}])
@@ -172,41 +159,75 @@ async fn send_message(
         req.content
     };
 
-    // Add message to session
-    if req.is_tool_result {
-        // Content should be an array of tool_result blocks
-        let blocks = if content.is_array() {
-            content.as_array().cloned().unwrap_or_default()
+    // Phase 1: Add message and build request while holding the session lock.
+    // Returns (body, betas, session_id, message_index) — the index is used
+    // for safe rollback if the API call fails.
+    #[allow(clippy::question_mark)]
+    let prepared = store.with_session(&id, |session| {
+        let max_tokens = req.max_tokens
+            .or(session.options.max_tokens)
+            .unwrap_or_else(|| crate::models::default_max_tokens(&session.model));
+
+        if let Err(msg) = session.preflight_check(max_tokens) {
+            return Err(msg);
+        }
+
+        if req.is_tool_result {
+            let blocks = if content.is_array() {
+                content.as_array().cloned().unwrap_or_default()
+            } else {
+                vec![content.clone()]
+            };
+            session.add_tool_result(blocks);
         } else {
-            vec![content]
-        };
-        session.add_tool_result(blocks);
-    } else {
-        session.add_user_message(content);
-    }
+            session.add_user_message(content.clone());
+        }
 
-    // Build API request
-    let body = session.build_request(req.max_tokens);
-    let extra_betas = session.options.betas.as_deref();
+        let msg_index = session.messages.len() - 1;
+        let body = session.build_request(req.max_tokens);
+        let betas = session.options.betas.clone();
+        let upstream_sid = session.id.clone();
+        Ok((body, betas, upstream_sid, msg_index))
+    }).await;
 
-    // Call API
-    match proxy::messages_sync(proxy_state, body, extra_betas).await {
+    let (body, extra_betas, upstream_session_id, msg_index) = match prepared {
+        None => return error_response(404, "session_not_found", &format!("Session {id} not found")),
+        Some(Err(msg)) => return error_response(400, "context_limit", &msg),
+        Some(Ok(tuple)) => tuple,
+    };
+
+    // Phase 2: Call API (lock released)
+    match proxy::messages_sync(proxy_state, body, extra_betas.as_deref(), &upstream_session_id).await {
         Ok((resp_body, upstream_status)) => {
             if upstream_status == 200 {
-                // Record assistant response in session
-                session.record_assistant_response(&resp_body);
-                store.update(session.clone()).await;
+                // Phase 3: Record response while holding the lock
+                let session_meta = store.with_session(&id, |session| {
+                    session.record_assistant_response(&resp_body);
+                    (
+                        session.id.clone(),
+                        session.estimated_context_tokens(),
+                        session.is_context_near_limit(),
+                    )
+                }).await;
 
-                // Build response with session metadata
+                let (sid, ctx_tokens, near_limit) = match session_meta {
+                    Some(meta) => meta,
+                    None => {
+                        tracing::warn!(
+                            "Session {} was deleted during API call; \
+                             assistant response lost",
+                            id
+                        );
+                        (id.clone(), 0, false)
+                    }
+                };
+
                 let mut result = resp_body;
                 if let Some(obj) = result.as_object_mut() {
-                    obj.insert("session_id".to_string(), json!(session.id));
-                    obj.insert("estimated_context_tokens".to_string(),
-                        json!(session.estimated_context_tokens()));
-                    obj.insert("context_near_limit".to_string(),
-                        json!(session.is_context_near_limit()));
+                    obj.insert("session_id".to_string(), json!(sid));
+                    obj.insert("estimated_context_tokens".to_string(), json!(ctx_tokens));
+                    obj.insert("context_near_limit".to_string(), json!(near_limit));
 
-                    // Add rate limit warning if present
                     if let Some(ps) = state.proxy.as_ref() {
                         let rl = ps.rate_limit.read().await;
                         if let Some(warning) = rl.warning_message() {
@@ -217,11 +238,10 @@ async fn send_message(
 
                 Json(result).into_response()
             } else {
-                // Error from API — don't record in session, but save the user message
-                // (already added above) so the conversation state is consistent
-                // Remove the last message since it wasn't processed
-                session.messages.pop();
-                store.update(session).await;
+                // Rollback: remove the message we added
+                let _ = store.with_session(&id, |session| {
+                    session.rollback_message_at(msg_index, "user");
+                }).await;
 
                 let status = StatusCode::from_u16(upstream_status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -229,9 +249,9 @@ async fn send_message(
             }
         }
         Err(e) => {
-            // Remove the unprocessed message
-            session.messages.pop();
-            store.update(session).await;
+            let _ = store.with_session(&id, |session| {
+                session.rollback_message_at(msg_index, "user");
+            }).await;
 
             let status = StatusCode::from_u16(e.http_status())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -251,6 +271,7 @@ async fn send_message(
 /// Note: session history is updated AFTER the stream completes (from the
 /// final message_stop event). During streaming, the session state is
 /// temporarily inconsistent — this is acceptable for development use.
+#[allow(clippy::question_mark)]
 async fn send_message_stream(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -265,44 +286,54 @@ async fn send_message_stream(
         None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
     };
 
-    let mut session = match store.get(&id).await {
-        Some(s) => s,
-        None => return error_response(404, "session_not_found", &format!("Session {id} not found")),
-    };
-
-    if session.is_context_near_limit() {
-        return error_response(400, "context_limit", "Session context near limit. Create a new session.");
-    }
-
     let content = if req.content.is_string() {
         serde_json::json!([{"type": "text", "text": req.content}])
     } else {
         req.content
     };
 
-    if req.is_tool_result {
-        let blocks = if content.is_array() {
-            content.as_array().cloned().unwrap_or_default()
+    // Phase 1: Add message and build request under lock
+    let prepared = store.with_session(&id, |session| {
+        let max_tokens = req.max_tokens
+            .or(session.options.max_tokens)
+            .unwrap_or_else(|| crate::models::default_max_tokens(&session.model));
+
+        if let Err(msg) = session.preflight_check(max_tokens) {
+            return Err(msg);
+        }
+
+        if req.is_tool_result {
+            let blocks = if content.is_array() {
+                content.as_array().cloned().unwrap_or_default()
+            } else {
+                vec![content.clone()]
+            };
+            session.add_tool_result(blocks);
         } else {
-            vec![content]
-        };
-        session.add_tool_result(blocks);
-    } else {
-        session.add_user_message(content);
-    }
+            session.add_user_message(content.clone());
+        }
 
-    let body = session.build_request(req.max_tokens);
-    let extra_betas = session.options.betas.clone();
+        let msg_index = session.messages.len() - 1;
+        let body = session.build_request(req.max_tokens);
+        let betas = session.options.betas.clone();
+        let upstream_sid = session.id.clone();
+        Ok((body, betas, upstream_sid, msg_index))
+    }).await;
 
-    // Save session with the user message added (will be rolled back on error)
-    store.update(session.clone()).await;
+    let (body, extra_betas, upstream_session_id, msg_index) = match prepared {
+        None => return error_response(404, "session_not_found", &format!("Session {id} not found")),
+        Some(Err(msg)) => return error_response(400, "context_limit", &msg),
+        Some(Ok(tuple)) => tuple,
+    };
 
-    match proxy::messages_stream(proxy_state, body, extra_betas.as_deref()).await {
+    // Phase 2: Call API (lock released)
+    match proxy::messages_stream(proxy_state, body, extra_betas.as_deref(), &upstream_session_id).await {
         Ok((resp, upstream_status)) => {
             if upstream_status != 200 {
-                // Rollback: remove unprocessed message
-                session.messages.pop();
-                store.update(session).await;
+                // Rollback
+                let _ = store.with_session(&id, |session| {
+                    session.rollback_message_at(msg_index, "user");
+                }).await;
 
                 let body = resp.json::<serde_json::Value>().await
                     .unwrap_or_else(|_| json!({"error": {"type": "unknown", "message": "Unknown error"}}));
@@ -311,46 +342,122 @@ async fn send_message_stream(
                 return (status, Json(body)).into_response();
             }
 
-            // SSE passthrough — after stream ends, client should call GET /v1/sessions/:id
-            // to see the updated session state (or we update asynchronously).
-            // For now: passthrough raw SSE, update session from final events in background.
+            // SSE passthrough with inline parsing: raw bytes are forwarded
+            // to the client unchanged, while SseParser + StreamAccumulator
+            // extract the assistant message and usage for session update.
             let byte_stream = resp.bytes_stream();
 
-            // Spawn background task to update session from the stream
-            // (We pass through the raw bytes and also accumulate for session update)
+            let parser = Arc::new(Mutex::new(SseParser::new()));
+            let accumulator = Arc::new(Mutex::new(StreamAccumulator::new()));
             let store_bg = store.clone();
-            let session_id = session.id.clone();
+            let session_id = upstream_session_id.clone();
+            let parser_bg = parser.clone();
+            let acc_bg = accumulator.clone();
+
+            // Track whether the stream completed successfully so we can
+            // roll back the user message on abort/error.
+            let stream_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let completed_flag = stream_completed.clone();
+
             let body = axum::body::Body::from_stream(
                 futures::stream::unfold(
-                    (byte_stream, String::new()),
-                    move |(mut stream, mut accumulated)| {
+                    byte_stream,
+                    move |mut stream| {
                         let store_ref = store_bg.clone();
                         let sid = session_id.clone();
+                        let parser_ref = parser_bg.clone();
+                        let acc_ref = acc_bg.clone();
+                        let completed = completed_flag.clone();
                         async move {
                             use futures::StreamExt;
                             match stream.next().await {
                                 Some(Ok(bytes)) => {
-                                    let chunk = String::from_utf8_lossy(&bytes).to_string();
-                                    accumulated.push_str(&chunk);
+                                    let events = {
+                                        let mut p = parser_ref.lock().await;
+                                        p.push(&bytes)
+                                    };
 
-                                    // Check if stream ended — update session
-                                    if chunk.contains("\"type\":\"message_stop\"") {
-                                        // Parse accumulated SSE to extract the full message
-                                        update_session_from_sse(&store_ref, &sid, &accumulated).await;
+                                    let is_complete = {
+                                        let mut a = acc_ref.lock().await;
+                                        for event in &events {
+                                            a.process_event(event);
+                                        }
+                                        a.is_complete()
+                                    };
+
+                                    if is_complete {
+                                        update_session_from_accumulator(
+                                            &store_ref, &sid, &acc_ref,
+                                        ).await;
+                                        completed.store(true, std::sync::atomic::Ordering::Release);
                                     }
 
-                                    Some((Ok::<_, std::convert::Infallible>(bytes), (stream, accumulated)))
+                                    Some((Ok::<_, std::convert::Infallible>(bytes), stream))
                                 }
                                 Some(Err(e)) => {
-                                    let err_bytes = axum::body::Bytes::from(format!("data: {{\"error\": \"{e}\"}}\n\n"));
-                                    Some((Ok(err_bytes), (stream, accumulated)))
+                                    tracing::warn!("SSE stream error, rolling back session {}: {e}", sid);
+                                    let _ = store_ref.with_session(&sid, |session| {
+                                        session.rollback_message_at(msg_index, "user");
+                                    }).await;
+                                    completed.store(true, std::sync::atomic::Ordering::Release);
+                                    None
                                 }
-                                None => None,
+                                None => {
+                                    let trailing = {
+                                        let mut p = parser_ref.lock().await;
+                                        p.finish()
+                                    };
+                                    if !trailing.is_empty() {
+                                        let mut a = acc_ref.lock().await;
+                                        for event in &trailing {
+                                            a.process_event(event);
+                                        }
+                                        if a.is_complete() {
+                                            drop(a);
+                                            update_session_from_accumulator(
+                                                &store_ref, &sid, &acc_ref,
+                                            ).await;
+                                            completed.store(true, std::sync::atomic::Ordering::Release);
+                                        }
+                                    }
+
+                                    if !completed.load(std::sync::atomic::Ordering::Acquire) {
+                                        tracing::warn!(
+                                            "SSE stream ended without message_stop, \
+                                             rolling back session {}",
+                                            sid
+                                        );
+                                        let _ = store_ref.with_session(&sid, |session| {
+                                            session.rollback_message_at(msg_index, "user");
+                                        }).await;
+                                    }
+
+                                    None
+                                }
                             }
                         }
                     },
                 ),
             );
+
+            // Background safety net for client disconnect (stream drop).
+            // When the client disconnects, the Body is dropped and the unfold
+            // future is cancelled — the None branch never runs.
+            let rollback_store = store.clone();
+            let rollback_sid = upstream_session_id.clone();
+            let rollback_completed = stream_completed.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                if !rollback_completed.load(std::sync::atomic::Ordering::Acquire) {
+                    tracing::warn!(
+                        "SSE stream for session {} timed out without completion, rolling back",
+                        rollback_sid
+                    );
+                    let _ = rollback_store.with_session(&rollback_sid, |session| {
+                        session.rollback_message_at(msg_index, "user");
+                    }).await;
+                }
+            });
 
             Response::builder()
                 .status(StatusCode::OK)
@@ -360,8 +467,9 @@ async fn send_message_stream(
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(e) => {
-            session.messages.pop();
-            store.update(session).await;
+            let _ = store.with_session(&id, |session| {
+                session.rollback_message_at(msg_index, "user");
+            }).await;
 
             let status = StatusCode::from_u16(e.http_status())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -372,84 +480,34 @@ async fn send_message_stream(
     }
 }
 
-/// Parse accumulated SSE data to extract assistant content and update session.
-async fn update_session_from_sse(
+/// Update session state from a completed StreamAccumulator.
+async fn update_session_from_accumulator(
     store: &std::sync::Arc<crate::proxy_session::ProxySessionStore>,
     session_id: &str,
-    sse_data: &str,
+    accumulator: &Arc<Mutex<StreamAccumulator>>,
 ) {
-    let mut session = match store.get(session_id).await {
-        Some(s) => s,
-        None => return,
+    // Swap out the accumulator to take ownership
+    let acc = {
+        let mut guard = accumulator.lock().await;
+        std::mem::replace(&mut *guard, StreamAccumulator::new())
     };
 
-    // Extract text deltas and tool_use blocks from SSE events
-    let mut text_parts = Vec::new();
-    let mut content_blocks: Vec<serde_json::Value> = Vec::new();
-    let mut input_tokens = 0u64;
-    let mut output_tokens = 0u64;
+    let input_tokens = acc.input_tokens;
+    let output_tokens = acc.output_tokens;
+    let content_blocks = acc.into_content_blocks();
 
-    for line in sse_data.lines() {
-        let line = line.trim();
-        if !line.starts_with("data: ") { continue; }
-        let json_str = &line[6..];
-        let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) else { continue };
-
-        match event.get("type").and_then(|t| t.as_str()) {
-            Some("content_block_start") => {
-                if let Some(block) = event.get("content_block") {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        content_blocks.push(block.clone());
-                    }
-                }
-            }
-            Some("content_block_delta") => {
-                if let Some(delta) = event.get("delta") {
-                    match delta.get("type").and_then(|t| t.as_str()) {
-                        Some("text_delta") => {
-                            if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
-                                text_parts.push(text.to_string());
-                            }
-                        }
-                        Some("input_json_delta") => {
-                            // Tool input accumulation — simplified
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Some("message_start") => {
-                if let Some(msg) = event.get("message") {
-                    if let Some(usage) = msg.get("usage") {
-                        input_tokens += usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                        output_tokens += usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                    }
-                }
-            }
-            Some("message_delta") => {
-                if let Some(usage) = event.get("usage") {
-                    output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(output_tokens);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    // Build assistant message content
-    let full_text = text_parts.join("");
-    if !full_text.is_empty() {
-        content_blocks.insert(0, json!({"type": "text", "text": full_text}));
-    }
-
-    if !content_blocks.is_empty() {
-        session.messages.push(json!({
-            "role": "assistant",
-            "content": content_blocks,
-        }));
-        session.total_input_tokens += input_tokens;
-        session.total_output_tokens += output_tokens;
-        session.last_activity = crate::proxy_session::epoch_secs_pub();
-        store.update(session).await;
+    if let Some(blocks) = content_blocks {
+        let _ = store.with_session(session_id, |session| {
+            session.messages.push(json!({
+                "role": "assistant",
+                "content": blocks,
+            }));
+            session.total_input_tokens += input_tokens;
+            session.total_output_tokens += output_tokens;
+            session.last_input_tokens = input_tokens;
+            session.last_output_tokens = output_tokens;
+            session.last_activity = crate::proxy_session::epoch_secs();
+        }).await;
     }
 }
 

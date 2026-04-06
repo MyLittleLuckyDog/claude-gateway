@@ -3,17 +3,12 @@
 //! tracks token usage, and auto-cleans when context limit approaches.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::models;
-
-/// Maximum concurrent proxy sessions
-const MAX_PROXY_SESSIONS: usize = 50;
-
-/// Session idle timeout (seconds) — matches CLI default
-const SESSION_IDLE_TIMEOUT_SECS: u64 = 1800; // 30 min
 
 // ── Session ────────────────────────────────────────────────────────
 
@@ -24,12 +19,22 @@ pub struct ProxySession {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<serde_json::Value>,
     pub messages: Vec<serde_json::Value>,
+    /// Cumulative input tokens across all turns (for stats)
     pub total_input_tokens: u64,
+    /// Cumulative output tokens across all turns (for stats)
     pub total_output_tokens: u64,
+    /// Input tokens from the most recent API response — approximates
+    /// current context size (the server re-counts all messages each turn).
+    pub last_input_tokens: u64,
+    /// Output tokens from the most recent API response
+    pub last_output_tokens: u64,
     pub created_at: u64,
     pub last_activity: u64,
     #[serde(skip)]
     pub options: SessionOptions,
+    /// Idle timeout in seconds — from config
+    #[serde(skip)]
+    idle_timeout_secs: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -58,8 +63,10 @@ pub struct SessionOptions {
 }
 
 impl ProxySession {
-    pub fn new(id: String, options: SessionOptions) -> Self {
-        let model = options.model.as_deref()
+    pub fn new(id: String, options: SessionOptions, idle_timeout_secs: u64) -> Self {
+        let model = options
+            .model
+            .as_deref()
             .map(|m| models::canonical_model_id(m).to_string())
             .unwrap_or_else(|| models::DEFAULT_MODEL.id.to_string());
 
@@ -70,15 +77,22 @@ impl ProxySession {
             messages: Vec::new(),
             total_input_tokens: 0,
             total_output_tokens: 0,
+            last_input_tokens: 0,
+            last_output_tokens: 0,
             created_at: epoch_secs(),
             last_activity: epoch_secs(),
             options,
+            idle_timeout_secs,
         }
     }
 
-    /// Estimated total tokens in context (input + output so far)
+    /// Estimated current context size based on the most recent API response.
+    /// After the first turn, `last_input_tokens` reflects the full context
+    /// the server received (all messages re-counted), plus the output the
+    /// server just generated (which is now part of the context for the next
+    /// turn).
     pub fn estimated_context_tokens(&self) -> u64 {
-        self.total_input_tokens + self.total_output_tokens
+        self.last_input_tokens + self.last_output_tokens
     }
 
     /// Is the context approaching the limit?
@@ -86,7 +100,27 @@ impl ProxySession {
         self.estimated_context_tokens() >= models::CONTEXT_CLEANUP_THRESHOLD as u64
     }
 
-    /// Build the API request body for the current state + new user content.
+    /// Preflight check: will the next request likely exceed the context window?
+    pub fn preflight_check(&self, max_tokens: u32) -> Result<(), String> {
+        let estimated = self.estimated_context_tokens();
+        if estimated == 0 {
+            // First turn — no prior data, allow it
+            return Ok(());
+        }
+        let model_context = models::resolve_model(&self.model)
+            .map(|m| m.context_window as u64)
+            .unwrap_or(200_000);
+        if estimated + max_tokens as u64 > model_context {
+            return Err(format!(
+                "Estimated context ({} tokens) + max_tokens ({}) exceeds \
+                 model context window ({}). Create a new session.",
+                estimated, max_tokens, model_context
+            ));
+        }
+        Ok(())
+    }
+
+    /// Build the API request body for the current state.
     pub fn build_request(&self, max_tokens_override: Option<u32>) -> serde_json::Value {
         let max_tokens = max_tokens_override
             .or(self.options.max_tokens)
@@ -98,19 +132,19 @@ impl ProxySession {
             "messages": self.messages,
         });
 
-        let obj = body.as_object_mut().expect("just created");
-
-        if let Some(ref system) = self.system {
-            obj.insert("system".to_string(), system.clone());
-        }
-        if let Some(ref temp) = self.options.temperature {
-            obj.insert("temperature".to_string(), serde_json::json!(temp));
-        }
-        if let Some(ref tools) = self.options.tools {
-            obj.insert("tools".to_string(), serde_json::json!(tools));
-        }
-        if let Some(ref tc) = self.options.tool_choice {
-            obj.insert("tool_choice".to_string(), tc.clone());
+        if let Some(obj) = body.as_object_mut() {
+            if let Some(ref system) = self.system {
+                obj.insert("system".to_string(), system.clone());
+            }
+            if let Some(ref temp) = self.options.temperature {
+                obj.insert("temperature".to_string(), serde_json::json!(temp));
+            }
+            if let Some(ref tools) = self.options.tools {
+                obj.insert("tools".to_string(), serde_json::json!(tools));
+            }
+            if let Some(ref tc) = self.options.tool_choice {
+                obj.insert("tool_choice".to_string(), tc.clone());
+            }
         }
 
         body
@@ -135,11 +169,7 @@ impl ProxySession {
     }
 
     /// Record assistant response and update token counts.
-    pub fn record_assistant_response(
-        &mut self,
-        response: &serde_json::Value,
-    ) {
-        // Extract content blocks from response
+    pub fn record_assistant_response(&mut self, response: &serde_json::Value) {
         if let Some(content) = response.get("content") {
             self.messages.push(serde_json::json!({
                 "role": "assistant",
@@ -147,58 +177,112 @@ impl ProxySession {
             }));
         }
 
-        // Update token counts
         if let Some(usage) = response.get("usage") {
-            if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-                self.total_input_tokens += input;
-            }
-            if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
-                self.total_output_tokens += output;
-            }
+            let input = usage
+                .get("input_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let output = usage
+                .get("output_tokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            self.total_input_tokens += input;
+            self.total_output_tokens += output;
+            // Overwrite — last turn's counts approximate current context
+            self.last_input_tokens = input;
+            self.last_output_tokens = output;
         }
 
         self.last_activity = epoch_secs();
     }
 
+    /// Remove a message at a specific index (rollback on error).
+    /// Only removes if the index is valid and the message at that index
+    /// has the expected role — prevents rolling back the wrong message
+    /// when concurrent requests interleave on the same session.
+    pub fn rollback_message_at(&mut self, index: usize, expected_role: &str) -> bool {
+        if index < self.messages.len() {
+            let matches = self.messages[index]
+                .get("role")
+                .and_then(|r| r.as_str())
+                .map(|r| r == expected_role)
+                .unwrap_or(false);
+            if matches {
+                self.messages.remove(index);
+                return true;
+            }
+        }
+        false
+    }
+
     /// Check if session has been idle too long
     fn is_idle(&self) -> bool {
-        epoch_secs() - self.last_activity > SESSION_IDLE_TIMEOUT_SECS
+        epoch_secs() - self.last_activity > self.idle_timeout_secs
     }
 }
 
 // ── Session Store ──────────────────────────────────────────────────
 
+/// Thread-safe session store. Each session is wrapped in `Arc<Mutex>`
+/// to prevent lost-update races when concurrent requests mutate the
+/// same session.
 pub struct ProxySessionStore {
-    sessions: RwLock<HashMap<String, ProxySession>>,
+    sessions: RwLock<HashMap<String, Arc<Mutex<ProxySession>>>>,
+    max_sessions: usize,
+    idle_timeout_secs: u64,
 }
 
 impl ProxySessionStore {
-    pub fn new() -> Self {
+    pub fn new(max_sessions: usize, idle_timeout_secs: u64) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            max_sessions,
+            idle_timeout_secs,
         }
     }
 
+    /// Create a new session. Returns a snapshot (clone) for the response.
     pub async fn create(&self, options: SessionOptions) -> Result<ProxySession, String> {
         let mut sessions = self.sessions.write().await;
 
-        if sessions.len() >= MAX_PROXY_SESSIONS {
-            return Err(format!("Max proxy sessions ({MAX_PROXY_SESSIONS}) reached"));
+        if sessions.len() >= self.max_sessions {
+            return Err(format!(
+                "Max proxy sessions ({}) reached",
+                self.max_sessions
+            ));
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let session = ProxySession::new(id.clone(), options);
-        sessions.insert(id, session.clone());
+        let session = ProxySession::new(id.clone(), options, self.idle_timeout_secs);
+        let snapshot = session.clone();
+        sessions.insert(id, Arc::new(Mutex::new(session)));
 
-        Ok(session)
+        Ok(snapshot)
     }
 
-    pub async fn get(&self, id: &str) -> Option<ProxySession> {
-        self.sessions.read().await.get(id).cloned()
+    /// Execute a closure while holding the per-session Mutex.
+    /// The outer RwLock is only held for the HashMap lookup, not during
+    /// the closure execution — other sessions remain accessible.
+    pub async fn with_session<F, R>(&self, id: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut ProxySession) -> R,
+    {
+        let session_arc = {
+            let sessions = self.sessions.read().await;
+            sessions.get(id)?.clone()
+        };
+        let mut session = session_arc.lock().await;
+        Some(f(&mut session))
     }
 
-    pub async fn update(&self, session: ProxySession) {
-        self.sessions.write().await.insert(session.id.clone(), session);
+    /// Get a read-only snapshot (clone) of a session.
+    pub async fn get_snapshot(&self, id: &str) -> Option<ProxySession> {
+        let session_arc = {
+            let sessions = self.sessions.read().await;
+            sessions.get(id)?.clone()
+        };
+        let session = session_arc.lock().await;
+        Some(session.clone())
     }
 
     pub async fn delete(&self, id: &str) -> bool {
@@ -206,31 +290,62 @@ impl ProxySessionStore {
     }
 
     pub async fn list(&self) -> Vec<SessionSummary> {
-        self.sessions.read().await.values().map(|s| SessionSummary {
-            id: s.id.clone(),
-            model: s.model.clone(),
-            messages_count: s.messages.len(),
-            total_input_tokens: s.total_input_tokens,
-            total_output_tokens: s.total_output_tokens,
-            context_near_limit: s.is_context_near_limit(),
-            created_at: s.created_at,
-            last_activity: s.last_activity,
-        }).collect()
+        // Collect Arc clones under the RwLock, then release it before
+        // locking individual sessions — avoids holding the RwLock across
+        // await points which would block create/delete.
+        let arcs: Vec<Arc<Mutex<ProxySession>>> = {
+            let sessions = self.sessions.read().await;
+            sessions.values().cloned().collect()
+        };
+
+        let mut summaries = Vec::with_capacity(arcs.len());
+        for arc in &arcs {
+            let s = arc.lock().await;
+            summaries.push(SessionSummary {
+                id: s.id.clone(),
+                model: s.model.clone(),
+                messages_count: s.messages.len(),
+                total_input_tokens: s.total_input_tokens,
+                total_output_tokens: s.total_output_tokens,
+                estimated_context_tokens: s.estimated_context_tokens(),
+                context_near_limit: s.is_context_near_limit(),
+                created_at: s.created_at,
+                last_activity: s.last_activity,
+            });
+        }
+        summaries
     }
 
-    /// Remove idle and context-exhausted sessions
+    /// Remove idle sessions. Returns count of removed sessions.
     pub async fn cleanup(&self) -> usize {
-        let mut sessions = self.sessions.write().await;
-        let before = sessions.len();
+        // Phase 1: identify idle sessions without holding the write lock
+        let candidates: Vec<(String, Arc<Mutex<ProxySession>>)> = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .iter()
+                .map(|(id, arc)| (id.clone(), arc.clone()))
+                .collect()
+        };
 
-        sessions.retain(|_id, s| {
+        let mut to_remove = Vec::new();
+        for (id, arc) in &candidates {
+            let s = arc.lock().await;
             if s.is_idle() {
                 tracing::info!("Cleaning up idle proxy session {}", s.id);
-                return false;
+                to_remove.push(id.clone());
             }
-            true
-        });
+        }
 
+        if to_remove.is_empty() {
+            return 0;
+        }
+
+        // Phase 2: remove under write lock
+        let mut sessions = self.sessions.write().await;
+        let before = sessions.len();
+        for id in &to_remove {
+            sessions.remove(id);
+        }
         before - sessions.len()
     }
 
@@ -246,19 +361,15 @@ pub struct SessionSummary {
     pub messages_count: usize,
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
+    pub estimated_context_tokens: u64,
     pub context_near_limit: bool,
     pub created_at: u64,
     pub last_activity: u64,
 }
 
-fn epoch_secs() -> u64 {
+pub fn epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Public version for use by other modules
-pub fn epoch_secs_pub() -> u64 {
-    epoch_secs()
 }

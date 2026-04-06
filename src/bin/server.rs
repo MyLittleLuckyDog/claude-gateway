@@ -83,7 +83,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let proxy_sessions = proxy.as_ref().map(|_| {
-        Arc::new(claude_agent::proxy_session::ProxySessionStore::new())
+        Arc::new(claude_agent::proxy_session::ProxySessionStore::new(
+            config.proxy.max_proxy_sessions,
+            config.proxy.session_idle_timeout_secs,
+        ))
     });
 
     // Spawn proxy session cleanup task
