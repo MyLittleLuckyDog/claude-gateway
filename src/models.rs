@@ -165,14 +165,14 @@ pub fn resolve_model(input: &str) -> Option<&'static ModelDef> {
         return Some(m);
     }
 
-    // Prefix match: "claude-sonnet-4-6" matches SONNET_4_6
-    for model in ALL_MODELS {
-        if lower.starts_with(model.id) || model.id.starts_with(&lower) {
-            return Some(model);
-        }
-    }
-
-    None
+    // Prefix match: "claude-sonnet-4-6-20250101" matches SONNET_4_6.
+    // Only allow user input that is longer/equal to the model ID — the
+    // reverse (short input like "claude" matching the first model) is
+    // ambiguous and was removed intentionally.
+    ALL_MODELS
+        .iter()
+        .find(|model| lower.starts_with(model.id))
+        .copied()
 }
 
 /// Get the canonical model ID for a given input string.

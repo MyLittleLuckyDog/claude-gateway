@@ -121,15 +121,25 @@ impl ProxySession {
     }
 
     /// Build the API request body for the current state.
+    /// Strips internal `_msg_id` fields from messages before sending
+    /// to the Anthropic API (which rejects unknown fields).
     pub fn build_request(&self, max_tokens_override: Option<u32>) -> serde_json::Value {
         let max_tokens = max_tokens_override
             .or(self.options.max_tokens)
             .unwrap_or_else(|| models::default_max_tokens(&self.model));
 
+        let clean_messages: Vec<serde_json::Value> = self.messages.iter().map(|m| {
+            let mut msg = m.clone();
+            if let Some(obj) = msg.as_object_mut() {
+                obj.remove("_msg_id");
+            }
+            msg
+        }).collect();
+
         let mut body = serde_json::json!({
             "model": self.model,
             "max_tokens": max_tokens,
-            "messages": self.messages,
+            "messages": clean_messages,
         });
 
         if let Some(obj) = body.as_object_mut() {
@@ -151,21 +161,29 @@ impl ProxySession {
     }
 
     /// Append a user message to the conversation.
-    pub fn add_user_message(&mut self, content: serde_json::Value) {
+    /// Returns a unique message ID for safe rollback.
+    pub fn add_user_message(&mut self, content: serde_json::Value) -> String {
+        let msg_id = uuid::Uuid::new_v4().to_string();
         self.messages.push(serde_json::json!({
+            "_msg_id": msg_id,
             "role": "user",
             "content": content,
         }));
         self.last_activity = epoch_secs();
+        msg_id
     }
 
     /// Append a tool_result message to the conversation.
-    pub fn add_tool_result(&mut self, tool_results: Vec<serde_json::Value>) {
+    /// Returns a unique message ID for safe rollback.
+    pub fn add_tool_result(&mut self, tool_results: Vec<serde_json::Value>) -> String {
+        let msg_id = uuid::Uuid::new_v4().to_string();
         self.messages.push(serde_json::json!({
+            "_msg_id": msg_id,
             "role": "user",
             "content": tool_results,
         }));
         self.last_activity = epoch_secs();
+        msg_id
     }
 
     /// Record assistant response and update token counts.
@@ -196,23 +214,18 @@ impl ProxySession {
         self.last_activity = epoch_secs();
     }
 
-    /// Remove a message at a specific index (rollback on error).
-    /// Only removes if the index is valid and the message at that index
-    /// has the expected role — prevents rolling back the wrong message
-    /// when concurrent requests interleave on the same session.
-    pub fn rollback_message_at(&mut self, index: usize, expected_role: &str) -> bool {
-        if index < self.messages.len() {
-            let matches = self.messages[index]
-                .get("role")
-                .and_then(|r| r.as_str())
-                .map(|r| r == expected_role)
-                .unwrap_or(false);
-            if matches {
-                self.messages.remove(index);
-                return true;
-            }
+    /// Remove a message by its unique `_msg_id`. Safe under concurrent
+    /// access: even if other messages were inserted/removed in the
+    /// meantime, we always target the exact message we added.
+    pub fn rollback_message_by_id(&mut self, msg_id: &str) -> bool {
+        if let Some(pos) = self.messages.iter().position(|m| {
+            m.get("_msg_id").and_then(|v| v.as_str()) == Some(msg_id)
+        }) {
+            self.messages.remove(pos);
+            true
+        } else {
+            false
         }
-        false
     }
 
     /// Check if session has been idle too long

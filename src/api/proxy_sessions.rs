@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
+use super::error_response;
 use crate::api::AppState;
 use crate::proxy;
 use crate::proxy_session::SessionOptions;
@@ -160,8 +161,8 @@ async fn send_message(
     };
 
     // Phase 1: Add message and build request while holding the session lock.
-    // Returns (body, betas, session_id, message_index) — the index is used
-    // for safe rollback if the API call fails.
+    // Returns (body, betas, session_id, msg_id) — msg_id is used for safe
+    // rollback if the API call fails (immune to concurrent index shifts).
     #[allow(clippy::question_mark)]
     let prepared = store.with_session(&id, |session| {
         let max_tokens = req.max_tokens
@@ -172,25 +173,24 @@ async fn send_message(
             return Err(msg);
         }
 
-        if req.is_tool_result {
+        let msg_id = if req.is_tool_result {
             let blocks = if content.is_array() {
                 content.as_array().cloned().unwrap_or_default()
             } else {
                 vec![content.clone()]
             };
-            session.add_tool_result(blocks);
+            session.add_tool_result(blocks)
         } else {
-            session.add_user_message(content.clone());
-        }
+            session.add_user_message(content.clone())
+        };
 
-        let msg_index = session.messages.len() - 1;
         let body = session.build_request(req.max_tokens);
         let betas = session.options.betas.clone();
         let upstream_sid = session.id.clone();
-        Ok((body, betas, upstream_sid, msg_index))
+        Ok((body, betas, upstream_sid, msg_id))
     }).await;
 
-    let (body, extra_betas, upstream_session_id, msg_index) = match prepared {
+    let (body, extra_betas, upstream_session_id, msg_id) = match prepared {
         None => return error_response(404, "session_not_found", &format!("Session {id} not found")),
         Some(Err(msg)) => return error_response(400, "context_limit", &msg),
         Some(Ok(tuple)) => tuple,
@@ -240,7 +240,7 @@ async fn send_message(
             } else {
                 // Rollback: remove the message we added
                 let _ = store.with_session(&id, |session| {
-                    session.rollback_message_at(msg_index, "user");
+                    session.rollback_message_by_id(&msg_id);
                 }).await;
 
                 let status = StatusCode::from_u16(upstream_status)
@@ -250,17 +250,10 @@ async fn send_message(
         }
         Err(e) => {
             let _ = store.with_session(&id, |session| {
-                session.rollback_message_at(msg_index, "user");
+                session.rollback_message_by_id(&msg_id);
             }).await;
 
-            let status = StatusCode::from_u16(e.http_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status, Json(json!({
-                "error": {
-                    "type": e.error_code(),
-                    "message": e.to_string(),
-                }
-            }))).into_response()
+            super::proxy_error_response(e)
         }
     }
 }
@@ -302,25 +295,24 @@ async fn send_message_stream(
             return Err(msg);
         }
 
-        if req.is_tool_result {
+        let msg_id = if req.is_tool_result {
             let blocks = if content.is_array() {
                 content.as_array().cloned().unwrap_or_default()
             } else {
                 vec![content.clone()]
             };
-            session.add_tool_result(blocks);
+            session.add_tool_result(blocks)
         } else {
-            session.add_user_message(content.clone());
-        }
+            session.add_user_message(content.clone())
+        };
 
-        let msg_index = session.messages.len() - 1;
         let body = session.build_request(req.max_tokens);
         let betas = session.options.betas.clone();
         let upstream_sid = session.id.clone();
-        Ok((body, betas, upstream_sid, msg_index))
+        Ok((body, betas, upstream_sid, msg_id))
     }).await;
 
-    let (body, extra_betas, upstream_session_id, msg_index) = match prepared {
+    let (body, extra_betas, upstream_session_id, msg_id) = match prepared {
         None => return error_response(404, "session_not_found", &format!("Session {id} not found")),
         Some(Err(msg)) => return error_response(400, "context_limit", &msg),
         Some(Ok(tuple)) => tuple,
@@ -332,7 +324,7 @@ async fn send_message_stream(
             if upstream_status != 200 {
                 // Rollback
                 let _ = store.with_session(&id, |session| {
-                    session.rollback_message_at(msg_index, "user");
+                    session.rollback_message_by_id(&msg_id);
                 }).await;
 
                 let body = resp.json::<serde_json::Value>().await
@@ -354,10 +346,13 @@ async fn send_message_stream(
             let parser_bg = parser.clone();
             let acc_bg = accumulator.clone();
 
-            // Track whether the stream completed successfully so we can
-            // roll back the user message on abort/error.
-            let stream_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let completed_flag = stream_completed.clone();
+            // Oneshot channel: signals the safety-net task to cancel when
+            // the stream finishes (success or error). Without this the
+            // safety-net sleeps for the full 600s even on normal completion.
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+            let done_tx = Arc::new(Mutex::new(Some(done_tx)));
+            let done_tx_bg = done_tx.clone();
+            let msg_id_for_stream = msg_id.clone();
 
             let body = axum::body::Body::from_stream(
                 futures::stream::unfold(
@@ -366,10 +361,19 @@ async fn send_message_stream(
                         let store_ref = store_bg.clone();
                         let sid = session_id.clone();
                         let parser_ref = parser_bg.clone();
+                        let msg_id = msg_id_for_stream.clone();
                         let acc_ref = acc_bg.clone();
-                        let completed = completed_flag.clone();
+                        let done = done_tx_bg.clone();
                         async move {
                             use futures::StreamExt;
+
+                            // Helper: signal the safety-net task that we're done
+                            async fn signal_done(tx: &Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>) {
+                                if let Some(sender) = tx.lock().await.take() {
+                                    let _ = sender.send(());
+                                }
+                            }
+
                             match stream.next().await {
                                 Some(Ok(bytes)) => {
                                     let events = {
@@ -389,7 +393,7 @@ async fn send_message_stream(
                                         update_session_from_accumulator(
                                             &store_ref, &sid, &acc_ref,
                                         ).await;
-                                        completed.store(true, std::sync::atomic::Ordering::Release);
+                                        signal_done(&done).await;
                                     }
 
                                     Some((Ok::<_, std::convert::Infallible>(bytes), stream))
@@ -397,9 +401,9 @@ async fn send_message_stream(
                                 Some(Err(e)) => {
                                     tracing::warn!("SSE stream error, rolling back session {}: {e}", sid);
                                     let _ = store_ref.with_session(&sid, |session| {
-                                        session.rollback_message_at(msg_index, "user");
+                                        session.rollback_message_by_id(&msg_id);
                                     }).await;
-                                    completed.store(true, std::sync::atomic::Ordering::Release);
+                                    signal_done(&done).await;
                                     None
                                 }
                                 None => {
@@ -407,6 +411,7 @@ async fn send_message_stream(
                                         let mut p = parser_ref.lock().await;
                                         p.finish()
                                     };
+                                    let mut completed = false;
                                     if !trailing.is_empty() {
                                         let mut a = acc_ref.lock().await;
                                         for event in &trailing {
@@ -417,21 +422,22 @@ async fn send_message_stream(
                                             update_session_from_accumulator(
                                                 &store_ref, &sid, &acc_ref,
                                             ).await;
-                                            completed.store(true, std::sync::atomic::Ordering::Release);
+                                            completed = true;
                                         }
                                     }
 
-                                    if !completed.load(std::sync::atomic::Ordering::Acquire) {
+                                    if !completed {
                                         tracing::warn!(
                                             "SSE stream ended without message_stop, \
                                              rolling back session {}",
                                             sid
                                         );
                                         let _ = store_ref.with_session(&sid, |session| {
-                                            session.rollback_message_at(msg_index, "user");
+                                            session.rollback_message_by_id(&msg_id);
                                         }).await;
                                     }
 
+                                    signal_done(&done).await;
                                     None
                                 }
                             }
@@ -441,21 +447,28 @@ async fn send_message_stream(
             );
 
             // Background safety net for client disconnect (stream drop).
-            // When the client disconnects, the Body is dropped and the unfold
-            // future is cancelled — the None branch never runs.
+            // When the client disconnects mid-stream, the Body is dropped
+            // and the unfold future is cancelled — the None branch never
+            // runs and signal_done() is never called. In that case the
+            // 600s timeout fires and rolls back the pending user message.
+            // On normal completion, done_rx resolves immediately and the
+            // task exits without waiting.
             let rollback_store = store.clone();
             let rollback_sid = upstream_session_id.clone();
-            let rollback_completed = stream_completed.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
-                if !rollback_completed.load(std::sync::atomic::Ordering::Acquire) {
-                    tracing::warn!(
-                        "SSE stream for session {} timed out without completion, rolling back",
-                        rollback_sid
-                    );
-                    let _ = rollback_store.with_session(&rollback_sid, |session| {
-                        session.rollback_message_at(msg_index, "user");
-                    }).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(600)) => {
+                        tracing::warn!(
+                            "SSE stream for session {} timed out without completion, rolling back",
+                            rollback_sid
+                        );
+                        let _ = rollback_store.with_session(&rollback_sid, |session| {
+                            session.rollback_message_by_id(&msg_id);
+                        }).await;
+                    }
+                    _ = done_rx => {
+                        // Stream completed normally — nothing to do
+                    }
                 }
             });
 
@@ -468,14 +481,10 @@ async fn send_message_stream(
         }
         Err(e) => {
             let _ = store.with_session(&id, |session| {
-                session.rollback_message_at(msg_index, "user");
+                session.rollback_message_by_id(&msg_id);
             }).await;
 
-            let status = StatusCode::from_u16(e.http_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status, Json(json!({
-                "error": { "type": e.error_code(), "message": e.to_string() }
-            }))).into_response()
+            super::proxy_error_response(e)
         }
     }
 }
@@ -509,14 +518,4 @@ async fn update_session_from_accumulator(
             session.last_activity = crate::proxy_session::epoch_secs();
         }).await;
     }
-}
-
-fn error_response(status: u16, code: &str, message: &str) -> Response {
-    let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status_code, Json(json!({
-        "error": {
-            "type": code,
-            "message": message,
-        }
-    }))).into_response()
 }

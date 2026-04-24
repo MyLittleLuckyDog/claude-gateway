@@ -59,21 +59,16 @@ pub struct ClaudeAgentOptions {
     pub add_dirs: Option<Vec<PathBuf>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum PermissionMode {
+    #[default]
     Default,
     AcceptEdits,
     Plan,
     BypassPermissions,
     #[serde(rename = "dontAsk")]
     DontAsk,
-}
-
-impl Default for PermissionMode {
-    fn default() -> Self {
-        Self::Default
-    }
 }
 
 impl PermissionMode {

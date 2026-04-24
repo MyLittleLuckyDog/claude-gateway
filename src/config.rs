@@ -18,6 +18,10 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
+    /// Allowed CORS origins. Empty = permissive (allow all).
+    /// Default: localhost only.
+    #[serde(default = "default_cors_origins")]
+    pub cors_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -28,11 +32,19 @@ pub struct CliConfig {
     pub session_idle_timeout_secs: u64,
 }
 
+fn default_cors_origins() -> Vec<String> {
+    vec![
+        "http://localhost".to_string(),
+        "http://127.0.0.1".to_string(),
+    ]
+}
+
 fn default_server_config() -> ServerConfig {
     ServerConfig {
         host: default_host(),
         port: default_port(),
         max_sessions: default_max_sessions(),
+        cors_origins: default_cors_origins(),
     }
 }
 

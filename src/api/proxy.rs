@@ -14,8 +14,9 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde_json::json;
 
+use super::{error_response, proxy_error_response};
 use crate::api::AppState;
-use crate::proxy::{self, ProxyError};
+use crate::proxy;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -238,24 +239,4 @@ async fn auth_status_handler() -> Response {
             })).into_response()
         }
     }
-}
-
-fn error_response(status: u16, code: &str, message: &str) -> Response {
-    let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status_code, Json(json!({
-        "error": {
-            "type": code,
-            "message": message,
-        }
-    }))).into_response()
-}
-
-fn proxy_error_response(e: ProxyError) -> Response {
-    let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(json!({
-        "error": {
-            "type": e.error_code(),
-            "message": e.to_string(),
-        }
-    }))).into_response()
 }
