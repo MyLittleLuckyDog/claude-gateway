@@ -56,14 +56,32 @@ INFO Starting claude-agent-rs on 127.0.0.1:8765
 host = "127.0.0.1"
 port = 8765
 max_sessions = 100
+cors_origins = ["http://localhost", "http://127.0.0.1"]  # 빈 배열 = 모두 허용
 
 [cli]
 bin_path = ""                    # 빈 문자열 = PATH 자동 탐색
-session_idle_timeout_secs = 1800 # 30분
+session_idle_timeout_secs = 1800 # 30분 (CLI wrap 세션)
+
+[proxy]
+enabled = true                   # /v1/* 라우트 활성화
+max_concurrent = 1               # 동시 API 호출 수 (보수적 기본)
+max_proxy_sessions = 50          # 프록시 세션 상한
+session_idle_timeout_secs = 1800 # 30분 (프록시 세션)
 ```
 
-환경변수: `CLAUDE_GATEWAY__SERVER__PORT=9000`
-로그: `RUST_LOG=debug ./claude-agent-rs`
+환경변수 오버라이드: `CLAUDE_GATEWAY__<SECTION>__<FIELD>` 형식.
+예: `CLAUDE_GATEWAY__SERVER__PORT=9000`, `CLAUDE_GATEWAY__PROXY__MAX_CONCURRENT=4`.
+
+기타 인식되는 환경변수:
+
+| 변수 | 용도 |
+|------|------|
+| `RUST_LOG` | 로그 레벨 (`info`, `debug`, `claude_agent=debug`, …) |
+| `CLAUDE_CONFIG_DIR` | Claude Code 설정 디렉터리 (토큰/credentials 위치) |
+| `CLAUDE_CODE_CUSTOM_OAUTH_URL` | 사내망 OAuth 엔드포인트 override (allowlist됨) |
+| `USE_LOCAL_OAUTH`, `USE_STAGING_OAUTH`, `USER_TYPE` | Anthropic 내부 테스트용 OAuth 런타임 선택 |
+| `CLAUDE_LOCAL_OAUTH_API_BASE` | 로컬 OAuth 서버 베이스 URL |
+| `CLAUDE_GATEWAY_SKIP_KEYCHAIN=1` | **테스트 전용**. macOS Keychain 접근 차단. |
 
 ---
 
@@ -76,12 +94,16 @@ CLI subprocess 오버헤드 없이 빠르고, Haiku/Sonnet/Opus 자유 선택 �
 
 | 별칭 | 정규 ID |
 |------|---------|
-| `haiku` | `claude-haiku-4-5-20251001` |
-| `sonnet` | `claude-sonnet-4-6` |
+| `haiku`, `haiku4.5`, `claude-haiku` | `claude-haiku-4-5-20251001` |
 | `sonnet4` | `claude-sonnet-4-20250514` |
-| `opus` | `claude-opus-4-6` |
+| `sonnet4.5` | `claude-sonnet-4-5-20250929` |
+| `sonnet`, `claude-sonnet` | `claude-sonnet-4-6` |
+| `opus4` | `claude-opus-4-20250514` |
+| `opus4.5` | `claude-opus-4-5-20251101` |
+| `opus`, `claude-opus` | `claude-opus-4-6` |
 
-정규 ID를 직접 써도 됩니다.
+정규 ID를 직접 써도 되고, 접두사 매치(`claude-sonnet-4-6-...`)도 통합니다.
+모델이 지정되지 않으면 기본값은 `sonnet` (`claude-sonnet-4-6`).
 
 ### 단일 요청 (Stateless)
 
@@ -140,6 +162,11 @@ curl http://localhost:8765/v1/sessions
 
 # 6. 세션 삭제
 curl -X DELETE http://localhost:8765/v1/sessions/abc-123
+
+# 7. 세션 내 메시지 스트리밍 (SSE)
+curl -N -X POST http://localhost:8765/v1/sessions/abc-123/msg/stream \
+  -H "Content-Type: application/json" \
+  -d '{"content": "스트리밍으로 답해봐"}'
 ```
 
 #### 세션 생성 옵션
@@ -268,6 +295,15 @@ POST   /sessions/{id}/interrupt
 
 ### Hook 시스템
 
+세션 옵션에 `hook_rules`를 넣으면 gateway가 CLI spawn 직후 `initialize`
+제어 요청으로 각 규칙을 콜백 ID로 등록합니다. 이후 CLI가 `PreToolUse` 등의
+`hook_callback`을 제어 프로토콜로 올려보내면 서버 규칙이 우선 평가되어
+`approve` / `block` / `defer`를 결정합니다. 우선순위: **block > approve > defer**.
+
+`defer`로 매칭되거나 매칭되는 규칙이 없으면 해당 이벤트가 `type: hook_request`
+SSE 메시지로 클라이언트에 전달되고, 30초 안에 아래 엔드포인트로 응답해야
+합니다(미응답 시 자동 approve + 히스토리에 `hook_timeout` 에러 기록).
+
 ```json
 {
   "options": {
@@ -278,6 +314,13 @@ POST   /sessions/{id}/interrupt
     ]
   }
 }
+```
+
+```bash
+# 클라이언트 defer 응답 (요청은 SSE로 받은 request_id 사용)
+curl -X POST http://localhost:8765/sessions/{id}/hook_response \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "<from stream>", "decision": "block", "reason": "manual deny"}'
 ```
 
 ### 관리 API

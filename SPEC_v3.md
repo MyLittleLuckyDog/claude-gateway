@@ -1,8 +1,27 @@
 # claude-agent-rs — 확정 요구사항 명세 v3
 
 > 작성: 2026-04-03 | 베이스: SPEC.md v2 + DESIGN.md  
-> 상태: **구현 착수 가능 (선행 조사 완료)**  
+> 상태: **Phase 1~5 구현 완료 (2026-04 기준)**  
 > 목표: Claude Code CLI가 RALP 루프로 자율 구현 완료
+
+---
+
+## 📌 구현 후 업데이트 노트 (2026-04-25)
+
+본 SPEC의 **Hook 프로토콜** 섹션은 구현 과정에서 CLI 실제 동작에 맞춰
+재설계되었습니다. 현행 정상 스펙은 **README.md / docs/USAGE.md**를 참조하세요.
+
+변경 요약:
+- 최상위 메시지 `{"type":"hook_request","hook_id":...}` →
+  SDK 제어 프로토콜 `{"type":"control_request","request_id":...,"request":{"subtype":"hook_callback",...}}`
+- 응답 `{"type":"hook_response",...}` →
+  `{"type":"control_response","response":{"subtype":"success","request_id":...,"response":{...}}}`
+- CLI spawn 직후 `{"subtype":"initialize","hooks":{...}}` 제어 요청으로 콜백 등록
+- 클라이언트 응답 엔드포인트 `POST /sessions/:id/hook_response` 는 `hook_id` 대신
+  `request_id` 필드를 사용
+
+SPEC 본문의 `hook_id`, `HookResponse`, `CliHookRequestEvent` 등 구 용어는
+**역사적 참조**이며 현 코드와 일치하지 않습니다.
 
 ---
 

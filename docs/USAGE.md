@@ -46,17 +46,36 @@ claude --version
 [server]
 host = "127.0.0.1"
 port = 8765
-max_sessions = 100
+max_sessions = 100                  # CLI-wrap 세션 상한
+cors_origins = ["http://localhost", "http://127.0.0.1"]  # 빈 배열 = 모두 허용
 
 [cli]
-bin_path = ""                    # 빈 문자열 = PATH에서 자동 탐색
-session_idle_timeout_secs = 1800 # 30분 유휴 시 세션 자동 정리
+bin_path = ""                       # 빈 문자열 = PATH에서 자동 탐색
+session_idle_timeout_secs = 1800    # 30분 유휴 시 세션 자동 정리
+
+[proxy]
+enabled = true                      # /v1/* 라우트 on/off
+max_concurrent = 1                  # 동시 API 호출 수
+max_proxy_sessions = 50             # Proxy 세션 상한
+session_idle_timeout_secs = 1800    # Proxy 세션 idle timeout
 ```
 
-환경변수로도 설정 가능:
+환경변수로도 설정 가능 (섹션/필드 구분은 `__`):
 ```bash
 CLAUDE_GATEWAY__SERVER__PORT=9000 ./claude-agent-rs
+CLAUDE_GATEWAY__PROXY__MAX_CONCURRENT=4 ./claude-agent-rs
 ```
+
+기타 환경변수:
+
+| 변수 | 용도 |
+|------|------|
+| `RUST_LOG` | 로그 레벨 (`info` / `debug` / `claude_agent=debug`) |
+| `CLAUDE_CONFIG_DIR` | Claude Code 설정 디렉터리 (credentials 읽기 경로) |
+| `CLAUDE_CODE_CUSTOM_OAUTH_URL` | 사내망 OAuth 엔드포인트 override (allowlist 필수) |
+| `USE_LOCAL_OAUTH`, `USE_STAGING_OAUTH`, `USER_TYPE` | Anthropic 내부 테스트용 OAuth 런타임 선택 |
+| `CLAUDE_LOCAL_OAUTH_API_BASE` | 로컬 OAuth 서버 베이스 URL |
+| `CLAUDE_GATEWAY_SKIP_KEYCHAIN=1` | **테스트 전용**. macOS Keychain 우회 (원본 토큰 보호). |
 
 ### 로그 레벨
 ```bash
@@ -105,9 +124,54 @@ curl http://localhost:8765/stats
 #### `GET /config`
 현재 서버 설정 조회.
 
+#### Proxy 모드 모니터링 (`/v1/*`)
+
+| 엔드포인트 | 설명 |
+|-----------|------|
+| `GET /v1/auth_status` | OAuth 토큰 유효성, 구독 종류, rate_limit tier |
+| `GET /v1/rate_limit` | 5h/7d 사용률, 리셋 시각, `allowed/warning/rejected` 상태 |
+| `GET /v1/proxy_stats` | 누적 요청/입출력 토큰, 동시 호출 여유 |
+
 ---
 
-### 3.2 단일 쿼리 (세션 없음)
+### 3.2 Proxy 모드 (`/v1/*`) — Direct Messages API
+
+Claude Code OAuth 토큰으로 `api.anthropic.com/v1/messages`를 직접 호출합니다.
+CLI subprocess 없이 빠르고, 7종 모델을 자유롭게 섞어쓸 수 있습니다.
+상세 모델 별칭표는 [README.md](../README.md#모델-별칭) 참조.
+
+#### `POST /v1/messages` — 단일 요청 (동기)
+```bash
+curl -X POST http://localhost:8765/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "haiku",
+    "max_tokens": 100,
+    "system": "계산기. 숫자만 답해.",
+    "messages": [{"role": "user", "content": "2+2"}]
+  }'
+```
+`max_tokens` 생략 시 기본 8000.
+
+#### `POST /v1/messages/stream` — SSE 스트리밍
+동일 body로 `event: message_start`, `content_block_delta`, `message_stop` SSE 이벤트를 받습니다.
+
+#### Proxy 세션 (멀티턴)
+
+| 엔드포인트 | 설명 |
+|-----------|------|
+| `POST /v1/sessions` | 세션 생성. body: `{model, system?, max_tokens?, temperature?, tools?, tool_choice?, betas?}` |
+| `GET /v1/sessions` | 세션 목록 |
+| `GET /v1/sessions/:id` | 세션 상태 + 메시지 배열 |
+| `DELETE /v1/sessions/:id` | 세션 삭제 |
+| `POST /v1/sessions/:id/msg` | 메시지 전송 (이전 대화 자동 포함) |
+| `POST /v1/sessions/:id/msg/stream` | SSE 스트리밍 버전 |
+
+tool_use 라운드트립은 `POST /v1/sessions/:id/msg` body에 `{"is_tool_result": true, "content": [{"type":"tool_result","tool_use_id":"...","content":"..."}]}` 를 실어보냅니다 (상세: [README.md](../README.md#tool_use-라운드트립)).
+
+---
+
+### 3.3 단일 쿼리 (세션 없음, CLI wrap)
 
 #### `POST /query`
 한 번 질의하고 결과를 JSON으로 받음.
@@ -160,7 +224,7 @@ data: [DONE]
 
 ---
 
-### 3.3 세션 (Multi-turn 대화)
+### 3.4 세션 (Multi-turn 대화, CLI wrap)
 
 #### `POST /sessions` — 세션 생성
 ```bash
@@ -233,7 +297,7 @@ curl -X POST http://localhost:8765/sessions/abc-123/interrupt
 
 ---
 
-### 3.4 Hook 시스템
+### 3.5 Hook 시스템
 
 Claude가 도구(Edit, Bash 등)를 실행하기 전 hook 이벤트가 발생. 두 가지 처리 방식:
 
@@ -255,13 +319,19 @@ Claude가 도구(Edit, Bash 등)를 실행하기 전 hook 이벤트가 발생. �
 
 **B. 클라이언트 응답** — SSE에서 `hook_request` 수신 시 30초 내 응답:
 ```bash
-# SSE에서 수신:
-# data: {"type":"hook_request","hook_id":"hook-001","hook_event_name":"PreToolUse","tool_name":"Edit",...}
+# SSE에서 수신 (request_id는 CLI 제어 프로토콜의 control_request.request_id):
+# data: {"type":"hook_request","request_id":"req-001","callback_id":"hook_0",
+#        "hook_event_name":"PreToolUse","tool_name":"Edit","tool_use_id":"toolu_..."}
 
-# 30초 내 응답:
+# 30초 내 응답 (decision + reason 혹은 response raw 둘 중 하나 사용):
 curl -X POST http://localhost:8765/sessions/abc-123/hook_response \
   -H "Content-Type: application/json" \
-  -d '{"hook_id": "hook-001", "decision": "approve"}'
+  -d '{"request_id": "req-001", "decision": "approve"}'
+
+# 또는 control_response.response 전체를 직접 지정:
+curl -X POST http://localhost:8765/sessions/abc-123/hook_response \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "req-001", "response": {"decision": "block", "reason": "policy"}}'
 ```
 
 decision 값:
@@ -275,7 +345,7 @@ decision 값:
 
 ---
 
-### 3.5 MCP 서버 연결
+### 3.6 MCP 서버 연결
 
 외부 MCP(Model Context Protocol) 서버를 세션에 연결:
 
@@ -306,22 +376,27 @@ decision 값:
 | 필드 | 타입 | 기본값 | 설명 |
 |------|------|--------|------|
 | `system_prompt` | string | null | 시스템 프롬프트 |
-| `model` | string | null | 모델 (예: `claude-sonnet-4-6`) |
+| `model` | string | null | 모델 (예: `claude-sonnet-4-6`, 또는 별칭 `sonnet`) |
+| `fallback_model` | string | null | 주 모델 불가 시 대체 모델 |
 | `permission_mode` | string | `"default"` | `default`, `acceptEdits`, `plan`, `bypassPermissions`, `dontAsk` |
 | `max_turns` | number | null | 최대 턴 수 |
 | `max_budget_usd` | number | null | 비용 한도 (USD) |
 | `allowed_tools` | string[] | null | 허용 도구 목록 |
 | `disallowed_tools` | string[] | null | 차단 도구 목록 |
-| `mcp_servers` | object | null | MCP 서버 설정 (위 참조) |
+| `mcp_servers` | object | null | MCP 서버 설정 (3.6 참조) |
 | `hook_rules` | array | null | 서버사이드 훅 규칙 |
 | `resume` | string | null | 이전 세션 재개 (CLI session_id) |
 | `continue_conversation` | bool | false | 가장 최근 세션 계속 |
+| `fork_session` | string | null | 지정한 세션을 분기(fork)해서 시작 |
 | `cwd` | string | null | CLI 작업 디렉토리 |
 | `env` | object | null | CLI 환경변수 |
 | `cli_path` | string | null | claude CLI 경로 (기본: PATH 탐색) |
+| `add_dirs` | string[] | null | CLI에 추가로 노출할 작업 디렉토리(`--add-dir`) |
 | `include_partial_messages` | bool | false | 스트리밍 중간 메시지 포함 |
+| `output_format` | any | null | 출력 형식 오버라이드 (SDK와 동일 스키마) |
+| `agents` | object | null | subagent 정의 맵 (이름→definition) |
 | `betas` | string[] | null | 베타 기능 활성화 |
-| `setting_sources` | string[] | `[""]` | 설정 소스 (빈 배열=격리) |
+| `setting_sources` | string[] | `[""]` | 설정 소스 (빈 배열=격리, `user/project/local` 혼합) |
 
 ---
 
