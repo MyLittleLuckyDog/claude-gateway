@@ -1,12 +1,13 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::config::AppConfig;
 use crate::error::GatewayError;
-use crate::hooks;
+use crate::hooks::{self, AutoResolveOutcome};
 use crate::messages::Message;
+use crate::messages::cli_control::{ControlRequestOut, ControlRequestPayload};
 use crate::messages::cli_output::{CliOutputEvent, SystemSubtype};
 use crate::options::ClaudeAgentOptions;
 use crate::query::cli_output_to_message;
@@ -89,6 +90,35 @@ async fn run_session_loop(
     let mut event_rx = transport.event_receiver()
         .ok_or_else(|| GatewayError::Internal("No event receiver".to_string()))?;
 
+    // Register hook callbacks with the CLI via an initialize control_request
+    // BEFORE we relay the user's first message. Without this step the CLI
+    // never routes PreToolUse events back to us and hook_rules are dead.
+    let callback_map: HashMap<String, usize> =
+        match hooks::build_initialize_hooks(&options) {
+            Some((hooks_cfg, cbmap)) => {
+                let req_id = format!("init-{}", uuid::Uuid::new_v4());
+                let init = ControlRequestOut::new(
+                    req_id.clone(),
+                    serde_json::json!({"subtype": "initialize", "hooks": hooks_cfg}),
+                );
+                match serde_json::to_string(&init) {
+                    Ok(s) => {
+                        if let Err(e) = transport.write(&s).await {
+                            tracing::warn!("initialize control_request failed: {}", e);
+                        } else {
+                            tracing::debug!(
+                                "session {}: sent initialize request_id={}",
+                                session_id_str, req_id
+                            );
+                        }
+                    }
+                    Err(e) => tracing::warn!("initialize serialize failed: {}", e),
+                }
+                cbmap
+            }
+            None => HashMap::new(),
+        };
+
     transport.write(&first_msg).await?;
 
     loop {
@@ -112,25 +142,66 @@ async fn run_session_loop(
                             CliOutputEvent::Result(_) => {
                                 *session.state.lock().await = SessionState::Idle;
                             }
-                            CliOutputEvent::HookRequest(ref h) => {
-                                if let Some(response_json) = hooks::try_auto_resolve_hook(&options, h) {
-                                    tracing::info!("Hook {} auto-resolved by server rules", h.hook_id);
-                                    if let Err(e) = transport.write(&response_json).await {
-                                        tracing::error!("Failed to write auto-resolved hook response: {}", e);
+                            CliOutputEvent::ControlRequest(ref ctl) => {
+                                match &ctl.request {
+                                    ControlRequestPayload::HookCallback(hc) => {
+                                        let outcome = hooks::try_auto_resolve_hook(
+                                            &options,
+                                            &ctl.request_id,
+                                            hc,
+                                        );
+                                        match outcome {
+                                            AutoResolveOutcome::Respond(json) => {
+                                                tracing::info!(
+                                                    "hook_callback {} (rule={}) auto-resolved",
+                                                    ctl.request_id,
+                                                    callback_map
+                                                        .get(&hc.callback_id)
+                                                        .map(|i| i.to_string())
+                                                        .unwrap_or_else(|| "?".to_string())
+                                                );
+                                                if let Err(e) = transport.write(&json).await {
+                                                    tracing::error!(
+                                                        "write auto-resolved hook response: {}",
+                                                        e
+                                                    );
+                                                }
+                                                *session.state.lock().await = SessionState::Running;
+                                            }
+                                            AutoResolveOutcome::DeferToClient => {
+                                                let deadline = std::time::Instant::now()
+                                                    + std::time::Duration::from_secs(30);
+                                                *session.state.lock().await =
+                                                    SessionState::WaitingForHook {
+                                                        request_id: ctl.request_id.clone(),
+                                                        deadline,
+                                                    };
+                                                let handle = hooks::spawn_hook_timeout(
+                                                    session.clone(),
+                                                    ctl.request_id.clone(),
+                                                );
+                                                *session.hook_timeout_handle.lock().await =
+                                                    Some(handle);
+                                            }
+                                        }
                                     }
-                                    *session.state.lock().await = SessionState::Running;
-                                } else {
-                                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                                    *session.state.lock().await = SessionState::WaitingForHook {
-                                        hook_id: h.hook_id.clone(),
-                                        deadline,
-                                    };
-                                    let handle = hooks::spawn_hook_timeout(
-                                        session.clone(),
-                                        h.hook_id.clone(),
-                                    );
-                                    *session.hook_timeout_handle.lock().await = Some(handle);
+                                    ControlRequestPayload::CanUseTool(_)
+                                    | ControlRequestPayload::Unknown => {
+                                        // Not implemented yet — reject so the CLI doesn't hang.
+                                        let err = crate::messages::cli_control::ControlResponseOut::error(
+                                            ctl.request_id.clone(),
+                                            "subtype not supported by server",
+                                        );
+                                        if let Ok(s) = serde_json::to_string(&err) {
+                                            let _ = transport.write(&s).await;
+                                        }
+                                    }
                                 }
+                            }
+                            CliOutputEvent::ControlResponse(_) => {
+                                // Response to a request WE issued (e.g. initialize).
+                                // We don't currently block on these — future work may
+                                // track request_id ↔ oneshot for stricter handshakes.
                             }
                             CliOutputEvent::Unknown => continue,
                             _ => {}

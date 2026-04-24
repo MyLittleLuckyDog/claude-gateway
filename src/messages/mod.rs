@@ -1,3 +1,4 @@
+pub mod cli_control;
 pub mod cli_input;
 pub mod cli_output;
 pub mod content;
@@ -44,12 +45,16 @@ pub enum Message {
         uuid: Option<String>,
         stream_event: Value,
     },
+    /// A hook_callback control_request surfaced to streaming clients. The
+    /// `request_id` lets the client respond via `/sessions/:id/hook_response`
+    /// when the server has no matching rule (the defer path).
     HookRequest {
-        hook_id: String,
-        session_id: String,
+        request_id: String,
+        callback_id: String,
         hook_event_name: String,
         tool_name: Option<String>,
         tool_input: Option<Value>,
+        tool_use_id: Option<String>,
     },
     Error {
         message: String,

@@ -72,15 +72,23 @@ fn test_parse_result_error() {
 
 #[test]
 fn test_parse_hook_request() {
+    use claude_agent::messages::cli_control::{ControlRequestPayload, HookCallbackInput};
     let raw = include_str!("fixtures/hook_request.json");
     let event: CliOutputEvent = serde_json::from_str(raw).expect("parse hook request");
     match event {
-        CliOutputEvent::HookRequest(h) => {
-            assert_eq!(h.hook_id, "hook-uuid-001");
-            assert_eq!(h.hook_event_name, "PreToolUse");
-            assert_eq!(h.tool_name.as_deref(), Some("Edit"));
+        CliOutputEvent::ControlRequest(ctl) => {
+            assert_eq!(ctl.request_id, "req-uuid-001");
+            match ctl.request {
+                ControlRequestPayload::HookCallback(hc) => {
+                    assert_eq!(hc.callback_id, "hook_0");
+                    let input = HookCallbackInput::from_value(&hc.input);
+                    assert_eq!(input.hook_event_name, "PreToolUse");
+                    assert_eq!(input.tool_name.as_deref(), Some("Edit"));
+                }
+                _ => panic!("Expected hook_callback subtype"),
+            }
         }
-        _ => panic!("Expected HookRequest event"),
+        _ => panic!("Expected ControlRequest event"),
     }
 }
 

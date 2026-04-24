@@ -16,7 +16,7 @@ pub enum SessionState {
     Initializing,
     Idle,
     Running,
-    WaitingForHook { hook_id: String, deadline: std::time::Instant },
+    WaitingForHook { request_id: String, deadline: std::time::Instant },
     Completed,
     Dead,
 }

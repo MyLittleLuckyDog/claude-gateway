@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::cli_control::ControlRequest;
 use super::content::{ContentBlock, SessionUsage, TokenUsage};
 
 /// All event types read from CLI stdout
@@ -12,7 +13,12 @@ pub enum CliOutputEvent {
     User(CliUserEvent),
     Result(CliResultEvent),
     StreamEvent(CliStreamEventWrapper),
-    HookRequest(CliHookRequestEvent),
+    /// Inbound control_request envelope (hook callbacks, tool permission asks, ...).
+    /// Replaces the older top-level `hook_request` shape.
+    ControlRequest(ControlRequest),
+    /// Control response from CLI to a request we issued (e.g. initialize).
+    /// Kept as raw value — the session loop matches request_id and moves on.
+    ControlResponse(Value),
     /// Unknown event types (rate_limit_event, etc.) — ignored gracefully
     #[serde(other)]
     Unknown,
@@ -94,15 +100,6 @@ pub struct CliStreamEventWrapper {
     pub parent_tool_use_id: Option<String>,
     pub uuid: Option<String>,
     pub stream_event: Value,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CliHookRequestEvent {
-    pub hook_id: String,
-    pub session_id: String,
-    pub hook_event_name: String,
-    pub tool_name: Option<String>,
-    pub tool_input: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, Clone, Serialize)]

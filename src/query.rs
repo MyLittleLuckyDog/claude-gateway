@@ -199,12 +199,29 @@ pub fn cli_output_to_message(event: CliOutputEvent) -> Message {
             uuid: se.uuid,
             stream_event: se.stream_event,
         },
-        CliOutputEvent::HookRequest(h) => Message::HookRequest {
-            hook_id: h.hook_id,
-            session_id: h.session_id,
-            hook_event_name: h.hook_event_name,
-            tool_name: h.tool_name,
-            tool_input: h.tool_input,
+        CliOutputEvent::ControlRequest(ctl) => {
+            use crate::messages::cli_control::{ControlRequestPayload, HookCallbackInput};
+            match ctl.request {
+                ControlRequestPayload::HookCallback(hc) => {
+                    let input = HookCallbackInput::from_value(&hc.input);
+                    Message::HookRequest {
+                        request_id: ctl.request_id,
+                        callback_id: hc.callback_id,
+                        hook_event_name: input.hook_event_name,
+                        tool_name: input.tool_name,
+                        tool_input: input.tool_input,
+                        tool_use_id: hc.tool_use_id,
+                    }
+                }
+                _ => Message::Error {
+                    message: "Unsupported control_request subtype".to_string(),
+                    code: "unsupported_control".to_string(),
+                },
+            }
+        }
+        CliOutputEvent::ControlResponse(_) => Message::Error {
+            message: "Unexpected control_response in stream".to_string(),
+            code: "unexpected_control_response".to_string(),
         },
         CliOutputEvent::Unknown => Message::Error {
             message: "Unknown CLI event type".to_string(),

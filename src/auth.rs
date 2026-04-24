@@ -475,7 +475,14 @@ fn persist_token_update(
 }
 
 fn read_storage_entry_raw() -> Result<(CredentialSource, String), String> {
-    if cfg!(target_os = "macos") {
+    // Test-only escape hatch: when set, skip the system keychain so unit tests
+    // never read (or, worse, write to) the user's real credentials. Production
+    // callers don't set this variable.
+    let skip_keychain = std::env::var("CLAUDE_GATEWAY_SKIP_KEYCHAIN")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if cfg!(target_os = "macos") && !skip_keychain {
         let account = keychain_account_name();
         for service in keychain_service_candidates() {
             if let Ok(json_str) = read_keychain_entry(&service, &account) {
@@ -779,9 +786,36 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire the global env lock; if a prior test panicked while holding it
+    /// we recover the guard from the poison error rather than cascading the
+    /// failure across every remaining test.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        match ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(poison) => poison.into_inner(),
+        }
+    }
+
+    /// Combined guard for an auth test: holds ENV_LOCK *and* forces the file
+    /// credential path (via CLAUDE_GATEWAY_SKIP_KEYCHAIN=1) so the test is
+    /// fully isolated from the developer's real Keychain entry.
+    struct AuthTestGuard {
+        _lock: MutexGuard<'static, ()>,
+        _skip: EnvGuard,
+    }
+
+    impl AuthTestGuard {
+        fn new() -> Self {
+            Self {
+                _lock: env_lock(),
+                _skip: EnvGuard::set("CLAUDE_GATEWAY_SKIP_KEYCHAIN", "1"),
+            }
+        }
+    }
 
     struct EnvGuard {
         key: &'static str,
@@ -847,7 +881,7 @@ mod tests {
 
     #[test]
     fn default_keychain_service_name_matches_prod() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = AuthTestGuard::new();
         let _config = EnvGuard::unset("CLAUDE_CONFIG_DIR");
         let _custom = EnvGuard::unset("CLAUDE_CODE_CUSTOM_OAUTH_URL");
         let _local = EnvGuard::unset("USE_LOCAL_OAUTH");
@@ -858,7 +892,7 @@ mod tests {
 
     #[test]
     fn custom_oauth_url_must_be_allowlisted() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = AuthTestGuard::new();
         let _custom = EnvGuard::set("CLAUDE_CODE_CUSTOM_OAUTH_URL", "https://example.com");
         let err = validated_custom_oauth_base().unwrap_err();
         assert!(err.contains("approved endpoint"));
@@ -866,7 +900,7 @@ mod tests {
 
     #[test]
     fn local_oauth_runtime_uses_local_endpoint() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = AuthTestGuard::new();
         let _user_type = EnvGuard::set("USER_TYPE", "ant");
         let _local = EnvGuard::set("USE_LOCAL_OAUTH", "1");
         let _api = EnvGuard::set("CLAUDE_LOCAL_OAUTH_API_BASE", "http://127.0.0.1:9999/");
@@ -876,7 +910,7 @@ mod tests {
 
     #[test]
     fn persist_token_update_keeps_newer_stored_token() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = AuthTestGuard::new();
         let temp_dir =
             std::env::temp_dir().join(format!("claude-gateway-auth-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
@@ -916,7 +950,7 @@ mod tests {
 
     #[test]
     fn refresh_last_credentials_mtime_tracks_file_write() {
-        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = AuthTestGuard::new();
         let temp_dir =
             std::env::temp_dir().join(format!("claude-gateway-auth-test-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();

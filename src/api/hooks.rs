@@ -6,17 +6,28 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::AppState;
 use crate::error::{ErrorResponse, GatewayError};
-use crate::messages::cli_input::{CliInputMessage, HookDecision};
+use crate::messages::cli_control::ControlResponseOut;
+use crate::messages::cli_input::CliInputMessage;
 use crate::session::SessionState;
 
+/// Client-driven hook response body.
+///
+/// For the common deny/allow cases clients pass `{"decision": "block", "reason": "..."}`
+/// or `{"decision": "approve"}`. Any additional fields are preserved in the
+/// `response` object forwarded to the CLI.
 #[derive(Deserialize)]
 pub struct HookResponseRequest {
-    pub hook_id: String,
-    pub decision: HookDecision,
+    pub request_id: String,
+    /// Raw control_response `response` payload (e.g. `{"decision":"block","reason":"..."}`).
+    /// If omitted we synthesize one from `decision` + `reason`.
+    #[serde(default)]
+    pub response: Option<Value>,
+    #[serde(default)]
+    pub decision: Option<String>,
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
@@ -39,20 +50,19 @@ async fn hook_response(
         Err(e) => return error_response(&e),
     };
 
-    // Validate state
     {
         let current_state = session.state.lock().await;
         match &*current_state {
-            SessionState::WaitingForHook { hook_id, deadline } => {
-                if *hook_id != body.hook_id {
+            SessionState::WaitingForHook { request_id, deadline } => {
+                if *request_id != body.request_id {
                     return error_response(&GatewayError::InvalidSessionState {
-                        expected: format!("waiting for hook {}", body.hook_id),
-                        actual: format!("waiting for hook {}", hook_id),
+                        expected: format!("waiting for request {}", body.request_id),
+                        actual: format!("waiting for request {}", request_id),
                     });
                 }
                 if std::time::Instant::now() > *deadline {
                     return error_response(&GatewayError::HookTimeout {
-                        hook_id: body.hook_id,
+                        hook_id: body.request_id,
                     });
                 }
             }
@@ -65,30 +75,40 @@ async fn hook_response(
         }
     }
 
-    // Build response message
-    let msg = CliInputMessage::HookResponse {
-        hook_id: body.hook_id,
-        decision: body.decision,
-        reason: body.reason,
-        updated_input: body.updated_input,
-        suppress_output: None,
+    // Build the inner response payload. Explicit `response` wins; otherwise we
+    // compose `{decision, reason?, updatedInput?}` — the keys the CLI expects.
+    let payload = match body.response {
+        Some(v) => v,
+        None => {
+            let mut obj = serde_json::Map::new();
+            if let Some(d) = body.decision {
+                obj.insert("decision".to_string(), Value::String(d));
+            }
+            if let Some(r) = body.reason {
+                obj.insert("reason".to_string(), Value::String(r));
+            }
+            if let Some(u) = body.updated_input {
+                // CLI-side field is camelCase (updatedInput).
+                obj.insert("updatedInput".to_string(), u);
+            }
+            Value::Object(obj)
+        }
     };
 
-    let json = match serde_json::to_string(&msg) {
+    let response = ControlResponseOut::success(body.request_id, payload);
+    let json = match serde_json::to_string(&response) {
         Ok(j) => j,
         Err(e) => return error_response(&GatewayError::Internal(format!("JSON error: {}", e))),
     };
 
-    // Cancel pending hook timeout task before transitioning state
     if let Some(handle) = session.hook_timeout_handle.lock().await.take() {
         handle.abort();
     }
 
-    // Send to CLI stdin
     match session.stdin_tx.send(json).await {
         Ok(_) => {
             *session.state.lock().await = SessionState::Running;
-            (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response()
+            (StatusCode::ACCEPTED, Json(json!({}))).into_response()
         }
         Err(_) => error_response(&GatewayError::Internal("stdin closed".to_string())),
     }
