@@ -21,6 +21,10 @@
   - turn 단위 non-interactive runtime을 세션처럼 묶는다.
   - 현재는 approval callback bridge 없이 headless 자동 실행에 초점을 둔다.
 
+- `Experimental Codex app-server mode` (`/codex/app/*`)
+  - 로컬 `codex app-server`를 stdio JSON-RPC로 실행한다.
+  - approval request/response가 필요한 세션은 이 경로가 담당한다.
+
 - `Experimental OpenAI API mode` (`/openai/v1/*`)
   - `OPENAI_API_KEY`가 있으면 OpenAI Responses API에 가깝게 프록시한다.
   - 현재는 stateless `responses`, `responses/stream`, `models` 수준만 제공한다.
@@ -86,6 +90,13 @@ Codex approval 쪽 확인 결과:
 3. 따라서 현재 gateway의 `exec` 기반 Codex transport는 interactive approval bridge를
    지원하지 않고, 향후 `app-server` 또는 `exec-server` backend가 필요하다.
 
+Codex app-server 쪽 확인 결과:
+
+1. `initialize -> thread/start -> turn/start` stdio JSON-RPC 왕복 확인
+2. sandbox 외부 쓰기 작업에서 `item/commandExecution/requestApproval` 수신 확인
+3. `approval_response` 이후 `serverRequest/resolved -> command completed -> final answer`
+   재개 확인
+
 확인 중 드러나 같이 수정한 항목:
 
 - 내부 `initialize`용 `control_response`가 사용자 스트림에 새던 문제 수정
@@ -125,6 +136,8 @@ Codex approval 쪽 확인 결과:
 5. Codex approval/interactive surface가 공식적으로 어떤 채널을 제공하는지 추가 검토
 6. Codex 세션 상태에 `last_turn_completed_at` 같은 운영 필드 보강
 7. OpenAI Responses proxy에 세션형 상위 표면을 얹을지 검토
+8. Codex app-server의 file-change / permissions approval payload를 더 친절한 상위
+   API로 감쌀지 검토
 
 ## 검증 명령
 

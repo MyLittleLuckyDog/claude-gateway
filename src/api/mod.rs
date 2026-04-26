@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod codex;
+pub mod codex_app;
 pub mod hooks;
 pub mod openai;
 pub mod proxy;
@@ -16,6 +17,7 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::config::AppConfig;
 use crate::codex::store::CodexSessionStore;
+use crate::codex_app::store::CodexAppSessionStore;
 use crate::openai_proxy::OpenAiProxyState;
 use crate::proxy::ProxyState;
 use crate::proxy_session::ProxySessionStore;
@@ -26,6 +28,7 @@ pub struct AppState {
     pub config: Arc<AppConfig>,
     pub sessions: Arc<SessionStore>,
     pub codex_sessions: Arc<CodexSessionStore>,
+    pub codex_app_sessions: Arc<CodexAppSessionStore>,
     pub start_time: std::time::Instant,
     pub stats: Arc<tokio::sync::Mutex<Stats>>,
     pub proxy: Option<Arc<ProxyState>>,
@@ -99,6 +102,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .merge(admin::routes())
         .merge(codex::routes())
+        .merge(codex_app::routes())
         .merge(openai::routes())
         .merge(query::routes())
         .merge(sessions::routes())

@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 use claude_agent::api::{self, AppState, Stats};
 use claude_agent::config::AppConfig;
 use claude_agent::codex::store::CodexSessionStore;
+use claude_agent::codex_app::store::CodexAppSessionStore;
 use claude_agent::openai_proxy::OpenAiProxyState;
 use claude_agent::session::store::SessionStore;
 
@@ -47,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(config);
     let sessions = Arc::new(SessionStore::new(config.server.max_sessions));
     let codex_sessions = Arc::new(CodexSessionStore::new(config.server.max_sessions));
+    let codex_app_sessions = Arc::new(CodexAppSessionStore::new(config.server.max_sessions));
 
     // Spawn cleanup task
     let cleanup_sessions = sessions.clone();
@@ -65,6 +67,17 @@ async fn main() -> anyhow::Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             cleanup_codex_sessions
                 .run_cleanup(cleanup_codex_config.cli.session_idle_timeout_secs)
+                .await;
+        }
+    });
+
+    let cleanup_codex_app_sessions = codex_app_sessions.clone();
+    let cleanup_codex_app_config = config.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            cleanup_codex_app_sessions
+                .run_cleanup(cleanup_codex_app_config.cli.session_idle_timeout_secs)
                 .await;
         }
     });
@@ -128,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
         sessions,
         codex_sessions,
+        codex_app_sessions,
         start_time: std::time::Instant::now(),
         stats: Arc::new(tokio::sync::Mutex::new(Stats::default())),
         proxy,

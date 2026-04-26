@@ -48,6 +48,54 @@ turn 단위 non-interactive 실행을 세션처럼 묶는 방식이다.
   `exec-server` backend가 필요하다.
 - Claude의 `hook_request` / `permission_request`와 1:1 parity를 목표로 하지 않는다.
 
+## Experimental Codex App-Server 모드
+
+approval callback이 필요한 Codex 세션은 별도 `app-server` 경로를 사용한다.
+
+- `/codex/app/sessions`
+- `/codex/app/sessions/:id/send`
+- `/codex/app/sessions/:id/stream`
+- `/codex/app/sessions/:id/messages`
+- `/codex/app/sessions/:id/approval_response`
+
+이 경로는 `codex app-server` stdio JSON-RPC를 래핑한다.
+현재 확인된 범위:
+
+- `thread/start`
+- `turn/start`
+- `item/commandExecution/requestApproval`
+- approval 응답 후 turn 재개
+
+예시:
+
+```bash
+# 1. approval-capable Codex 세션 생성
+curl -X POST http://localhost:8765/codex/app/sessions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "options": {
+      "cwd": "/path/to/workspace",
+      "model": "gpt-5.4-mini",
+      "sandbox": "workspace-write",
+      "approval_policy": "on-request"
+    }
+  }'
+
+# 2. 승인 필요한 작업 전송
+curl -X POST http://localhost:8765/codex/app/sessions/{id}/send \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Create /Users/me/outside.txt with the text hi, then answer with exactly hi."}'
+
+# 3. stream/messages에서 approval_request 확인
+# 4. 승인 응답
+curl -X POST http://localhost:8765/codex/app/sessions/{id}/approval_response \
+  -H "Content-Type: application/json" \
+  -d '{"request_id":"0","decision":"accept"}'
+```
+
+현재 1차 구현은 command approval 중심이다. file change / permissions approval은
+raw `response` body를 그대로 넘기는 방식으로 확장할 수 있다.
+
 ## 사전 요구사항
 
 | 항목 | 설명 |
