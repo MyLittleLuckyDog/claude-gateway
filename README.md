@@ -42,6 +42,10 @@ turn 단위 non-interactive 실행을 세션처럼 묶는 방식이다.
 현재 제한:
 - Codex approval callback bridge는 아직 없다.
 - 무인모드 기준으로 `approval_policy=never` 사용을 권장한다.
+- `approval_policy=on-request`, `untrusted`, `on-failure` 같은 interactive approval
+  정책은 현재 `exec` transport에서 명시적으로 거부된다.
+- Codex approval bridge를 붙이려면 `exec --json`이 아니라 `app-server` 또는
+  `exec-server` backend가 필요하다.
 - Claude의 `hook_request` / `permission_request`와 1:1 parity를 목표로 하지 않는다.
 
 ## 사전 요구사항
@@ -265,6 +269,37 @@ curl http://localhost:8765/v1/rate_limit
 # 프록시 누적 통계
 curl http://localhost:8765/v1/proxy_stats
 # → {"total_requests": 15, "total_input_tokens": 3200, "total_output_tokens": 1500, ...}
+```
+
+## Experimental OpenAI API 모드 (`/openai/v1/*`)
+
+`OPENAI_API_KEY`가 설정되어 있으면 OpenAI Responses API에 가까운 얇은 프록시를
+제공한다.
+
+- `POST /openai/v1/responses`
+- `POST /openai/v1/responses/stream`
+- `GET /openai/v1/models`
+- `GET /openai/v1/proxy_stats`
+
+현재 범위:
+- stateless Responses 호출
+- streaming passthrough
+- models 조회
+
+현재 제한:
+- OpenAI 세션/대화 상태는 서버가 따로 관리하지 않는다.
+- OpenAI tool loop는 caller가 처리해야 한다.
+- 현재는 Responses API 중심이며 Chat Completions 호환 표면은 없다.
+
+예시:
+
+```bash
+curl -X POST http://localhost:8765/openai/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-5.4-mini",
+    "input": "Reply with exactly: hi"
+  }'
 ```
 
 ---

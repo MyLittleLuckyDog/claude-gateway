@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 use claude_agent::api::{self, AppState, Stats};
 use claude_agent::config::AppConfig;
 use claude_agent::codex::store::CodexSessionStore;
+use claude_agent::openai_proxy::OpenAiProxyState;
 use claude_agent::session::store::SessionStore;
 
 #[derive(Parser)]
@@ -102,6 +103,13 @@ async fn main() -> anyhow::Result<()> {
         ))
     });
 
+    let openai = OpenAiProxyState::from_env();
+    if openai.is_some() {
+        tracing::info!("OpenAI Responses proxy enabled");
+    } else {
+        tracing::info!("OpenAI Responses proxy disabled (OPENAI_API_KEY not set)");
+    }
+
     // Spawn proxy session cleanup task
     if let Some(ref ps) = proxy_sessions {
         let cleanup_store = ps.clone();
@@ -124,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         stats: Arc::new(tokio::sync::Mutex::new(Stats::default())),
         proxy,
         proxy_sessions,
+        openai,
     };
 
     let app = api::build_router(state);

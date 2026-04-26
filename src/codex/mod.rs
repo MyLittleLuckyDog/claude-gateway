@@ -42,6 +42,17 @@ fn default_approval_policy(options: &CodexOptions) -> CodexApprovalPolicy {
         .unwrap_or(CodexApprovalPolicy::Never)
 }
 
+fn validate_automation_policy(options: &CodexOptions) -> Result<(), GatewayError> {
+    let approval_policy = default_approval_policy(options);
+    let auto_exec = options.full_auto || options.dangerously_bypass_approvals_and_sandbox;
+    if !auto_exec && !matches!(approval_policy, CodexApprovalPolicy::Never) {
+        return Err(GatewayError::Internal(
+            "Codex approval bridging is not supported by the current exec transport. Use approval_policy=never, full_auto, or a future app-server backend.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn effective_prompt(prompt: &str, options: &CodexOptions, has_existing_thread: bool) -> String {
     match (&options.system_prompt, has_existing_thread) {
         (Some(system_prompt), false) if !system_prompt.trim().is_empty() => {
@@ -115,7 +126,8 @@ fn build_exec_command(
     prompt: &str,
     options: &CodexOptions,
     thread_id: Option<&str>,
-) -> Command {
+) -> Result<Command, GatewayError> {
+    validate_automation_policy(options)?;
     let mut cmd = Command::new(codex_cli_path(options));
     configure_base_command(&mut cmd, options);
     cmd.arg("exec");
@@ -128,7 +140,7 @@ fn build_exec_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    cmd
+    Ok(cmd)
 }
 
 fn raw_to_event(raw: RawCodexEvent) -> Option<CodexEvent> {
@@ -165,7 +177,7 @@ async fn run_command_collect(
     thread_id: Option<&str>,
 ) -> Result<CodexQueryResult, GatewayError> {
     let prompt = effective_prompt(prompt, options, thread_id.is_some());
-    let mut cmd = build_exec_command(&prompt, options, thread_id);
+    let mut cmd = build_exec_command(&prompt, options, thread_id)?;
     tracing::debug!("spawning Codex CLI: {:?}", cmd.as_std());
 
     let mut child = cmd.spawn().map_err(|e| {
@@ -278,7 +290,18 @@ pub async fn query_stream(
     let prompt = prompt.to_string();
     tokio::spawn(async move {
         let prompt = effective_prompt(&prompt, &options, false);
-        let mut cmd = build_exec_command(&prompt, &options, None);
+        let mut cmd = match build_exec_command(&prompt, &options, None) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                let _ = tx
+                    .send(CodexEvent::Error {
+                        message: e.to_string(),
+                        code: e.error_code().to_string(),
+                    })
+                    .await;
+                return;
+            }
+        };
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -425,6 +448,7 @@ pub fn path_display(path: &Path) -> String {
 mod tests {
     use super::{effective_prompt, raw_to_event};
     use crate::codex::messages::{CodexEvent, RawCodexEvent};
+    use crate::codex::options::{CodexApprovalPolicy, CodexOptions};
     use serde_json::json;
 
     #[test]
@@ -471,5 +495,17 @@ mod tests {
             }
             other => panic!("unexpected event: {:?}", other),
         }
+    }
+
+    #[test]
+    fn rejects_interactive_approval_policy_for_exec_transport() {
+        let options = CodexOptions {
+            approval_policy: Some(CodexApprovalPolicy::OnRequest),
+            ..Default::default()
+        };
+        let err = super::validate_automation_policy(&options).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Codex approval bridging is not supported"));
     }
 }
