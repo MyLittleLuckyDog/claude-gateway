@@ -4,6 +4,7 @@ use tracing_subscriber::EnvFilter;
 
 use claude_agent::api::{self, AppState, Stats};
 use claude_agent::config::AppConfig;
+use claude_agent::codex::store::CodexSessionStore;
 use claude_agent::session::store::SessionStore;
 
 #[derive(Parser)]
@@ -44,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(config);
     let sessions = Arc::new(SessionStore::new(config.server.max_sessions));
+    let codex_sessions = Arc::new(CodexSessionStore::new(config.server.max_sessions));
 
     // Spawn cleanup task
     let cleanup_sessions = sessions.clone();
@@ -52,6 +54,17 @@ async fn main() -> anyhow::Result<()> {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             cleanup_sessions.run_cleanup(cleanup_config.cli.session_idle_timeout_secs).await;
+        }
+    });
+
+    let cleanup_codex_sessions = codex_sessions.clone();
+    let cleanup_codex_config = config.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            cleanup_codex_sessions
+                .run_cleanup(cleanup_codex_config.cli.session_idle_timeout_secs)
+                .await;
         }
     });
 
@@ -106,6 +119,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         config: config.clone(),
         sessions,
+        codex_sessions,
         start_time: std::time::Instant::now(),
         stats: Arc::new(tokio::sync::Mutex::new(Stats::default())),
         proxy,

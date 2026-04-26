@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod codex;
 pub mod hooks;
 pub mod proxy;
 pub mod proxy_sessions;
@@ -13,6 +14,7 @@ use serde_json::json;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 use crate::config::AppConfig;
+use crate::codex::store::CodexSessionStore;
 use crate::proxy::ProxyState;
 use crate::proxy_session::ProxySessionStore;
 use crate::session::store::SessionStore;
@@ -21,6 +23,7 @@ use crate::session::store::SessionStore;
 pub struct AppState {
     pub config: Arc<AppConfig>,
     pub sessions: Arc<SessionStore>,
+    pub codex_sessions: Arc<CodexSessionStore>,
     pub start_time: std::time::Instant,
     pub stats: Arc<tokio::sync::Mutex<Stats>>,
     pub proxy: Option<Arc<ProxyState>>,
@@ -92,6 +95,7 @@ pub fn build_router(state: AppState) -> Router {
     let cors = build_cors_layer(&state.config.server.cors_origins);
     Router::new()
         .merge(admin::routes())
+        .merge(codex::routes())
         .merge(query::routes())
         .merge(sessions::routes())
         .merge(hooks::routes())

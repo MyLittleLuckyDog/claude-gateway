@@ -16,3 +16,4 @@ pub mod models;
 pub mod proxy;
 pub mod proxy_session;
 pub mod sse;
+pub mod codex;

@@ -3,6 +3,9 @@
 Claude Code CLI를 래핑하는 Rust 네이티브 REST API 게이트웨이.
 단일 바이너리로 배포되며, Claude Code 구독만으로 API 키 없이 동작합니다.
 
+아키텍처 확장 방향은 [docs/MULTI_PROVIDER_ARCHITECTURE.md](/Volumes/juryu_home/with_AI/projects/06.DenoV8POC/01.Tools/claude-gateway/docs/MULTI_PROVIDER_ARCHITECTURE.md:1)를 참고하세요.
+현재 기준은 `기존 Claude 경로 유지 + Codex 축 추가 + 얇은 공통층 추출`입니다.
+
 ## 두 가지 모드
 
 | 모드 | 경로 | 설명 |
@@ -15,6 +18,31 @@ Claude Code CLI를 래핑하는 Rust 네이티브 REST API 게이트웨이.
 Client ──HTTP──▶ gateway ─┤
                           └─ /query ──▶  claude CLI (subprocess)
 ```
+
+## Experimental Codex 모드
+
+현재는 Claude 경로와 별도로 `Codex` headless 경로를 실험적으로 제공한다.
+
+- `/codex/query`
+- `/codex/query/stream`
+- `/codex/sessions`
+- `/codex/sessions/:id/send`
+- `/codex/sessions/:id/stream`
+- `/codex/sessions/:id/messages`
+
+이 경로는 `codex exec --json` / `codex exec resume --json`을 래핑한다.
+즉 Claude처럼 장시간 붙어 있는 interactive subprocess가 아니라,
+turn 단위 non-interactive 실행을 세션처럼 묶는 방식이다.
+
+현재 범위:
+- 단발 query
+- 멀티턴 session resume
+- command execution / agent message / token usage 스트리밍
+
+현재 제한:
+- Codex approval callback bridge는 아직 없다.
+- 무인모드 기준으로 `approval_policy=never` 사용을 권장한다.
+- Claude의 `hook_request` / `permission_request`와 1:1 parity를 목표로 하지 않는다.
 
 ## 사전 요구사항
 
@@ -238,6 +266,98 @@ curl http://localhost:8765/v1/rate_limit
 curl http://localhost:8765/v1/proxy_stats
 # → {"total_requests": 15, "total_input_tokens": 3200, "total_output_tokens": 1500, ...}
 ```
+
+---
+
+## Codex 모드 API (`/codex/*`)
+
+Codex CLI를 headless non-interactive 채널로 사용한다.
+
+### 단일 요청
+
+```bash
+curl -X POST http://localhost:8765/codex/query \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Reply with exactly: hi",
+    "options": {
+      "sandbox": "read-only",
+      "approval_policy": "never"
+    }
+  }'
+```
+
+응답에는 `thread_id`, 마지막 `output_text`, `usage`, 그리고 JSONL에서 변환한 `events`
+배열이 포함된다.
+
+### 스트리밍
+
+```bash
+curl -N -X POST http://localhost:8765/codex/query/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Run pwd and print the directory path only.",
+    "options": {
+      "sandbox": "read-only",
+      "approval_policy": "never"
+    }
+  }'
+```
+
+### 세션
+
+```bash
+# 1. 세션 생성
+curl -X POST http://localhost:8765/codex/sessions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "options": {
+      "sandbox": "read-only",
+      "approval_policy": "never"
+    }
+  }'
+
+# 2. 첫 턴
+curl -X POST http://localhost:8765/codex/sessions/{id}/send \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Reply with exactly: first"}'
+
+# 3. 메시지/이벤트 조회
+curl http://localhost:8765/codex/sessions/{id}/messages
+
+# 4. 다음 턴
+curl -X POST http://localhost:8765/codex/sessions/{id}/send \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Reply with exactly: second"}'
+```
+
+세션은 내부적으로 Codex `thread_id`를 저장하고 다음 턴에서 `exec resume`를 사용한다.
+
+### Codex 옵션
+
+지원되는 주요 옵션:
+
+- `system_prompt`
+- `model`
+- `cwd`
+- `env`
+- `cli_path`
+- `add_dirs`
+- `profile`
+- `sandbox`
+- `approval_policy`
+- `full_auto`
+- `dangerously_bypass_approvals_and_sandbox`
+- `search`
+- `ephemeral`
+- `ignore_user_config`
+- `ignore_rules`
+- `skip_git_repo_check`
+
+권장 기본값:
+
+- `sandbox`: `read-only` 또는 `workspace-write`
+- `approval_policy`: `never`
 
 ### 트래픽 관리 규칙
 

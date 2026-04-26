@@ -2,6 +2,7 @@
 
 이 문서는 현재 `claude-gateway`의 CLI wrap / SDK-style control flow 구현 상태를
 소스 기준으로 정리한 운영 메모다. README/USAGE보다 더 구현 지향적인 상태 문서다.
+멀티 provider 확장 방향은 [MULTI_PROVIDER_ARCHITECTURE.md](/Volumes/juryu_home/with_AI/projects/06.DenoV8POC/01.Tools/claude-gateway/docs/MULTI_PROVIDER_ARCHITECTURE.md:1)에 따로 정리한다.
 
 ## 현재 포지션
 
@@ -14,6 +15,11 @@
   - 로컬 `claude` CLI를 subprocess로 실행한다.
   - headless runtime adapter 역할을 한다.
   - hook / permission control flow는 이 경로에서 처리된다.
+
+- `Experimental Codex mode` (`/codex/*`)
+  - 로컬 `codex` CLI를 `exec --json` / `exec resume --json`으로 실행한다.
+  - turn 단위 non-interactive runtime을 세션처럼 묶는다.
+  - 현재는 approval callback bridge 없이 headless 자동 실행에 초점을 둔다.
 
 ## 구현 완료 범위
 
@@ -59,6 +65,12 @@
 3. write-capable Bash에서 `permission_request` surface
 4. `permission_response` 후 turn 재개 및 tool 실행 완료
 
+Codex 쪽은 다음을 실제 로컬 실행으로 확인했다.
+
+1. `/codex/query` 단발 응답
+2. `/codex/sessions` 첫 turn 실행
+3. 저장된 `thread_id`로 `exec resume` 멀티턴 이어가기
+
 확인 중 드러나 같이 수정한 항목:
 
 - 내부 `initialize`용 `control_response`가 사용자 스트림에 새던 문제 수정
@@ -95,6 +107,8 @@
 2. 문서 예시에 `permission_request` / `hook_timeout_action=approve` 샘플 추가 보강
 3. 운영 로그 필드 정리
 4. 레퍼런스 전체 대비 아직 연결되지 않은 옵션 표면 추가 sweep
+5. Codex approval/interactive surface가 공식적으로 어떤 채널을 제공하는지 추가 검토
+6. Codex 세션 상태에 `last_turn_completed_at` 같은 운영 필드 보강
 
 ## 검증 명령
 
