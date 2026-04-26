@@ -12,10 +12,10 @@ struct Cli {
     #[arg(long, help = "Check CLI availability and exit")]
     check_cli: bool,
 
-    #[arg(long, default_value = "8765", help = "Port to listen on")]
+    #[arg(long, help = "Port to listen on")]
     port: Option<u16>,
 
-    #[arg(long, default_value = "127.0.0.1", help = "Host to bind")]
+    #[arg(long, help = "Host to bind")]
     host: Option<String>,
 }
 
@@ -164,5 +164,24 @@ fn check_cli_available() {
             eprintln!("claude CLI not found in PATH");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn cli_does_not_override_config_when_host_and_port_are_omitted() {
+        let cli = Cli::parse_from(["claude-agent-rs"]);
+        assert_eq!(cli.port, None);
+        assert_eq!(cli.host, None);
+    }
+
+    #[test]
+    fn cli_accepts_explicit_port_override() {
+        let cli = Cli::parse_from(["claude-agent-rs", "--port", "8876"]);
+        assert_eq!(cli.port, Some(8876));
     }
 }

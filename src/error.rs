@@ -23,7 +23,7 @@ pub enum GatewayError {
     #[error("Session in wrong state: expected {expected}, got {actual}")]
     InvalidSessionState { expected: String, actual: String },
 
-    #[error("Hook timeout (hook_id={hook_id}): auto-approved after 30s")]
+    #[error("Hook timeout (hook_id={hook_id})")]
     HookTimeout { hook_id: String },
 
     #[error("Concurrent session limit reached (max={max})")]

@@ -17,7 +17,7 @@ pub enum SessionState {
     Idle,
     Running,
     WaitingForHook { request_id: String, deadline: std::time::Instant },
-    Completed,
+    WaitingForPermission { request_id: String, original_input: serde_json::Value },
     Dead,
 }
 
@@ -28,7 +28,7 @@ impl std::fmt::Display for SessionState {
             Self::Idle => write!(f, "idle"),
             Self::Running => write!(f, "running"),
             Self::WaitingForHook { .. } => write!(f, "waiting_for_hook"),
-            Self::Completed => write!(f, "completed"),
+            Self::WaitingForPermission { .. } => write!(f, "waiting_for_permission"),
             Self::Dead => write!(f, "dead"),
         }
     }

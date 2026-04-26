@@ -152,6 +152,8 @@ curl -X POST http://localhost:8765/v1/messages \
   }'
 ```
 `max_tokens` 생략 시 기본 8000.
+`POST /v1/messages`는 `model`이 필수입니다. 기본 모델 보정은 `/v1/sessions`
+세션 경로에서만 적용됩니다.
 
 #### `POST /v1/messages/stream` — SSE 스트리밍
 동일 body로 `event: message_start`, `content_block_delta`, `message_stop` SSE 이벤트를 받습니다.
@@ -317,7 +319,7 @@ Claude가 도구(Edit, Bash 등)를 실행하기 전 hook 이벤트가 발생. �
 - `approve` — 자동 승인
 - `defer` — SSE로 클라이언트에 위임
 
-**B. 클라이언트 응답** — SSE에서 `hook_request` 수신 시 30초 내 응답:
+**B. 클라이언트 응답** — SSE에서 `hook_request` 수신 시 timeout 내 응답:
 ```bash
 # SSE에서 수신 (request_id는 CLI 제어 프로토콜의 control_request.request_id):
 # data: {"type":"hook_request","request_id":"req-001","callback_id":"hook_0",
@@ -333,6 +335,21 @@ curl -X POST http://localhost:8765/sessions/abc-123/hook_response \
   -H "Content-Type: application/json" \
   -d '{"request_id": "req-001", "response": {"decision": "block", "reason": "policy"}}'
 ```
+
+Permission prompt도 동일하게 세션 스트림으로 surface됩니다:
+
+```bash
+# data: {"type":"permission_request","request_id":"req-perm-001",
+#        "tool_name":"Bash","input":{"command":"..."}} 
+
+curl -X POST http://localhost:8765/sessions/abc-123/permission_response \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "req-perm-001", "behavior": "allow"}'
+```
+
+`POST /query`, `POST /query/stream`는 stateless 경로라 deferred hook callback과
+tool permission prompt를 대화형으로 처리하지 않습니다. 이 경로에서는 해당 요청이
+자동 block/deny 처리됩니다.
 
 decision 값:
 | 값 | 설명 |
@@ -385,16 +402,19 @@ decision 값:
 | `disallowed_tools` | string[] | null | 차단 도구 목록 |
 | `mcp_servers` | object | null | MCP 서버 설정 (3.6 참조) |
 | `hook_rules` | array | null | 서버사이드 훅 규칙 |
+| `include_hook_events` | bool | false | CLI hook lifecycle event 포함 (`--include-hook-events`) |
+| `hook_timeout_secs` | number | `30` | deferred hook callback 대기 시간 |
+| `hook_timeout_action` | string | `"block"` | hook timeout 시 동작: `block`, `approve` |
 | `resume` | string | null | 이전 세션 재개 (CLI session_id) |
 | `continue_conversation` | bool | false | 가장 최근 세션 계속 |
-| `fork_session` | string | null | 지정한 세션을 분기(fork)해서 시작 |
+| `fork_session` | string | null | resume/continue 시 새 session ID로 분기 (`--fork-session`) |
 | `cwd` | string | null | CLI 작업 디렉토리 |
 | `env` | object | null | CLI 환경변수 |
 | `cli_path` | string | null | claude CLI 경로 (기본: PATH 탐색) |
 | `add_dirs` | string[] | null | CLI에 추가로 노출할 작업 디렉토리(`--add-dir`) |
 | `include_partial_messages` | bool | false | 스트리밍 중간 메시지 포함 |
-| `output_format` | any | null | 출력 형식 오버라이드 (SDK와 동일 스키마) |
-| `agents` | object | null | subagent 정의 맵 (이름→definition) |
+| `output_format` | string | null | CLI wrap 경로에서는 `stream-json`만 지원 |
+| `agents` | object | null | subagent 정의 맵. `initialize` control_request로 전달 |
 | `betas` | string[] | null | 베타 기능 활성화 |
 | `setting_sources` | string[] | `[""]` | 설정 소스 (빈 배열=격리, `user/project/local` 혼합) |
 
@@ -421,7 +441,7 @@ decision 값:
 | `session_not_found` | 404 | 존재하지 않는 session_id |
 | `invalid_state` | 409 | 잘못된 상태에서 요청 |
 | `rate_limited` | 429 | 동시 세션 한도 초과 |
-| `hook_timeout` | 408 | hook 응답 30초 초과 |
+| `hook_timeout` | 408 | hook 응답 timeout (`hook_timeout_secs`, 기본 30초) |
 | `internal_error` | 500 | 내부 오류 |
 
 ---

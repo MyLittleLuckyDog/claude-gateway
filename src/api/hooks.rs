@@ -34,9 +34,23 @@ pub struct HookResponseRequest {
     pub updated_input: Option<Value>,
 }
 
+#[derive(Deserialize)]
+pub struct PermissionResponseRequest {
+    pub request_id: String,
+    #[serde(default)]
+    pub response: Option<Value>,
+    #[serde(default)]
+    pub behavior: Option<String>,
+    #[serde(default)]
+    pub updated_input: Option<Value>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/sessions/:id/hook_response", post(hook_response))
+        .route("/sessions/:id/permission_response", post(permission_response))
         .route("/sessions/:id/interrupt", post(interrupt))
 }
 
@@ -135,8 +149,160 @@ async fn interrupt(
     }
 }
 
+async fn permission_response(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<PermissionResponseRequest>,
+) -> Response {
+    let session = match state.sessions.get(&id) {
+        Ok(s) => s,
+        Err(e) => return error_response(&e),
+    };
+
+    let payload = {
+        let current_state = session.state.lock().await;
+        match &*current_state {
+            SessionState::WaitingForPermission {
+                request_id,
+                original_input,
+            } => {
+                if *request_id != body.request_id {
+                    return error_response(&GatewayError::InvalidSessionState {
+                        expected: format!("waiting for request {}", body.request_id),
+                        actual: format!("waiting for request {}", request_id),
+                    });
+                }
+                match build_permission_response_payload(
+                    body.response,
+                    body.behavior,
+                    body.updated_input,
+                    body.message,
+                    original_input.clone(),
+                ) {
+                    Ok(v) => v,
+                    Err(e) => return error_response(&e),
+                }
+            }
+            other => {
+                return error_response(&GatewayError::InvalidSessionState {
+                    expected: "waiting_for_permission".to_string(),
+                    actual: other.to_string(),
+                });
+            }
+        }
+    };
+
+    send_permission_response(session, body.request_id, payload).await
+}
+
+async fn send_permission_response(
+    session: std::sync::Arc<crate::session::Session>,
+    request_id: String,
+    payload: Value,
+) -> Response {
+    let response = ControlResponseOut::success(request_id, payload);
+    let json = match serde_json::to_string(&response) {
+        Ok(j) => j,
+        Err(e) => return error_response(&GatewayError::Internal(format!("JSON error: {}", e))),
+    };
+
+    match session.stdin_tx.send(json).await {
+        Ok(_) => {
+            *session.state.lock().await = SessionState::Running;
+            (StatusCode::ACCEPTED, Json(json!({}))).into_response()
+        }
+        Err(_) => error_response(&GatewayError::Internal("stdin closed".to_string())),
+    }
+}
+
+fn build_permission_response_payload(
+    response: Option<Value>,
+    behavior: Option<String>,
+    updated_input: Option<Value>,
+    message: Option<String>,
+    original_input: Value,
+) -> Result<Value, GatewayError> {
+    if let Some(v) = response {
+        return Ok(v);
+    }
+
+    let behavior = behavior.unwrap_or_else(|| "deny".to_string());
+    match behavior.as_str() {
+        "allow" => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("behavior".to_string(), Value::String("allow".to_string()));
+            obj.insert(
+                "updatedInput".to_string(),
+                updated_input.unwrap_or(original_input),
+            );
+            Ok(Value::Object(obj))
+        }
+        "deny" => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("behavior".to_string(), Value::String("deny".to_string()));
+            if let Some(v) = message {
+                obj.insert("message".to_string(), Value::String(v));
+            }
+            Ok(Value::Object(obj))
+        }
+        other => Err(GatewayError::Internal(format!(
+            "invalid permission behavior: {}",
+            other
+        ))),
+    }
+}
+
 fn error_response(e: &GatewayError) -> Response {
     let status = axum::http::StatusCode::from_u16(e.http_status())
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     (status, Json(ErrorResponse::from(e))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::build_permission_response_payload;
+
+    #[test]
+    fn builds_allow_permission_payload() {
+        let payload = build_permission_response_payload(
+            None,
+            Some("allow".to_string()),
+            Some(json!({"command": "git diff"})),
+            None,
+            json!({"command": "git status"}),
+        )
+        .unwrap();
+        assert_eq!(payload["behavior"], "allow");
+        assert_eq!(payload["updatedInput"]["command"], "git diff");
+    }
+
+    #[test]
+    fn builds_deny_permission_payload() {
+        let payload = build_permission_response_payload(
+            None,
+            Some("deny".to_string()),
+            None,
+            Some("blocked by policy".to_string()),
+            json!({"command": "git status"}),
+        )
+        .unwrap();
+        assert_eq!(payload["behavior"], "deny");
+        assert_eq!(payload["message"], "blocked by policy");
+    }
+
+    #[test]
+    fn allow_permission_payload_falls_back_to_original_input() {
+        let payload = build_permission_response_payload(
+            None,
+            Some("allow".to_string()),
+            None,
+            None,
+            json!({"command": "git status"}),
+        )
+        .unwrap();
+        assert_eq!(payload["behavior"], "allow");
+        assert_eq!(payload["updatedInput"]["command"], "git status");
+    }
 }

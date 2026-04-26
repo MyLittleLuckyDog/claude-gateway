@@ -117,20 +117,16 @@ async fn send_message(
     };
 
     // Atomic check-and-set: acquire lock once, verify state, transition to Running
-    {
+    let previous_state = {
         let mut current_state = session.state.lock().await;
-        match &*current_state {
-            SessionState::Initializing | SessionState::Idle | SessionState::Completed => {
+        match take_sendable_state(&current_state) {
+            Ok(previous) => {
                 *current_state = SessionState::Running;
+                previous
             }
-            other => {
-                return error_response(&GatewayError::InvalidSessionState {
-                    expected: "initializing, idle, or completed".to_string(),
-                    actual: other.to_string(),
-                });
-            }
+            Err(e) => return error_response(&e),
         }
-    }
+    };
 
     // Build message
     let mut content = vec![InputContent::Text { text: req.message }];
@@ -167,7 +163,22 @@ async fn send_message(
 
     match session.stdin_tx.send(json).await {
         Ok(_) => (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response(),
-        Err(_) => error_response(&GatewayError::Internal("stdin closed".to_string())),
+        Err(_) => {
+            *session.state.lock().await = previous_state;
+            error_response(&GatewayError::Internal("stdin closed".to_string()))
+        }
+    }
+}
+
+fn take_sendable_state(current_state: &SessionState) -> Result<SessionState, GatewayError> {
+    match current_state {
+        SessionState::Initializing | SessionState::Idle => {
+            Ok(current_state.clone())
+        }
+        other => Err(GatewayError::InvalidSessionState {
+            expected: "initializing or idle".to_string(),
+            actual: other.to_string(),
+        }),
     }
 }
 
@@ -276,6 +287,7 @@ async fn fork_session(
     // Create new session with --resume pointing to the original CLI session
     let mut new_options = session.options.clone();
     new_options.resume = Some(cli_session_id);
+    new_options.fork_session = Some("true".to_string());
 
     match client::create_session(new_options, state.sessions.clone(), state.config.clone()).await {
         Ok(new_session) => {
@@ -293,4 +305,32 @@ fn error_response(e: &GatewayError) -> Response {
     let status = axum::http::StatusCode::from_u16(e.http_status())
         .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
     (status, Json(ErrorResponse::from(e))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_sendable_state;
+    use crate::session::SessionState;
+
+    #[test]
+    fn sendable_states_are_preserved_for_rollback() {
+        assert_eq!(
+            take_sendable_state(&SessionState::Idle).unwrap(),
+            SessionState::Idle
+        );
+        assert_eq!(
+            take_sendable_state(&SessionState::Initializing).unwrap(),
+            SessionState::Initializing
+        );
+    }
+
+    #[test]
+    fn waiting_states_are_rejected_for_send() {
+        let err = take_sendable_state(&SessionState::WaitingForPermission {
+            request_id: "req_1".to_string(),
+            original_input: serde_json::json!({"command": "git status"}),
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("wrong state"));
+    }
 }

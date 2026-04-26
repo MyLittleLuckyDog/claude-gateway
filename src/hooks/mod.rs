@@ -7,15 +7,15 @@ use serde_json::{json, Value};
 
 use crate::messages::Message;
 use crate::messages::cli_control::{ControlResponseOut, HookCallbackInput, HookCallbackRequest};
-use crate::options::ClaudeAgentOptions;
+use crate::options::{ClaudeAgentOptions, HookTimeoutAction};
 use crate::session::{Session, SessionState, MAX_HISTORY_SIZE};
 
 use server_rules::{evaluate_hook_rules, ResolvedDecision};
 
-/// Build the `hooks` object for the `initialize` control_request and the
-/// per-session callback_id → rule map. Returns `None` when no rules configured.
+/// Build the `initialize` control_request payload and the per-session
+/// callback_id → rule map. Returns `None` when no initialize-time data exists.
 ///
-/// Shape produced (matches SDK):
+/// Hooks shape produced (matches SDK):
 /// ```text
 /// {
 ///   "PreToolUse": [
@@ -24,23 +24,38 @@ use server_rules::{evaluate_hook_rules, ResolvedDecision};
 ///   ]
 /// }
 /// ```
-pub fn build_initialize_hooks(options: &ClaudeAgentOptions) -> Option<(Value, HashMap<String, usize>)> {
-    let rules = options.hook_rules.as_ref()?;
-    if rules.is_empty() {
+pub fn build_initialize_request(options: &ClaudeAgentOptions) -> Option<(Value, HashMap<String, usize>)> {
+    let mut request = serde_json::Map::new();
+    request.insert("subtype".to_string(), Value::String("initialize".to_string()));
+
+    let mut callback_map: HashMap<String, usize> = HashMap::new();
+    if let Some(rules) = options.hook_rules.as_ref() {
+        if !rules.is_empty() {
+            let mut by_event: HashMap<String, Vec<Value>> = HashMap::new();
+            for (idx, rule) in rules.iter().enumerate() {
+                let callback_id = format!("hook_{}", idx);
+                callback_map.insert(callback_id.clone(), idx);
+                let matcher = rule.tool_pattern.clone().unwrap_or_else(|| "*".to_string());
+                by_event.entry(rule.event.clone()).or_default().push(json!({
+                    "matcher": matcher,
+                    "hookCallbackIds": [callback_id],
+                }));
+            }
+            request.insert("hooks".to_string(), json!(by_event));
+        }
+    }
+
+    if let Some(agents) = options.agents.as_ref() {
+        if !agents.is_empty() {
+            request.insert("agents".to_string(), json!(agents));
+        }
+    }
+
+    if request.len() == 1 {
         return None;
     }
-    let mut by_event: HashMap<String, Vec<Value>> = HashMap::new();
-    let mut callback_map: HashMap<String, usize> = HashMap::new();
-    for (idx, rule) in rules.iter().enumerate() {
-        let callback_id = format!("hook_{}", idx);
-        callback_map.insert(callback_id.clone(), idx);
-        let matcher = rule.tool_pattern.clone().unwrap_or_else(|| "*".to_string());
-        by_event.entry(rule.event.clone()).or_default().push(json!({
-            "matcher": matcher,
-            "hookCallbackIds": [callback_id],
-        }));
-    }
-    Some((json!(by_event), callback_map))
+
+    Some((Value::Object(request), callback_map))
 }
 
 /// Decision outcome of `try_auto_resolve_hook` — lets the caller drive the
@@ -90,11 +105,17 @@ fn emit(request_id: String, payload: Value) -> AutoResolveOutcome {
     }
 }
 
-/// Start a watchdog that auto-approves after 30s when waiting on the client.
-/// Uses `request_id` (not a legacy `hook_id`) to identify the pending callback.
+/// Start a watchdog for a deferred hook callback. The timeout behavior is
+/// request-scoped via session options so callers can choose block vs approve
+/// per task rather than relying on a fixed global policy.
 pub fn spawn_hook_timeout(session: Arc<Session>, request_id: String) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        let timeout_secs = session.options.hook_timeout_secs.unwrap_or(30);
+        let timeout_action = session.options.hook_timeout_action
+            .clone()
+            .unwrap_or(HookTimeoutAction::Block);
+
+        tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
 
         let mut state = session.state.lock().await;
         if let SessionState::WaitingForHook {
@@ -103,15 +124,31 @@ pub fn spawn_hook_timeout(session: Arc<Session>, request_id: String) -> tokio::t
         } = *state
         {
             if *waiting_id == request_id {
-                tracing::warn!("Hook request {} timed out, auto-approving", request_id);
+                tracing::warn!(
+                    "Hook request {} timed out after {}s, auto-{}",
+                    request_id,
+                    timeout_secs,
+                    timeout_action.as_decision()
+                );
                 *state = SessionState::Running;
                 drop(state);
+
+                let (decision, reason) = match timeout_action {
+                    HookTimeoutAction::Approve => (
+                        "approve",
+                        format!("auto-approved after {}s timeout", timeout_secs),
+                    ),
+                    HookTimeoutAction::Block => (
+                        "block",
+                        format!("auto-blocked after {}s timeout", timeout_secs),
+                    ),
+                };
 
                 let response = ControlResponseOut::success(
                     request_id.clone(),
                     json!({
-                        "decision": "approve",
-                        "reason": "auto-approved after 30s timeout",
+                        "decision": decision,
+                        "reason": reason,
                     }),
                 );
                 if let Ok(json) = serde_json::to_string(&response) {
@@ -120,8 +157,10 @@ pub fn spawn_hook_timeout(session: Arc<Session>, request_id: String) -> tokio::t
 
                 let timeout_msg = Arc::new(Message::Error {
                     message: format!(
-                        "Hook timeout (request_id={}): auto-approved after 30s",
-                        request_id
+                        "Hook timeout (request_id={}): auto-{} after {}s",
+                        request_id,
+                        timeout_action.as_decision(),
+                        timeout_secs
                     ),
                     code: "hook_timeout".to_string(),
                 });
@@ -135,4 +174,51 @@ pub fn spawn_hook_timeout(session: Arc<Session>, request_id: String) -> tokio::t
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::{build_initialize_request, HookTimeoutAction};
+    use crate::options::{AgentDefinition, ClaudeAgentOptions, HookAction, HookRule};
+
+    #[test]
+    fn initialize_request_includes_hooks_and_agents() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "reviewer".to_string(),
+            AgentDefinition {
+                description: Some("Reviews code".to_string()),
+                prompt: Some("Review changes".to_string()),
+                tools: Some(vec!["Read".to_string()]),
+                model: Some("sonnet".to_string()),
+            },
+        );
+
+        let opts = ClaudeAgentOptions {
+            hook_rules: Some(vec![HookRule {
+                event: "PreToolUse".to_string(),
+                tool_pattern: Some("Bash".to_string()),
+                action: HookAction::Defer,
+            }]),
+            agents: Some(agents),
+            ..Default::default()
+        };
+
+        let (request, callback_map) = build_initialize_request(&opts).unwrap();
+        assert_eq!(request["subtype"], "initialize");
+        assert_eq!(request["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+        assert_eq!(request["agents"]["reviewer"]["prompt"], "Review changes");
+        assert_eq!(callback_map.get("hook_0"), Some(&0));
+    }
+
+    #[test]
+    fn hook_timeout_action_defaults_to_block() {
+        let opts = ClaudeAgentOptions::default();
+        assert!(matches!(
+            opts.hook_timeout_action.unwrap_or(HookTimeoutAction::Block),
+            HookTimeoutAction::Block
+        ));
+    }
 }

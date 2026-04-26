@@ -35,7 +35,20 @@ impl CliTransport {
         }
     }
 
-    fn build_command(options: &ClaudeAgentOptions, config: &AppConfig) -> Command {
+    fn validate_output_format(options: &ClaudeAgentOptions) -> Result<(), GatewayError> {
+        match options.output_format.as_ref() {
+            None => Ok(()),
+            Some(serde_json::Value::String(fmt)) if fmt == "stream-json" => Ok(()),
+            Some(other) => Err(GatewayError::Internal(format!(
+                "unsupported output_format for CLI transport: {}",
+                other
+            ))),
+        }
+    }
+
+    fn build_command(options: &ClaudeAgentOptions, config: &AppConfig) -> Result<Command, GatewayError> {
+        Self::validate_output_format(options)?;
+
         let cli_path = options.cli_path.clone()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| {
@@ -60,6 +73,11 @@ impl CliTransport {
             .unwrap_or("default");
         cmd.arg("--permission-mode").arg(perm_mode);
 
+        let permission_prompt_tool = options.permission_prompt_tool
+            .as_deref()
+            .unwrap_or("stdio");
+        cmd.arg("--permission-prompt-tool").arg(permission_prompt_tool);
+
         if let Some(sp) = &options.system_prompt {
             cmd.arg("--system-prompt").arg(sp);
         }
@@ -72,6 +90,10 @@ impl CliTransport {
 
         if let Some(max) = options.max_turns {
             cmd.arg("--max-turns").arg(max.to_string());
+        }
+
+        if let Some(max_budget_usd) = options.max_budget_usd {
+            cmd.arg("--max-budget-usd").arg(max_budget_usd.to_string());
         }
 
         if let Some(tools) = &options.allowed_tools {
@@ -88,10 +110,32 @@ impl CliTransport {
             }
         }
 
+        if let Some(fallback_model) = &options.fallback_model {
+            cmd.arg("--fallback-model").arg(fallback_model);
+        }
+
+        if options.include_partial_messages {
+            cmd.arg("--include-partial-messages");
+        }
+
+        if options.include_hook_events {
+            cmd.arg("--include-hook-events");
+        }
+
         if let Some(sources) = &options.setting_sources {
             cmd.arg("--setting-sources").arg(sources.join(","));
         } else {
             cmd.arg("--setting-sources").arg("");
+        }
+
+        if options.fork_session.is_some() {
+            cmd.arg("--fork-session");
+        }
+
+        if let Some(add_dirs) = &options.add_dirs {
+            for dir in add_dirs {
+                cmd.arg("--add-dir").arg(dir);
+            }
         }
 
         if let Some(cwd) = &options.cwd {
@@ -109,7 +153,7 @@ impl CliTransport {
            .stderr(Stdio::piped())
            .kill_on_drop(true);
 
-        cmd
+        Ok(cmd)
     }
 
     pub fn set_session_id(&mut self, id: String) {
@@ -120,7 +164,7 @@ impl CliTransport {
 #[async_trait]
 impl Transport for CliTransport {
     async fn connect(&mut self) -> Result<(), GatewayError> {
-        let mut cmd = Self::build_command(&self.options, &self.config);
+        let mut cmd = Self::build_command(&self.options, &self.config)?;
 
         // MCP config: create temp JSON file and add --mcp-config flag
         if let Some(ref servers) = self.options.mcp_servers {
@@ -287,5 +331,71 @@ async fn stderr_logger_task(stderr: tokio::process::ChildStderr) {
             Ok(None) => break,
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    use super::CliTransport;
+    use crate::config::AppConfig;
+    use crate::options::ClaudeAgentOptions;
+
+    fn test_config() -> AppConfig {
+        AppConfig::default()
+    }
+
+    #[test]
+    fn build_command_wires_supported_sdk_flags() {
+        let mut agents = HashMap::new();
+        agents.insert(
+            "reviewer".to_string(),
+            crate::options::AgentDefinition {
+                description: Some("Reviews code".to_string()),
+                prompt: Some("Review code".to_string()),
+                tools: None,
+                model: None,
+            },
+        );
+        let options = ClaudeAgentOptions {
+            fallback_model: Some("claude-opus-4-1".to_string()),
+            max_budget_usd: Some(2.5),
+            include_partial_messages: true,
+            include_hook_events: true,
+            fork_session: Some("true".to_string()),
+            add_dirs: Some(vec![PathBuf::from("/tmp/extra")]),
+            agents: Some(agents),
+            permission_prompt_tool: Some("stdio".to_string()),
+            output_format: Some(serde_json::Value::String("stream-json".to_string())),
+            ..Default::default()
+        };
+
+        let cmd = CliTransport::build_command(&options, &test_config()).unwrap();
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+
+        assert!(args.windows(2).any(|w| w == ["--fallback-model", "claude-opus-4-1"]));
+        assert!(args.windows(2).any(|w| w == ["--max-budget-usd", "2.5"]));
+        assert!(args.windows(2).any(|w| w == ["--permission-prompt-tool", "stdio"]));
+        assert!(args.iter().any(|arg| arg == "--include-partial-messages"));
+        assert!(args.iter().any(|arg| arg == "--include-hook-events"));
+        assert!(args.iter().any(|arg| arg == "--fork-session"));
+        assert!(args.windows(2).any(|w| w == ["--add-dir", "/tmp/extra"]));
+    }
+
+    #[test]
+    fn rejects_non_stream_json_output_format() {
+        let options = ClaudeAgentOptions {
+            output_format: Some(serde_json::Value::String("json".to_string())),
+            ..Default::default()
+        };
+
+        let err = CliTransport::build_command(&options, &test_config()).unwrap_err();
+        assert!(err.to_string().contains("unsupported output_format"));
     }
 }

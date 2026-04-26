@@ -103,7 +103,8 @@ CLI subprocess 오버헤드 없이 빠르고, Haiku/Sonnet/Opus 자유 선택 �
 | `opus`, `claude-opus` | `claude-opus-4-6` |
 
 정규 ID를 직접 써도 되고, 접두사 매치(`claude-sonnet-4-6-...`)도 통합니다.
-모델이 지정되지 않으면 기본값은 `sonnet` (`claude-sonnet-4-6`).
+`POST /v1/messages`는 `model`이 필수입니다. 기본 모델 보정은 `/v1/sessions`
+세션 경로에서만 적용됩니다.
 
 ### 단일 요청 (Stateless)
 
@@ -301,8 +302,9 @@ POST   /sessions/{id}/interrupt
 `approve` / `block` / `defer`를 결정합니다. 우선순위: **block > approve > defer**.
 
 `defer`로 매칭되거나 매칭되는 규칙이 없으면 해당 이벤트가 `type: hook_request`
-SSE 메시지로 클라이언트에 전달되고, 30초 안에 아래 엔드포인트로 응답해야
-합니다(미응답 시 자동 approve + 히스토리에 `hook_timeout` 에러 기록).
+SSE 메시지로 클라이언트에 전달되고, 지정 시간 안에 아래 엔드포인트로 응답해야
+합니다. 기본값은 `30초 후 auto-block`이며, 요청별 `hook_timeout_secs` /
+`hook_timeout_action`으로 override할 수 있습니다.
 
 ```json
 {
@@ -322,6 +324,20 @@ curl -X POST http://localhost:8765/sessions/{id}/hook_response \
   -H "Content-Type: application/json" \
   -d '{"request_id": "<from stream>", "decision": "block", "reason": "manual deny"}'
 ```
+
+도구 permission prompt도 세션 스트림으로 surface되며, 별도 응답 엔드포인트를
+사용합니다.
+
+```bash
+curl -X POST http://localhost:8765/sessions/{id}/permission_response \
+  -H "Content-Type: application/json" \
+  -d '{"request_id": "<from stream>", "behavior": "allow"}'
+```
+
+`POST /query`, `POST /query/stream`는 stateless 경로라 deferred hook callback이나
+tool permission prompt를 대화형으로 처리할 수 없습니다. 이 경로에서는 해당 요청이
+자동 block/deny 처리됩니다. interactive approval이 필요하면 `/sessions`를 사용해야
+합니다.
 
 ### 관리 API
 

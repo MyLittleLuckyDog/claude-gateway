@@ -28,10 +28,6 @@ pub async fn create_session(
     store: Arc<SessionStore>,
     config: Arc<AppConfig>,
 ) -> Result<Arc<Session>, GatewayError> {
-    if store.count() >= config.server.max_sessions {
-        return Err(GatewayError::SessionLimitReached { max: config.server.max_sessions });
-    }
-
     let session_id = uuid::Uuid::new_v4().to_string();
     let (stdin_tx, stdin_rx) = mpsc::channel::<String>(32);
     let (event_tx, _) = broadcast::channel::<Arc<Message>>(1024);
@@ -94,13 +90,10 @@ async fn run_session_loop(
     // BEFORE we relay the user's first message. Without this step the CLI
     // never routes PreToolUse events back to us and hook_rules are dead.
     let callback_map: HashMap<String, usize> =
-        match hooks::build_initialize_hooks(&options) {
-            Some((hooks_cfg, cbmap)) => {
+        match hooks::build_initialize_request(&options) {
+            Some((init_payload, cbmap)) => {
                 let req_id = format!("init-{}", uuid::Uuid::new_v4());
-                let init = ControlRequestOut::new(
-                    req_id.clone(),
-                    serde_json::json!({"subtype": "initialize", "hooks": hooks_cfg}),
-                );
+                let init = ControlRequestOut::new(req_id.clone(), init_payload);
                 match serde_json::to_string(&init) {
                     Ok(s) => {
                         if let Err(e) = transport.write(&s).await {
@@ -185,8 +178,16 @@ async fn run_session_loop(
                                             }
                                         }
                                     }
-                                    ControlRequestPayload::CanUseTool(_)
-                                    | ControlRequestPayload::Unknown => {
+                                    ControlRequestPayload::CanUseTool(_) => {
+                                        if let ControlRequestPayload::CanUseTool(req) = &ctl.request {
+                                            *session.state.lock().await =
+                                                SessionState::WaitingForPermission {
+                                                    request_id: ctl.request_id.clone(),
+                                                    original_input: req.input.clone(),
+                                                };
+                                        }
+                                    }
+                                    ControlRequestPayload::Unknown => {
                                         // Not implemented yet — reject so the CLI doesn't hang.
                                         let err = crate::messages::cli_control::ControlResponseOut::error(
                                             ctl.request_id.clone(),
@@ -202,6 +203,7 @@ async fn run_session_loop(
                                 // Response to a request WE issued (e.g. initialize).
                                 // We don't currently block on these — future work may
                                 // track request_id ↔ oneshot for stricter handshakes.
+                                continue;
                             }
                             CliOutputEvent::Unknown => continue,
                             _ => {}

@@ -72,7 +72,7 @@ async fn query_stream_handler(
     }
 
     match crate::query::query_stream(&req.prompt, options, &state.config).await {
-        Ok((_session_id, mut msg_rx)) => {
+        Ok(mut msg_rx) => {
             let stream = async_stream::stream! {
                 while let Some(msg) = msg_rx.recv().await {
                     match serde_json::to_string(&msg) {

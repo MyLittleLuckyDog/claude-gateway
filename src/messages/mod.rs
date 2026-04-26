@@ -56,6 +56,14 @@ pub enum Message {
         tool_input: Option<Value>,
         tool_use_id: Option<String>,
     },
+    /// A can_use_tool control_request surfaced to streaming clients. Clients
+    /// answer via `/sessions/:id/permission_response`.
+    PermissionRequest {
+        request_id: String,
+        tool_name: String,
+        input: Value,
+        permission_suggestions: Option<Value>,
+    },
     Error {
         message: String,
         code: String,

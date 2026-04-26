@@ -2,6 +2,8 @@ use tokio::sync::mpsc;
 
 use crate::config::AppConfig;
 use crate::error::GatewayError;
+use crate::hooks::{self, AutoResolveOutcome};
+use crate::messages::cli_control::{ControlRequest, ControlRequestOut, ControlRequestPayload, ControlResponseOut};
 use crate::messages::cli_input::{CliInputMessage, CliUserInput, InputContent};
 use crate::messages::cli_output::{CliOutputEvent, CliResultEvent, SystemSubtype};
 use crate::messages::{AssistantMessage, Message, SessionUsage};
@@ -45,11 +47,13 @@ pub async fn query(
     config: &AppConfig,
 ) -> Result<QueryResult, GatewayError> {
     tracing::debug!("query: spawning CLI transport");
-    let mut transport = CliTransport::new(options, config.clone());
+    let mut transport = CliTransport::new(options.clone(), config.clone());
     transport.connect().await?;
 
     let mut event_rx = transport.event_receiver()
         .ok_or_else(|| GatewayError::Internal("No event receiver".to_string()))?;
+
+    send_initialize_if_needed(&transport, &options).await?;
 
     // Send user message IMMEDIATELY (CLI reads stdin before producing output)
     let json = build_user_message(prompt)?;
@@ -73,6 +77,11 @@ pub async fn query(
                 result_event = Some(r);
                 break;
             }
+            Ok(CliOutputEvent::ControlRequest(ctl)) => {
+                let _ = handle_stateless_control_request(&transport, &options, ctl).await?;
+                continue;
+            }
+            Ok(CliOutputEvent::ControlResponse(_)) => continue,
             Ok(CliOutputEvent::Unknown) => continue,
             Ok(_) => continue,
             Err(e) => {
@@ -106,26 +115,46 @@ pub async fn query_stream(
     prompt: &str,
     options: ClaudeAgentOptions,
     config: &AppConfig,
-) -> Result<(String, mpsc::Receiver<Message>), GatewayError> {
-    let mut transport = CliTransport::new(options, config.clone());
+) -> Result<mpsc::Receiver<Message>, GatewayError> {
+    let mut transport = CliTransport::new(options.clone(), config.clone());
     transport.connect().await?;
 
     let mut event_rx = transport.event_receiver()
         .ok_or_else(|| GatewayError::Internal("No event receiver".to_string()))?;
+
+    send_initialize_if_needed(&transport, &options).await?;
 
     // Send user message immediately
     let json = build_user_message(prompt)?;
     transport.write(&json).await?;
 
     let (msg_tx, msg_rx) = mpsc::channel::<Message>(256);
-    let session_id = String::new(); // will be populated from init event
 
     // Spawn background task to relay events
     tokio::spawn(async move {
-        let _sid = session_id;
         while let Some(event) = event_rx.recv().await {
             match event {
                 Ok(CliOutputEvent::Unknown) => continue,
+                Ok(CliOutputEvent::ControlRequest(ctl)) => {
+                    match handle_stateless_control_request(&transport, &options, ctl).await {
+                        Ok(Some(msg)) => {
+                            if msg_tx.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            let err_msg = Message::Error {
+                                message: e.to_string(),
+                                code: e.error_code().to_string(),
+                            };
+                            let _ = msg_tx.send(err_msg).await;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Ok(CliOutputEvent::ControlResponse(_)) => continue,
                 Ok(cli_event) => {
                     let is_result = matches!(cli_event, CliOutputEvent::Result(_));
                     let message = cli_output_to_message(cli_event);
@@ -149,8 +178,7 @@ pub async fn query_stream(
         let _ = transport.close().await;
     });
 
-    // Return empty session_id initially — client gets it from system:init event in stream
-    Ok((String::new(), msg_rx))
+    Ok(msg_rx)
 }
 
 /// Convert CliOutputEvent to public Message
@@ -213,6 +241,12 @@ pub fn cli_output_to_message(event: CliOutputEvent) -> Message {
                         tool_use_id: hc.tool_use_id,
                     }
                 }
+                ControlRequestPayload::CanUseTool(req) => Message::PermissionRequest {
+                    request_id: ctl.request_id,
+                    tool_name: req.tool_name,
+                    input: req.input,
+                    permission_suggestions: req.permission_suggestions,
+                },
                 _ => Message::Error {
                     message: "Unsupported control_request subtype".to_string(),
                     code: "unsupported_control".to_string(),
@@ -227,5 +261,183 @@ pub fn cli_output_to_message(event: CliOutputEvent) -> Message {
             message: "Unknown CLI event type".to_string(),
             code: "unknown_event".to_string(),
         },
+    }
+}
+
+async fn send_initialize_if_needed<T: Transport>(
+    transport: &T,
+    options: &ClaudeAgentOptions,
+) -> Result<(), GatewayError> {
+    if let Some((payload, _)) = hooks::build_initialize_request(options) {
+        let request = ControlRequestOut::new(
+            format!("init-{}", uuid::Uuid::new_v4()),
+            payload,
+        );
+        let json = serde_json::to_string(&request)
+            .map_err(|e| GatewayError::Internal(format!("JSON serialize error: {}", e)))?;
+        transport.write(&json).await?;
+    }
+    Ok(())
+}
+
+async fn handle_stateless_control_request<T: Transport>(
+    transport: &T,
+    options: &ClaudeAgentOptions,
+    ctl: ControlRequest,
+) -> Result<Option<Message>, GatewayError> {
+    match ctl.request {
+        ControlRequestPayload::HookCallback(callback) => {
+            match hooks::try_auto_resolve_hook(options, &ctl.request_id, &callback) {
+                AutoResolveOutcome::Respond(json) => {
+                    transport.write(&json).await?;
+                    Ok(None)
+                }
+                AutoResolveOutcome::DeferToClient => {
+                    let response = ControlResponseOut::success(
+                        ctl.request_id,
+                        serde_json::json!({
+                            "decision": "block",
+                            "reason": "stateless /query cannot service deferred hook callbacks; use /sessions instead",
+                        }),
+                    );
+                    let json = serde_json::to_string(&response)
+                        .map_err(|e| GatewayError::Internal(format!("JSON serialize error: {}", e)))?;
+                    transport.write(&json).await?;
+                    Ok(Some(Message::Error {
+                        message: "Deferred hook callback auto-blocked in stateless /query".to_string(),
+                        code: "stateless_hook_callback".to_string(),
+                    }))
+                }
+            }
+        }
+        ControlRequestPayload::CanUseTool(req) => {
+            let response = ControlResponseOut::success(
+                ctl.request_id,
+                serde_json::json!({
+                    "behavior": "deny",
+                    "message": "stateless /query cannot answer tool permission prompts; use /sessions instead",
+                    "tool_name": req.tool_name,
+                }),
+            );
+            let json = serde_json::to_string(&response)
+                .map_err(|e| GatewayError::Internal(format!("JSON serialize error: {}", e)))?;
+            transport.write(&json).await?;
+            Ok(Some(Message::Error {
+                message: "Tool permission prompt auto-denied in stateless /query".to_string(),
+                code: "stateless_permission_prompt".to_string(),
+            }))
+        }
+        ControlRequestPayload::Unknown => {
+            let response = ControlResponseOut::error(
+                ctl.request_id,
+                "subtype not supported by stateless /query",
+            );
+            let json = serde_json::to_string(&response)
+                .map_err(|e| GatewayError::Internal(format!("JSON serialize error: {}", e)))?;
+            transport.write(&json).await?;
+            Ok(Some(Message::Error {
+                message: "Unsupported control_request subtype in stateless /query".to_string(),
+                code: "unsupported_control".to_string(),
+            }))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{cli_output_to_message, handle_stateless_control_request};
+    use crate::error::GatewayError;
+    use crate::messages::Message;
+    use crate::messages::cli_control::ControlRequest;
+    use crate::messages::cli_output::CliOutputEvent;
+    use crate::options::{ClaudeAgentOptions, HookAction, HookRule};
+    use crate::transport::Transport;
+    use tokio::sync::mpsc;
+
+    struct RecordingTransport {
+        writes: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for RecordingTransport {
+        async fn connect(&mut self) -> Result<(), GatewayError> { Ok(()) }
+        async fn write(&self, data: &str) -> Result<(), GatewayError> {
+            self.writes.lock().unwrap().push(data.to_string());
+            Ok(())
+        }
+        async fn close(&mut self) -> Result<(), GatewayError> { Ok(()) }
+        fn is_ready(&self) -> bool { true }
+        fn session_id(&self) -> Option<&str> { None }
+        fn event_receiver(&mut self) -> Option<mpsc::Receiver<Result<CliOutputEvent, GatewayError>>> { None }
+    }
+
+    #[test]
+    fn converts_can_use_tool_to_permission_request_message() {
+        let raw = json!({
+            "request_id": "req_perm_1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": {"command": "git status"},
+                "permission_suggestions": {"allow": false}
+            }
+        });
+        let ctl: ControlRequest = serde_json::from_value(raw).unwrap();
+
+        let message = cli_output_to_message(CliOutputEvent::ControlRequest(ctl));
+        match message {
+            Message::PermissionRequest {
+                request_id,
+                tool_name,
+                input,
+                permission_suggestions,
+            } => {
+                assert_eq!(request_id, "req_perm_1");
+                assert_eq!(tool_name, "Bash");
+                assert_eq!(input["command"], "git status");
+                assert_eq!(permission_suggestions.unwrap()["allow"], false);
+            }
+            other => panic!("expected permission request, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stateless_query_blocks_deferred_hook_callbacks() {
+        let transport = RecordingTransport {
+            writes: std::sync::Mutex::new(Vec::new()),
+        };
+        let raw = json!({
+            "request_id": "req_hook_1",
+            "request": {
+                "subtype": "hook_callback",
+                "callback_id": "hook_1",
+                "input": {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "rm -rf /"}
+                }
+            }
+        });
+        let ctl: ControlRequest = serde_json::from_value(raw).unwrap();
+        let options = ClaudeAgentOptions {
+            hook_rules: Some(vec![HookRule {
+                event: "PreToolUse".to_string(),
+                tool_pattern: Some("Bash".to_string()),
+                action: HookAction::Defer,
+            }]),
+            ..Default::default()
+        };
+
+        let msg = handle_stateless_control_request(&transport, &options, ctl)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(msg, Message::Error { .. }));
+
+        let writes = transport.writes.lock().unwrap();
+        let response: serde_json::Value = serde_json::from_str(&writes[0]).unwrap();
+        assert_eq!(response["response"]["response"]["decision"], "block");
     }
 }

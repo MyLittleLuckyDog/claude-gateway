@@ -21,6 +21,8 @@ pub struct ClaudeAgentOptions {
     pub allowed_tools: Option<Vec<String>>,
     #[serde(default)]
     pub disallowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub permission_prompt_tool: Option<String>,
 
     #[serde(default)]
     pub permission_mode: Option<PermissionMode>,
@@ -42,6 +44,12 @@ pub struct ClaudeAgentOptions {
 
     #[serde(default)]
     pub hook_rules: Option<Vec<HookRule>>,
+    #[serde(default)]
+    pub include_hook_events: bool,
+    #[serde(default)]
+    pub hook_timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub hook_timeout_action: Option<HookTimeoutAction>,
 
     #[serde(default)]
     pub agents: Option<HashMap<String, AgentDefinition>>,
@@ -118,6 +126,22 @@ pub enum HookAction {
     Approve,
     Block { reason: Option<String> },
     Defer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookTimeoutAction {
+    Approve,
+    Block,
+}
+
+impl HookTimeoutAction {
+    pub fn as_decision(&self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Block => "block",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
