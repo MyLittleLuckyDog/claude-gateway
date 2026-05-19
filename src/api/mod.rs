@@ -2,22 +2,26 @@ pub mod admin;
 pub mod codex;
 pub mod codex_app;
 pub mod hooks;
+pub mod local_mlx;
 pub mod openai;
+pub mod openai_oauth;
 pub mod proxy;
 pub mod proxy_sessions;
 pub mod query;
 pub mod sessions;
 
-use std::sync::Arc;
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::Router;
 use serde_json::json;
+use std::sync::Arc;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use crate::config::AppConfig;
 use crate::codex::store::CodexSessionStore;
 use crate::codex_app::store::CodexAppSessionStore;
+use crate::config::AppConfig;
+use crate::local_mlx_proxy::LocalMlxProxyState;
+use crate::openai_oauth::OpenAiOAuthState;
 use crate::openai_proxy::OpenAiProxyState;
 use crate::proxy::ProxyState;
 use crate::proxy_session::ProxySessionStore;
@@ -33,7 +37,9 @@ pub struct AppState {
     pub stats: Arc<tokio::sync::Mutex<Stats>>,
     pub proxy: Option<Arc<ProxyState>>,
     pub proxy_sessions: Option<Arc<ProxySessionStore>>,
+    pub local_mlx: Option<Arc<LocalMlxProxyState>>,
     pub openai: Option<Arc<OpenAiProxyState>>,
+    pub openai_oauth: Option<Arc<OpenAiOAuthState>>,
 }
 
 #[derive(Debug, Default)]
@@ -48,22 +54,30 @@ pub struct Stats {
 
 pub fn error_response(status: u16, code: &str, message: &str) -> Response {
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status_code, Json(json!({
-        "error": {
-            "type": code,
-            "message": message,
-        }
-    }))).into_response()
+    (
+        status_code,
+        Json(json!({
+            "error": {
+                "type": code,
+                "message": message,
+            }
+        })),
+    )
+        .into_response()
 }
 
 pub fn proxy_error_response(e: crate::proxy::ProxyError) -> Response {
     let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(json!({
-        "error": {
-            "type": e.error_code(),
-            "message": e.to_string(),
-        }
-    }))).into_response()
+    (
+        status,
+        Json(json!({
+            "error": {
+                "type": e.error_code(),
+                "message": e.to_string(),
+            }
+        })),
+    )
+        .into_response()
 }
 
 fn build_cors_layer(origins: &[String]) -> CorsLayer {
@@ -93,7 +107,13 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
                 origin == prefix || origin.starts_with(&format!("{prefix}:"))
             })
         }))
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
         .allow_headers(Any)
 }
 
@@ -104,9 +124,11 @@ pub fn build_router(state: AppState) -> Router {
         .merge(codex::routes())
         .merge(codex_app::routes())
         .merge(openai::routes())
+        .merge(openai_oauth::routes())
         .merge(query::routes())
         .merge(sessions::routes())
         .merge(hooks::routes())
+        .merge(local_mlx::routes())
         .merge(proxy::routes())
         .merge(proxy_sessions::routes())
         .layer(cors)

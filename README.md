@@ -352,6 +352,59 @@ curl -X POST http://localhost:8765/openai/v1/responses \
 
 ---
 
+## Gemma API 모드 (`/gemma/v1/*`)
+
+로컬 `mlx_lm.server`를 OpenAI Chat Completions 형태로 감싸는 프록시를 제공한다.
+외부 통합 표면은 `/gemma/v1/*`이고, 내부 백엔드는 local MLX다.
+
+- `POST /gemma/v1/chat/completions`
+- `GET /gemma/v1/models`
+- `GET /gemma/v1/proxy_stats`
+
+호환 alias로 `/local-mlx/v1/*`도 같은 핸들러에 연결된다.
+
+기본값:
+
+```bash
+GEMMA_BASE_URL=http://127.0.0.1:8080
+GEMMA_MODEL=Jiunsong/supergemma4-26b-uncensored-mlx-4bit-v2
+GEMMA_ALIAS=gemma
+GEMMA_MIN_MAX_TOKENS=1024
+```
+
+MLX 응답에 포함될 수 있는 `reasoning` 채널은 게이트웨이가 제거하고,
+클라이언트에는 일반 `message.content` 중심으로 전달한다. 이 모델은 최종 답변 전에
+reasoning 토큰을 길게 생성할 수 있어, 게이트웨이는 `max_tokens`가 낮게 들어오면
+기본적으로 `1024`까지 올려 최종 `content`가 비는 상황을 줄인다. 응답에는 OpenAI
+Chat Completions 호환 필드인 `id`, `object`, `created`, `model`, `choices`,
+`usage`가 보장된다.
+
+예시:
+
+```bash
+curl -X POST http://localhost:8765/gemma/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma",
+    "messages": [
+      {"role": "user", "content": "한국어로 한 문장만 답해. 정상 작동 중이야?"}
+    ],
+    "max_tokens": 256
+  }'
+```
+
+Stagehand, browser-use, 일반 챗봇 클라이언트처럼 OpenAI-compatible base URL과
+토큰을 받는 도구에는 다음 형태로 연결한다. 게이트웨이는 현재 Gemma 경로에서
+Authorization 토큰 값을 검증하지 않으므로 로컬 테스트용 임의 값이면 충분하다.
+
+```bash
+OPENAI_API_KEY=local-gemma
+OPENAI_BASE_URL=http://127.0.0.1:8765/gemma/v1
+OPENAI_MODEL=gemma
+```
+
+---
+
 ## Codex 모드 API (`/codex/*`)
 
 Codex CLI를 headless non-interactive 채널로 사용한다.

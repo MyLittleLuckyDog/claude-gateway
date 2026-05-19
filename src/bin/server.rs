@@ -1,11 +1,12 @@
-use std::sync::Arc;
 use clap::Parser;
+use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 use claude_agent::api::{self, AppState, Stats};
-use claude_agent::config::AppConfig;
 use claude_agent::codex::store::CodexSessionStore;
 use claude_agent::codex_app::store::CodexAppSessionStore;
+use claude_agent::config::AppConfig;
+use claude_agent::local_mlx_proxy::LocalMlxProxyState;
 use claude_agent::openai_proxy::OpenAiProxyState;
 use claude_agent::session::store::SessionStore;
 
@@ -25,7 +26,9 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -56,7 +59,9 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            cleanup_sessions.run_cleanup(cleanup_config.cli.session_idle_timeout_secs).await;
+            cleanup_sessions
+                .run_cleanup(cleanup_config.cli.session_idle_timeout_secs)
+                .await;
         }
     });
 
@@ -88,7 +93,8 @@ async fn main() -> anyhow::Result<()> {
             Ok(token) => {
                 tracing::info!(
                     "OAuth token loaded (subscription: {:?}, tier: {:?})",
-                    token.subscription_type, token.rate_limit_tier
+                    token.subscription_type,
+                    token.rate_limit_tier
                 );
                 Some(Arc::new(claude_agent::proxy::ProxyState::new(
                     config.proxy.max_concurrent,
@@ -116,11 +122,30 @@ async fn main() -> anyhow::Result<()> {
         ))
     });
 
+    let local_mlx = LocalMlxProxyState::from_env();
+    if let Some(ref local_mlx) = local_mlx {
+        tracing::info!(
+            "Gemma proxy enabled via local MLX (base_url: {}, alias: {}, model: {})",
+            local_mlx.base_url,
+            local_mlx.alias,
+            local_mlx.model,
+        );
+    } else {
+        tracing::info!("Gemma proxy disabled (GEMMA_ENABLED=false)");
+    }
+
     let openai = OpenAiProxyState::from_env();
     if openai.is_some() {
         tracing::info!("OpenAI Responses proxy enabled");
     } else {
         tracing::info!("OpenAI Responses proxy disabled (OPENAI_API_KEY not set)");
+    }
+
+    let openai_oauth = claude_agent::openai_oauth::OpenAiOAuthState::from_auth_file().await;
+    if openai_oauth.is_some() {
+        tracing::info!("OpenAI OAuth channel enabled");
+    } else {
+        tracing::info!("OpenAI OAuth channel disabled (auth.json not found)");
     }
 
     // Spawn proxy session cleanup task
@@ -146,7 +171,9 @@ async fn main() -> anyhow::Result<()> {
         stats: Arc::new(tokio::sync::Mutex::new(Stats::default())),
         proxy,
         proxy_sessions,
+        local_mlx,
         openai,
+        openai_oauth,
     };
 
     let app = api::build_router(state);
@@ -174,7 +201,9 @@ async fn shutdown_signal() {
     #[cfg(unix)]
     let terminate = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => { sig.recv().await; }
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
             Err(e) => {
                 tracing::error!("Failed to install SIGTERM handler: {e}");
                 std::future::pending::<()>().await;
