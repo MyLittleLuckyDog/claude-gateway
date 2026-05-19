@@ -215,7 +215,7 @@ async fn models_handler(State(state): State<AppState>) -> Response {
             return error_response(
                 501,
                 "openai_proxy_disabled",
-                "OpenAI proxy is not enabled (set OPENAI_API_KEY)",
+                "OpenAI proxy is not enabled (set OPENAI_API_KEY or provide auth.json)",
             )
         }
     };
@@ -255,20 +255,27 @@ async fn models_handler(State(state): State<AppState>) -> Response {
 }
 
 async fn stats_handler(State(state): State<AppState>) -> Response {
-    let proxy_state = match state.openai.as_ref() {
-        Some(ps) => ps,
-        None => {
-            return error_response(
-                501,
-                "openai_proxy_disabled",
-                "OpenAI proxy is not enabled (set OPENAI_API_KEY)",
-            )
-        }
-    };
+    if let Some(proxy_state) = state.openai.as_ref() {
+        return Json(json!({
+            "total_requests": proxy_state.total_requests.load(Ordering::Relaxed),
+            "base_url": proxy_state.base_url,
+        }))
+        .into_response();
+    }
 
-    Json(json!({
-        "total_requests": proxy_state.total_requests.load(Ordering::Relaxed),
-        "base_url": proxy_state.base_url,
-    }))
-    .into_response()
+    // Fall back to the OAuth channel, consistent with the responses/models
+    // handlers — otherwise stats report 501 while the channel actually works.
+    if let Some(oauth) = state.openai_oauth.as_ref() {
+        return Json(json!({
+            "total_requests": oauth.total_requests.load(Ordering::Relaxed),
+            "base_url": oauth.base_url,
+        }))
+        .into_response();
+    }
+
+    error_response(
+        501,
+        "openai_proxy_disabled",
+        "OpenAI proxy is not enabled (set OPENAI_API_KEY or provide auth.json)",
+    )
 }

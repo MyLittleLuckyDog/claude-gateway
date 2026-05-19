@@ -202,13 +202,39 @@ impl OpenAiOAuthState {
     }
 }
 
+/// Parameters the ChatGPT Codex `/responses` backend rejects outright with
+/// `HTTP 400 "Unsupported parameter: ..."` (verified against the live backend).
+/// They are stripped from every upstream request body so a caller that sets
+/// them does not break the whole request.
+const CODEX_UNSUPPORTED_PARAMS: &[&str] = &[
+    "max_output_tokens",
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "metadata",
+];
+
 pub fn normalize_codex_body(mut body: Value) -> Value {
     if let Some(obj) = body.as_object_mut() {
         obj.entry("instructions")
             .or_insert_with(|| Value::String(String::new()));
         obj.entry("store").or_insert(Value::Bool(false));
         obj.entry("stream").or_insert(Value::Bool(true));
-        obj.remove("max_output_tokens");
+
+        // Strip backend-unsupported params. Surface what we drop so a caller
+        // is not silently surprised (e.g. an ignored output-token cap).
+        let dropped: Vec<&str> = CODEX_UNSUPPORTED_PARAMS
+            .iter()
+            .copied()
+            .filter(|key| obj.remove(*key).is_some())
+            .collect();
+        if !dropped.is_empty() {
+            tracing::warn!(
+                "Stripped Codex-unsupported parameter(s) from upstream request: {}",
+                dropped.join(", ")
+            );
+        }
     }
     normalize_reasoning_effort(&mut body);
     body
@@ -622,10 +648,44 @@ fn sse_data(block: &str) -> Option<String> {
     }
 }
 
+/// OpenAI Chat Completions parameters that have no effect once a request is
+/// translated for the Codex `/responses` backend — sampling controls and
+/// output-token caps the backend does not honor. The translation simply omits
+/// them; this list exists only to log what the caller asked for and lost.
+const CHAT_IGNORED_PARAMS: &[&str] = &[
+    "max_tokens",
+    "max_completion_tokens",
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "n",
+    "logprobs",
+    "top_logprobs",
+    "logit_bias",
+    "stop",
+    "metadata",
+];
+
+fn warn_ignored_chat_params(obj: &serde_json::Map<String, Value>) {
+    let ignored: Vec<&str> = CHAT_IGNORED_PARAMS
+        .iter()
+        .copied()
+        .filter(|key| obj.contains_key(*key))
+        .collect();
+    if !ignored.is_empty() {
+        tracing::warn!(
+            "chat/completions: ignoring parameter(s) not supported by the Codex backend: {}",
+            ignored.join(", ")
+        );
+    }
+}
+
 pub fn chat_to_responses_body(body: Value, _stream: bool) -> Result<Value, GatewayError> {
     let obj = body
         .as_object()
         .ok_or_else(|| GatewayError::Internal("Request body must be a JSON object".into()))?;
+    warn_ignored_chat_params(obj);
     let model = obj
         .get("model")
         .cloned()
@@ -685,11 +745,9 @@ pub fn chat_to_responses_body(body: Value, _stream: bool) -> Result<Value, Gatew
     });
 
     if let Some(out_obj) = out.as_object_mut() {
-        for key in ["temperature", "top_p", "max_output_tokens", "metadata"] {
-            if let Some(value) = obj.get(key) {
-                out_obj.insert(key.to_string(), value.clone());
-            }
-        }
+        // Sampling/limit params (temperature, top_p, metadata, …) are
+        // intentionally not forwarded — the Codex backend rejects them.
+        // See CHAT_IGNORED_PARAMS / CODEX_UNSUPPORTED_PARAMS.
         if let Some(tool_choice) = obj.get("tool_choice") {
             out_obj.insert(
                 "tool_choice".to_string(),
@@ -1056,12 +1114,40 @@ mod tests {
     }
 
     #[test]
-    fn normalize_preserves_other_fields() {
-        let body = serde_json::json!({"model": "gpt-4o", "input": "hi", "temperature": 0.7});
+    fn normalize_preserves_passthrough_fields() {
+        let body = serde_json::json!({"model": "gpt-4o", "input": "hi", "user": "u1"});
         let out = normalize_codex_body(body);
         assert_eq!(out["model"], "gpt-4o");
         assert_eq!(out["input"], "hi");
-        assert_eq!(out["temperature"], 0.7);
+        assert_eq!(out["user"], "u1");
+    }
+
+    #[test]
+    fn normalize_strips_codex_unsupported_params() {
+        let body = serde_json::json!({
+            "model": "gpt-5.4",
+            "input": "hi",
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "frequency_penalty": 0.5,
+            "presence_penalty": 0.1,
+            "metadata": {"k": "v"},
+            "max_output_tokens": 100
+        });
+        let out = normalize_codex_body(body);
+        let obj = out.as_object().unwrap();
+        for key in [
+            "temperature",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "metadata",
+            "max_output_tokens",
+        ] {
+            assert!(obj.get(key).is_none(), "{key} should be stripped");
+        }
+        assert_eq!(out["model"], "gpt-5.4");
+        assert_eq!(out["input"], "hi");
     }
 
     #[test]
