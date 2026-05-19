@@ -5,6 +5,7 @@ Cargo.lock.bak
 # Logs & temp
 *.log
 docs/temp/
+DEBUG_*.md
 
 # OS
 .DS_Store
@@ -22,3 +23,4 @@ ehthumbs.db
 # Env
 .env
 .env.local
+config.toml

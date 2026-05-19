@@ -19,3 +19,4 @@ pub mod sse;
 pub mod codex;
 pub mod codex_app;
 pub mod openai_proxy;
+pub mod openai_oauth;

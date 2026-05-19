@@ -3,6 +3,7 @@ pub mod codex;
 pub mod codex_app;
 pub mod hooks;
 pub mod openai;
+pub mod openai_oauth;
 pub mod proxy;
 pub mod proxy_sessions;
 pub mod query;
@@ -19,6 +20,7 @@ use crate::config::AppConfig;
 use crate::codex::store::CodexSessionStore;
 use crate::codex_app::store::CodexAppSessionStore;
 use crate::openai_proxy::OpenAiProxyState;
+use crate::openai_oauth::OpenAiOAuthState;
 use crate::proxy::ProxyState;
 use crate::proxy_session::ProxySessionStore;
 use crate::session::store::SessionStore;
@@ -34,6 +36,7 @@ pub struct AppState {
     pub proxy: Option<Arc<ProxyState>>,
     pub proxy_sessions: Option<Arc<ProxySessionStore>>,
     pub openai: Option<Arc<OpenAiProxyState>>,
+    pub openai_oauth: Option<Arc<OpenAiOAuthState>>,
 }
 
 #[derive(Debug, Default)]
@@ -104,6 +107,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(codex::routes())
         .merge(codex_app::routes())
         .merge(openai::routes())
+        .merge(openai_oauth::routes())
         .merge(query::routes())
         .merge(sessions::routes())
         .merge(hooks::routes())

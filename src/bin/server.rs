@@ -123,6 +123,13 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("OpenAI Responses proxy disabled (OPENAI_API_KEY not set)");
     }
 
+    let openai_oauth = claude_agent::openai_oauth::OpenAiOAuthState::from_auth_file().await;
+    if openai_oauth.is_some() {
+        tracing::info!("OpenAI OAuth channel enabled");
+    } else {
+        tracing::info!("OpenAI OAuth channel disabled (auth.json not found)");
+    }
+
     // Spawn proxy session cleanup task
     if let Some(ref ps) = proxy_sessions {
         let cleanup_store = ps.clone();
@@ -147,6 +154,7 @@ async fn main() -> anyhow::Result<()> {
         proxy,
         proxy_sessions,
         openai,
+        openai_oauth,
     };
 
     let app = api::build_router(state);
