@@ -1,4 +1,24 @@
+# Rust
 /target
-.DS_Store
+Cargo.lock.bak
+
+# Logs & temp
 *.log
 docs/temp/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Env
+.env
+.env.local
