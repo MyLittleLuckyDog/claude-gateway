@@ -1,5 +1,9 @@
+# Rust
 /target
-.DS_Store
+Cargo.lock.bak
+
+# Logs & temp
 *.log
 docs/temp/
+.DS_Store
 /.claude/
