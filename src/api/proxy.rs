@@ -8,10 +8,31 @@
 use std::sync::atomic::Ordering;
 
 use axum::extract::State;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
+
+/// Resolve the upstream session_id from request headers, falling back to
+/// a fresh UUID when the client didn't pin one.
+///
+/// Gateway-internal session ids feed into `inject_metadata` →
+/// `metadata.user_id`, and Anthropic's prompt cache appears to key off
+/// that user_id (the same prompt prefix issued from two random
+/// session_ids consistently produces `cache_read_input_tokens=0`).
+///
+/// A long-lived caller (cc-gnothi nightly, future sub-agents) that
+/// pins a stable id via `X-Session-Id` thus sees its second request hit
+/// the cache. Random ids stay the default so legacy callers behave
+/// exactly as before.
+fn session_id_from(headers: &HeaderMap) -> String {
+    headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(crate::client_identity::new_session_id)
+}
 use serde_json::json;
 
 use super::{error_response, proxy_error_response};
@@ -102,6 +123,7 @@ fn preprocess_request(body: &serde_json::Value) -> Result<(serde_json::Value, Op
 /// POST /v1/messages — synchronous Messages API proxy
 async fn messages_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let proxy_state = match state.proxy.as_ref() {
@@ -114,7 +136,7 @@ async fn messages_handler(
         Err(e) => return e,
     };
 
-    let session_id = crate::client_identity::new_session_id();
+    let session_id = session_id_from(&headers);
 
     match proxy::messages_sync(
         proxy_state,
@@ -134,6 +156,7 @@ async fn messages_handler(
 /// POST /v1/messages/stream — SSE streaming Messages API proxy
 async fn messages_stream_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let proxy_state = match state.proxy.as_ref() {
@@ -146,7 +169,7 @@ async fn messages_stream_handler(
         Err(e) => return e,
     };
 
-    let session_id = crate::client_identity::new_session_id();
+    let session_id = session_id_from(&headers);
 
     match proxy::messages_stream(
         proxy_state,

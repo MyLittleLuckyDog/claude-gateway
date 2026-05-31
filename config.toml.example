@@ -1,0 +1,20 @@
+# claude-gateway local config.
+#
+# Loaded by `config::File::with_name("config")` at startup from the
+# gateway's working directory (set by the launchd plist to
+# ~/workspace/withAI/claude-gateway). Required = false, so this file
+# is purely override-on-top-of-defaults.
+#
+# Sections omitted = defaults (see src/config.rs).
+
+[proxy]
+# Concurrent /v1/messages calls allowed through the upstream Anthropic
+# semaphore. Default in code is 1 ("conservative"); raising it lets
+# parallel measurement workloads (G2-A-LLM 24-case batches, future
+# committee dispatch through gateway) finish faster — Claude Code
+# itself uses the same OAuth token for multiple concurrent sessions,
+# so 1 OAuth × N concurrent is the demonstrated-supported pattern.
+#
+# Start at 4 (matches typical Claude Code session count); raise to 8
+# if Anthropic doesn't 429 and 4 is still the bottleneck.
+max_concurrent = 4

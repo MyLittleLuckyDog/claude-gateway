@@ -7,3 +7,8 @@ Cargo.lock.bak
 docs/temp/
 .DS_Store
 /.claude/
+
+# Local runtime config — see config.toml.example for the shape and
+# defaults. Each host carries its own concurrent / session settings.
+# Tracked only via the example file.
+/config.toml
