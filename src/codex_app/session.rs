@@ -7,8 +7,6 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
 use crate::codex::options::CodexOptions;
 
-pub const MAX_CODEX_APP_HISTORY_SIZE: usize = 500;
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodexAppSessionState {
     Initializing,

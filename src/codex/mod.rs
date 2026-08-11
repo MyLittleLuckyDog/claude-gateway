@@ -18,7 +18,8 @@ use self::messages::{
     RawCodexEvent,
 };
 use self::options::{CodexApprovalPolicy, CodexOptions, CodexSandboxMode};
-use self::session::{CodexSession, CodexSessionState, MAX_CODEX_HISTORY_SIZE};
+use self::session::{CodexSession, CodexSessionState};
+use crate::core::events::record_and_broadcast;
 
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -404,14 +405,7 @@ pub async fn run_session_turn(
                 *session.thread_id.lock().await = Some(thread_id);
             }
             for event in result.events {
-                let arc = Arc::new(event);
-                let mut history = session.history.lock().await;
-                history.push_back(arc.clone());
-                while history.len() > MAX_CODEX_HISTORY_SIZE {
-                    history.pop_front();
-                }
-                drop(history);
-                let _ = session.event_tx.send(arc);
+                record_and_broadcast(&session.history, &session.event_tx, Arc::new(event)).await;
             }
             *session.state.lock().await = CodexSessionState::Idle;
             session
@@ -424,13 +418,7 @@ pub async fn run_session_turn(
                 message: e.to_string(),
                 code: e.error_code().to_string(),
             });
-            let mut history = session.history.lock().await;
-            history.push_back(event.clone());
-            while history.len() > MAX_CODEX_HISTORY_SIZE {
-                history.pop_front();
-            }
-            drop(history);
-            let _ = session.event_tx.send(event);
+            record_and_broadcast(&session.history, &session.event_tx, event).await;
             *session.state.lock().await = CodexSessionState::Idle;
             Err(e)
         }

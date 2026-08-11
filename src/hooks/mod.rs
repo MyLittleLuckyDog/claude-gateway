@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use crate::core::events::record_and_broadcast;
 use crate::messages::cli_control::{ControlResponseOut, HookCallbackInput, HookCallbackRequest};
 use crate::messages::Message;
 use crate::options::{ClaudeAgentOptions, HookTimeoutAction};
-use crate::session::{Session, SessionState, MAX_HISTORY_SIZE};
+use crate::session::{Session, SessionState};
 
 use server_rules::{evaluate_hook_rules, ResolvedDecision};
 
@@ -174,13 +175,7 @@ pub fn spawn_hook_timeout(
                     ),
                     code: "hook_timeout".to_string(),
                 });
-                let mut history = session.history.lock().await;
-                history.push_back(timeout_msg.clone());
-                while history.len() > MAX_HISTORY_SIZE {
-                    history.pop_front();
-                }
-                drop(history);
-                let _ = session.event_tx.send(timeout_msg);
+                record_and_broadcast(&session.history, &session.event_tx, timeout_msg).await;
             }
         }
     })

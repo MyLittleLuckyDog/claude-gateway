@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::config::AppConfig;
+use crate::core::events::record_and_broadcast;
 use crate::error::GatewayError;
 use crate::hooks::{self, AutoResolveOutcome};
 use crate::messages::cli_control::{ControlRequestOut, ControlRequestPayload};
@@ -12,7 +13,7 @@ use crate::messages::Message;
 use crate::options::ClaudeAgentOptions;
 use crate::query::cli_output_to_message;
 use crate::session::store::SessionStore;
-use crate::session::{Session, SessionState, MAX_HISTORY_SIZE};
+use crate::session::{Session, SessionState};
 use crate::transport::cli::CliTransport;
 use crate::transport::Transport;
 
@@ -255,12 +256,5 @@ async fn run_session_loop(
 }
 
 async fn broadcast_and_record(session: &Session, message: Arc<Message>) {
-    let mut history = session.history.lock().await;
-    history.push_back(message.clone());
-    // Cap history to prevent unbounded memory growth
-    while history.len() > MAX_HISTORY_SIZE {
-        history.pop_front();
-    }
-    drop(history);
-    let _ = session.event_tx.send(message);
+    record_and_broadcast(&session.history, &session.event_tx, message).await;
 }

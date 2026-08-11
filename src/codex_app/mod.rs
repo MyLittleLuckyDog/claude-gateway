@@ -15,9 +15,8 @@ use crate::codex::options::CodexOptions;
 use crate::config::AppConfig;
 use crate::error::GatewayError;
 
-use self::session::{
-    CodexAppSession, CodexAppSessionState, PendingApproval, MAX_CODEX_APP_HISTORY_SIZE,
-};
+use self::session::{CodexAppSession, CodexAppSessionState, PendingApproval};
+use crate::core::events::record_and_broadcast;
 
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -151,13 +150,7 @@ fn build_history_event(event_type: &str, payload: Value) -> Arc<Value> {
 }
 
 async fn record_event(session: &CodexAppSession, event: Arc<Value>) {
-    let mut history = session.history.lock().await;
-    history.push_back(event.clone());
-    while history.len() > MAX_CODEX_APP_HISTORY_SIZE {
-        history.pop_front();
-    }
-    drop(history);
-    let _ = session.event_tx.send(event);
+    record_and_broadcast(&session.history, &session.event_tx, event).await;
 }
 
 async fn handle_incoming_value(session: Arc<CodexAppSession>, value: Value) {

@@ -5,6 +5,7 @@ pub mod client_identity;
 pub mod codex;
 pub mod codex_app;
 pub mod config;
+pub mod core;
 pub mod error;
 pub mod hooks;
 pub mod local_mlx_proxy;
