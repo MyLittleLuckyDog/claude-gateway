@@ -39,10 +39,7 @@ pub fn create_mcp_config_file(
                     "type".to_string(),
                     serde_json::Value::String("sse".to_string()),
                 );
-                obj.insert(
-                    "url".to_string(),
-                    serde_json::Value::String(url.clone()),
-                );
+                obj.insert("url".to_string(), serde_json::Value::String(url.clone()));
                 if let Some(headers) = headers {
                     obj.insert(
                         "headers".to_string(),
@@ -58,10 +55,7 @@ pub fn create_mcp_config_file(
                     "type".to_string(),
                     serde_json::Value::String("http".to_string()),
                 );
-                obj.insert(
-                    "url".to_string(),
-                    serde_json::Value::String(url.clone()),
-                );
+                obj.insert("url".to_string(), serde_json::Value::String(url.clone()));
                 if let Some(headers) = headers {
                     obj.insert(
                         "headers".to_string(),
@@ -86,8 +80,8 @@ pub fn create_mcp_config_file(
     let filename = format!("mcp-{}.json", uuid::Uuid::new_v4());
     let path = dir.join(filename);
 
-    let json_str = serde_json::to_string_pretty(&config)
-        .map_err(|e| GatewayError::Internal(e.to_string()))?;
+    let json_str =
+        serde_json::to_string_pretty(&config).map_err(|e| GatewayError::Internal(e.to_string()))?;
     std::fs::write(&path, json_str).map_err(GatewayError::Io)?;
 
     tracing::debug!("Created MCP config file at {:?}", path);

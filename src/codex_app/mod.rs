@@ -3,8 +3,8 @@ pub mod store;
 
 use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -15,7 +15,9 @@ use crate::codex::options::CodexOptions;
 use crate::config::AppConfig;
 use crate::error::GatewayError;
 
-use self::session::{CodexAppSession, CodexAppSessionState, PendingApproval, MAX_CODEX_APP_HISTORY_SIZE};
+use self::session::{
+    CodexAppSession, CodexAppSessionState, PendingApproval, MAX_CODEX_APP_HISTORY_SIZE,
+};
 
 fn now_epoch_ms() -> u64 {
     std::time::SystemTime::now()
@@ -63,20 +65,35 @@ fn initialize_request(id: u64) -> Value {
 fn thread_start_request(id: u64, options: &CodexOptions) -> Value {
     let mut params = serde_json::Map::new();
     if let Some(cwd) = &options.cwd {
-        params.insert("cwd".to_string(), Value::String(cwd.to_string_lossy().to_string()));
+        params.insert(
+            "cwd".to_string(),
+            Value::String(cwd.to_string_lossy().to_string()),
+        );
     }
     if let Some(model) = &options.model {
         params.insert("model".to_string(), Value::String(model.clone()));
-        params.insert("modelProvider".to_string(), Value::String("openai".to_string()));
+        params.insert(
+            "modelProvider".to_string(),
+            Value::String("openai".to_string()),
+        );
     }
     if let Some(system_prompt) = &options.system_prompt {
-        params.insert("developerInstructions".to_string(), Value::String(system_prompt.clone()));
+        params.insert(
+            "developerInstructions".to_string(),
+            Value::String(system_prompt.clone()),
+        );
     }
     if let Some(approval_policy) = &options.approval_policy {
-        params.insert("approvalPolicy".to_string(), Value::String(approval_policy.as_str().to_string()));
+        params.insert(
+            "approvalPolicy".to_string(),
+            Value::String(approval_policy.as_str().to_string()),
+        );
     }
     if let Some(sandbox) = &options.sandbox {
-        params.insert("sandbox".to_string(), Value::String(sandbox.as_str().to_string()));
+        params.insert(
+            "sandbox".to_string(),
+            Value::String(sandbox.as_str().to_string()),
+        );
     }
     if options.ephemeral {
         params.insert("ephemeral".to_string(), Value::Bool(true));
@@ -115,10 +132,15 @@ async fn send_rpc_and_wait(
 ) -> Result<Value, GatewayError> {
     let id = next_rpc_id(session);
     let (tx, rx) = oneshot::channel();
-    session.pending_requests.lock().await.insert(id.to_string(), tx);
+    session
+        .pending_requests
+        .lock()
+        .await
+        .insert(id.to_string(), tx);
     let request = rpc_request(id, method, params);
     send_json_line(&session.stdin_tx, &request).await?;
-    rx.await.map_err(|_| GatewayError::Internal(format!("app-server request `{}` dropped", method)))
+    rx.await
+        .map_err(|_| GatewayError::Internal(format!("app-server request `{}` dropped", method)))
 }
 
 fn build_history_event(event_type: &str, payload: Value) -> Arc<Value> {
@@ -163,7 +185,11 @@ async fn handle_incoming_value(session: Arc<CodexAppSession>, value: Value) {
                 {
                     *session.thread_id.lock().await = Some(thread_id.to_string());
                 }
-                record_event(session.as_ref(), build_history_event("thread_started", params)).await;
+                record_event(
+                    session.as_ref(),
+                    build_history_event("thread_started", params),
+                )
+                .await;
             }
             "turn/started" => {
                 if let Some(turn_id) = params
@@ -174,31 +200,63 @@ async fn handle_incoming_value(session: Arc<CodexAppSession>, value: Value) {
                     *session.turn_id.lock().await = Some(turn_id.to_string());
                 }
                 *session.state.lock().await = CodexAppSessionState::Running;
-                record_event(session.as_ref(), build_history_event("turn_started", params)).await;
+                record_event(
+                    session.as_ref(),
+                    build_history_event("turn_started", params),
+                )
+                .await;
             }
             "turn/completed" => {
                 *session.turn_id.lock().await = None;
                 *session.pending_approval.lock().await = None;
                 *session.state.lock().await = CodexAppSessionState::Idle;
-                record_event(session.as_ref(), build_history_event("turn_completed", params)).await;
+                record_event(
+                    session.as_ref(),
+                    build_history_event("turn_completed", params),
+                )
+                .await;
             }
             "thread/status/changed" => {
-                record_event(session.as_ref(), build_history_event("thread_status_changed", params)).await;
+                record_event(
+                    session.as_ref(),
+                    build_history_event("thread_status_changed", params),
+                )
+                .await;
             }
             "item/agentMessage/delta" => {
-                record_event(session.as_ref(), build_history_event("agent_message_delta", params)).await;
+                record_event(
+                    session.as_ref(),
+                    build_history_event("agent_message_delta", params),
+                )
+                .await;
             }
             "item/started" => {
-                record_event(session.as_ref(), build_history_event("item_started", params)).await;
+                record_event(
+                    session.as_ref(),
+                    build_history_event("item_started", params),
+                )
+                .await;
             }
             "item/completed" => {
-                record_event(session.as_ref(), build_history_event("item_completed", params)).await;
+                record_event(
+                    session.as_ref(),
+                    build_history_event("item_completed", params),
+                )
+                .await;
             }
             "thread/tokenUsage/updated" => {
-                record_event(session.as_ref(), build_history_event("token_usage_updated", params)).await;
+                record_event(
+                    session.as_ref(),
+                    build_history_event("token_usage_updated", params),
+                )
+                .await;
             }
             "serverRequest/resolved" => {
-                record_event(session.as_ref(), build_history_event("server_request_resolved", params)).await;
+                record_event(
+                    session.as_ref(),
+                    build_history_event("server_request_resolved", params),
+                )
+                .await;
             }
             "item/commandExecution/requestApproval"
             | "item/fileChange/requestApproval"
@@ -245,10 +303,7 @@ async fn handle_incoming_value(session: Arc<CodexAppSession>, value: Value) {
     }
 }
 
-async fn stdout_parser_task(
-    stdout: tokio::process::ChildStdout,
-    session: Arc<CodexAppSession>,
-) {
+async fn stdout_parser_task(stdout: tokio::process::ChildStdout, session: Arc<CodexAppSession>) {
     let reader = BufReader::new(stdout);
     let mut lines = reader.lines();
     while let Ok(Some(line)) = lines.next_line().await {
@@ -273,10 +328,7 @@ async fn stdout_parser_task(
     *session.state.lock().await = CodexAppSessionState::Dead;
 }
 
-async fn stdin_writer_task(
-    mut stdin: tokio::process::ChildStdin,
-    mut rx: mpsc::Receiver<String>,
-) {
+async fn stdin_writer_task(mut stdin: tokio::process::ChildStdin, mut rx: mpsc::Receiver<String>) {
     while let Some(data) = rx.recv().await {
         let line = if data.ends_with('\n') {
             data
@@ -320,17 +372,15 @@ pub async fn create_session(
         }
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| GatewayError::CliConnection(format!("Failed to spawn Codex app-server: {}", e)))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| GatewayError::CliConnection("No stdout pipe from Codex app-server".to_string()))?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| GatewayError::CliConnection("No stdin pipe from Codex app-server".to_string()))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        GatewayError::CliConnection(format!("Failed to spawn Codex app-server: {}", e))
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| {
+        GatewayError::CliConnection("No stdout pipe from Codex app-server".to_string())
+    })?;
+    let stdin = child.stdin.take().ok_or_else(|| {
+        GatewayError::CliConnection("No stdin pipe from Codex app-server".to_string())
+    })?;
     let stderr = child.stderr.take();
 
     let (stdin_tx, stdin_rx) = mpsc::channel::<String>(64);
@@ -364,9 +414,14 @@ pub async fn create_session(
 
     let init_id = next_rpc_id(session.as_ref());
     let (tx, rx) = oneshot::channel();
-    session.pending_requests.lock().await.insert(init_id.to_string(), tx);
+    session
+        .pending_requests
+        .lock()
+        .await
+        .insert(init_id.to_string(), tx);
     send_json_line(&session.stdin_tx, &initialize_request(init_id)).await?;
-    rx.await.map_err(|_| GatewayError::Internal("app-server initialize dropped".to_string()))?;
+    rx.await
+        .map_err(|_| GatewayError::Internal("app-server initialize dropped".to_string()))?;
 
     let thread_result = send_rpc_and_wait(
         session.as_ref(),
@@ -388,15 +443,12 @@ pub async fn create_session(
 }
 
 pub async fn send_turn(session: Arc<CodexAppSession>, message: String) -> Result<(), GatewayError> {
-    let thread_id = session
-        .thread_id
-        .lock()
-        .await
-        .clone()
-        .ok_or_else(|| GatewayError::InvalidSessionState {
+    let thread_id = session.thread_id.lock().await.clone().ok_or_else(|| {
+        GatewayError::InvalidSessionState {
             expected: "initialized thread".to_string(),
             actual: "missing thread_id".to_string(),
-        })?;
+        }
+    })?;
     let request_id = next_rpc_id(session.as_ref());
     let (tx, rx) = oneshot::channel();
     session
@@ -405,8 +457,14 @@ pub async fn send_turn(session: Arc<CodexAppSession>, message: String) -> Result
         .await
         .insert(request_id.to_string(), tx);
     *session.state.lock().await = CodexAppSessionState::Running;
-    session.last_activity_ms.store(now_epoch_ms(), Ordering::Relaxed);
-    send_json_line(&session.stdin_tx, &turn_start_request(request_id, &thread_id, &message)).await?;
+    session
+        .last_activity_ms
+        .store(now_epoch_ms(), Ordering::Relaxed);
+    send_json_line(
+        &session.stdin_tx,
+        &turn_start_request(request_id, &thread_id, &message),
+    )
+    .await?;
     let _ = rx
         .await
         .map_err(|_| GatewayError::Internal("app-server turn/start dropped".to_string()))?;
@@ -431,16 +489,18 @@ pub async fn send_approval_response(
             actual: format!("waiting for approval {}", pending.request_id),
         });
     }
-    let id_num = request_id
-        .parse::<u64>()
-        .map_err(|_| GatewayError::Internal(format!("invalid approval request id: {}", request_id)))?;
+    let id_num = request_id.parse::<u64>().map_err(|_| {
+        GatewayError::Internal(format!("invalid approval request id: {}", request_id))
+    })?;
     let msg = json!({
         "id": id_num,
         "result": response,
     });
     send_json_line(&session.stdin_tx, &msg).await?;
     *session.state.lock().await = CodexAppSessionState::Running;
-    session.last_activity_ms.store(now_epoch_ms(), Ordering::Relaxed);
+    session
+        .last_activity_ms
+        .store(now_epoch_ms(), Ordering::Relaxed);
     Ok(())
 }
 

@@ -8,15 +8,15 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 use super::AppState;
 use crate::client;
 use crate::error::{ErrorResponse, GatewayError};
+use crate::messages::cli_input::{CliInputMessage, CliUserInput, ImageSource, InputContent};
 use crate::messages::Message;
-use crate::messages::cli_input::{CliInputMessage, CliUserInput, InputContent, ImageSource};
 use crate::options::ClaudeAgentOptions;
 use crate::session::SessionState;
 
@@ -51,7 +51,9 @@ pub struct MessagesQuery {
     pub include_system: bool,
 }
 
-fn default_limit() -> usize { 50 }
+fn default_limit() -> usize {
+    50
+}
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -95,10 +97,7 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
     Json(serde_json::json!(list))
 }
 
-async fn delete_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     if state.sessions.remove(&id) {
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -172,9 +171,7 @@ async fn send_message(
 
 fn take_sendable_state(current_state: &SessionState) -> Result<SessionState, GatewayError> {
     match current_state {
-        SessionState::Initializing | SessionState::Idle => {
-            Ok(current_state.clone())
-        }
+        SessionState::Initializing | SessionState::Idle => Ok(current_state.clone()),
         other => Err(GatewayError::InvalidSessionState {
             expected: "initializing or idle".to_string(),
             actual: other.to_string(),
@@ -182,10 +179,7 @@ fn take_sendable_state(current_state: &SessionState) -> Result<SessionState, Gat
     }
 }
 
-async fn stream_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn stream_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.sessions.get(&id) {
         Ok(s) => s,
         Err(e) => return error_response(&e),
@@ -225,7 +219,9 @@ async fn stream_session(
         }
     };
 
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 async fn get_messages(
@@ -239,7 +235,8 @@ async fn get_messages(
     };
 
     let history = session.history.lock().await;
-    let filtered: Vec<&Message> = history.iter()
+    let filtered: Vec<&Message> = history
+        .iter()
         .map(|m| m.as_ref())
         .filter(|m| {
             if !params.include_system {
@@ -251,7 +248,8 @@ async fn get_messages(
         .collect();
 
     let total = filtered.len();
-    let messages: Vec<_> = filtered.into_iter()
+    let messages: Vec<_> = filtered
+        .into_iter()
         .skip(params.offset)
         .take(params.limit)
         .collect();
@@ -260,13 +258,11 @@ async fn get_messages(
         "session_id": id,
         "total": total,
         "messages": messages,
-    })).into_response()
+    }))
+    .into_response()
 }
 
-async fn fork_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn fork_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.sessions.get(&id) {
         Ok(s) => s,
         Err(e) => return error_response(&e),

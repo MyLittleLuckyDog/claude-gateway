@@ -24,7 +24,9 @@ impl CodexAppSessionStore {
     pub fn insert(&self, session: Arc<CodexAppSession>) -> Result<(), GatewayError> {
         let _guard = self.op_lock.lock().unwrap();
         if self.sessions.len() >= self.max_sessions {
-            return Err(GatewayError::SessionLimitReached { max: self.max_sessions });
+            return Err(GatewayError::SessionLimitReached {
+                max: self.max_sessions,
+            });
         }
         self.sessions.insert(session.id.clone(), session);
         Ok(())
@@ -60,7 +62,8 @@ impl CodexAppSessionStore {
                 .last_activity_ms
                 .load(std::sync::atomic::Ordering::Relaxed);
             let state = session.state.lock().await.clone();
-            if (now_ms.saturating_sub(last_ms)) > timeout_ms || state == CodexAppSessionState::Dead {
+            if (now_ms.saturating_sub(last_ms)) > timeout_ms || state == CodexAppSessionState::Dead
+            {
                 to_remove.push(entry.key().clone());
             }
         }

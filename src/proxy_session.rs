@@ -128,13 +128,17 @@ impl ProxySession {
             .or(self.options.max_tokens)
             .unwrap_or_else(|| models::default_max_tokens(&self.model));
 
-        let clean_messages: Vec<serde_json::Value> = self.messages.iter().map(|m| {
-            let mut msg = m.clone();
-            if let Some(obj) = msg.as_object_mut() {
-                obj.remove("_msg_id");
-            }
-            msg
-        }).collect();
+        let clean_messages: Vec<serde_json::Value> = self
+            .messages
+            .iter()
+            .map(|m| {
+                let mut msg = m.clone();
+                if let Some(obj) = msg.as_object_mut() {
+                    obj.remove("_msg_id");
+                }
+                msg
+            })
+            .collect();
 
         let mut body = serde_json::json!({
             "model": self.model,
@@ -218,9 +222,11 @@ impl ProxySession {
     /// access: even if other messages were inserted/removed in the
     /// meantime, we always target the exact message we added.
     pub fn rollback_message_by_id(&mut self, msg_id: &str) -> bool {
-        if let Some(pos) = self.messages.iter().position(|m| {
-            m.get("_msg_id").and_then(|v| v.as_str()) == Some(msg_id)
-        }) {
+        if let Some(pos) = self
+            .messages
+            .iter()
+            .position(|m| m.get("_msg_id").and_then(|v| v.as_str()) == Some(msg_id))
+        {
             self.messages.remove(pos);
             true
         } else {

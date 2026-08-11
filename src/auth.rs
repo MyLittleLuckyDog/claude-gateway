@@ -1,10 +1,10 @@
 //! OAuth token reader and refresh helper for Claude Code credentials.
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
-use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
@@ -228,9 +228,7 @@ pub async fn recover_from_401(failed_access_token: &str) -> Result<Option<OAuthT
     result
 }
 
-async fn recover_from_401_impl(
-    failed_access_token: &str,
-) -> Result<Option<OAuthToken>, String> {
+async fn recover_from_401_impl(failed_access_token: &str) -> Result<Option<OAuthToken>, String> {
     invalidate_cache();
 
     if let Ok(token) = read_oauth_token_from_storage_async().await {

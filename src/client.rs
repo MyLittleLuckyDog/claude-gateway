@@ -1,18 +1,18 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::config::AppConfig;
 use crate::error::GatewayError;
 use crate::hooks::{self, AutoResolveOutcome};
-use crate::messages::Message;
 use crate::messages::cli_control::{ControlRequestOut, ControlRequestPayload};
 use crate::messages::cli_output::{CliOutputEvent, SystemSubtype};
+use crate::messages::Message;
 use crate::options::ClaudeAgentOptions;
 use crate::query::cli_output_to_message;
-use crate::session::{Session, SessionState, MAX_HISTORY_SIZE};
 use crate::session::store::SessionStore;
+use crate::session::{Session, SessionState, MAX_HISTORY_SIZE};
 use crate::transport::cli::CliTransport;
 use crate::transport::Transport;
 
@@ -72,45 +72,52 @@ async fn run_session_loop(
     let first_msg = match stdin_rx.recv().await {
         Some(msg) => msg,
         None => {
-            tracing::info!("session {} stdin closed before first message", session_id_str);
+            tracing::info!(
+                "session {} stdin closed before first message",
+                session_id_str
+            );
             *session.state.lock().await = SessionState::Dead;
             return Ok(());
         }
     };
 
-    tracing::debug!("session {}: first message received, spawning CLI", session_id_str);
+    tracing::debug!(
+        "session {}: first message received, spawning CLI",
+        session_id_str
+    );
 
     let mut transport = CliTransport::new(options.clone(), (*config).clone());
     transport.connect().await?;
 
-    let mut event_rx = transport.event_receiver()
+    let mut event_rx = transport
+        .event_receiver()
         .ok_or_else(|| GatewayError::Internal("No event receiver".to_string()))?;
 
     // Register hook callbacks with the CLI via an initialize control_request
     // BEFORE we relay the user's first message. Without this step the CLI
     // never routes PreToolUse events back to us and hook_rules are dead.
-    let callback_map: HashMap<String, usize> =
-        match hooks::build_initialize_request(&options) {
-            Some((init_payload, cbmap)) => {
-                let req_id = format!("init-{}", uuid::Uuid::new_v4());
-                let init = ControlRequestOut::new(req_id.clone(), init_payload);
-                match serde_json::to_string(&init) {
-                    Ok(s) => {
-                        if let Err(e) = transport.write(&s).await {
-                            tracing::warn!("initialize control_request failed: {}", e);
-                        } else {
-                            tracing::debug!(
-                                "session {}: sent initialize request_id={}",
-                                session_id_str, req_id
-                            );
-                        }
+    let callback_map: HashMap<String, usize> = match hooks::build_initialize_request(&options) {
+        Some((init_payload, cbmap)) => {
+            let req_id = format!("init-{}", uuid::Uuid::new_v4());
+            let init = ControlRequestOut::new(req_id.clone(), init_payload);
+            match serde_json::to_string(&init) {
+                Ok(s) => {
+                    if let Err(e) = transport.write(&s).await {
+                        tracing::warn!("initialize control_request failed: {}", e);
+                    } else {
+                        tracing::debug!(
+                            "session {}: sent initialize request_id={}",
+                            session_id_str,
+                            req_id
+                        );
                     }
-                    Err(e) => tracing::warn!("initialize serialize failed: {}", e),
                 }
-                cbmap
+                Err(e) => tracing::warn!("initialize serialize failed: {}", e),
             }
-            None => HashMap::new(),
-        };
+            cbmap
+        }
+        None => HashMap::new(),
+    };
 
     transport.write(&first_msg).await?;
 

@@ -5,13 +5,13 @@ pub mod store;
 
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
 use crate::config::AppConfig;
 use crate::error::GatewayError;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Command;
 
 use self::messages::{
     CodexCommandItem, CodexEvent, CodexItem, CodexMessageItem, CodexQueryResult, CodexTurnUsage,
@@ -65,10 +65,7 @@ fn effective_prompt(prompt: &str, options: &CodexOptions, has_existing_thread: b
     }
 }
 
-fn configure_base_command(
-    cmd: &mut Command,
-    options: &CodexOptions,
-) {
+fn configure_base_command(cmd: &mut Command, options: &CodexOptions) {
     if let Some(model) = &options.model {
         cmd.arg("--model").arg(model);
     }
@@ -180,9 +177,9 @@ async fn run_command_collect(
     let mut cmd = build_exec_command(&prompt, options, thread_id)?;
     tracing::debug!("spawning Codex CLI: {:?}", cmd.as_std());
 
-    let mut child = cmd.spawn().map_err(|e| {
-        GatewayError::CliConnection(format!("Failed to spawn Codex CLI: {}", e))
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| GatewayError::CliConnection(format!("Failed to spawn Codex CLI: {}", e)))?;
 
     let stdout = child
         .stdout
@@ -207,16 +204,18 @@ async fn run_command_collect(
             if trimmed.is_empty() || !trimmed.starts_with('{') {
                 continue;
             }
-            let raw: RawCodexEvent = serde_json::from_str(trimmed).map_err(|e| {
-                GatewayError::JsonDecode {
+            let raw: RawCodexEvent =
+                serde_json::from_str(trimmed).map_err(|e| GatewayError::JsonDecode {
                     line: trimmed.to_string(),
                     source: e,
-                }
-            })?;
+                })?;
             if let RawCodexEvent::ThreadStarted { thread_id: ref tid } = raw {
                 thread_id = Some(tid.clone());
             }
-            if let RawCodexEvent::TurnCompleted { usage: ref turn_usage } = raw {
+            if let RawCodexEvent::TurnCompleted {
+                usage: ref turn_usage,
+            } = raw
+            {
                 usage = Some(turn_usage.clone());
             }
             if let RawCodexEvent::ItemCompleted {
@@ -259,9 +258,7 @@ async fn run_command_collect(
                 exit_code: code,
                 stderr,
             },
-            None => GatewayError::ProcessCrash {
-                detail: stderr,
-            },
+            None => GatewayError::ProcessCrash { detail: stderr },
         });
     }
 

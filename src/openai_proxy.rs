@@ -1,7 +1,7 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 
 use crate::error::GatewayError;
 
@@ -64,13 +64,14 @@ pub async fn responses_sync(
         .json(&body)
         .send()
         .await
-        .map_err(|e| GatewayError::CliConnection(format!("OpenAI responses request failed: {}", e)))?;
+        .map_err(|e| {
+            GatewayError::CliConnection(format!("OpenAI responses request failed: {}", e))
+        })?;
 
     let status = resp.status().as_u16();
-    let json = resp
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|e| GatewayError::Internal(format!("OpenAI responses JSON decode failed: {}", e)))?;
+    let json = resp.json::<serde_json::Value>().await.map_err(|e| {
+        GatewayError::Internal(format!("OpenAI responses JSON decode failed: {}", e))
+    })?;
     Ok((json, status))
 }
 
@@ -89,7 +90,9 @@ pub async fn responses_stream(
         .json(&body)
         .send()
         .await
-        .map_err(|e| GatewayError::CliConnection(format!("OpenAI streaming request failed: {}", e)))?;
+        .map_err(|e| {
+            GatewayError::CliConnection(format!("OpenAI streaming request failed: {}", e))
+        })?;
     let status = resp.status().as_u16();
     Ok((resp, status))
 }

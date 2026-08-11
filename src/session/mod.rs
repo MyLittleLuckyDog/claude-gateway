@@ -1,8 +1,8 @@
 pub mod store;
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::messages::Message;
@@ -16,8 +16,14 @@ pub enum SessionState {
     Initializing,
     Idle,
     Running,
-    WaitingForHook { request_id: String, deadline: std::time::Instant },
-    WaitingForPermission { request_id: String, original_input: serde_json::Value },
+    WaitingForHook {
+        request_id: String,
+        deadline: std::time::Instant,
+    },
+    WaitingForPermission {
+        request_id: String,
+        original_input: serde_json::Value,
+    },
     Dead,
 }
 
