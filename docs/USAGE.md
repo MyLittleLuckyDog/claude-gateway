@@ -325,7 +325,7 @@ Claude가 도구(Edit, Bash 등)를 실행하기 전 hook 이벤트가 발생. �
 # data: {"type":"hook_request","request_id":"req-001","callback_id":"hook_0",
 #        "hook_event_name":"PreToolUse","tool_name":"Edit","tool_use_id":"toolu_..."}
 
-# 30초 내 응답 (decision + reason 혹은 response raw 둘 중 하나 사용):
+# hook_timeout_secs(기본 30초) 안에 응답 — decision + reason 혹은 response raw 중 하나:
 curl -X POST http://localhost:8765/sessions/abc-123/hook_response \
   -H "Content-Type: application/json" \
   -d '{"request_id": "req-001", "decision": "approve"}'
@@ -358,7 +358,13 @@ decision 값:
 | `block` | 도구 실행 차단 (reason 권장) |
 | `defer` | CLI 기본 동작 |
 
-30초 타임아웃 시 자동 `approve`.
+**타임아웃 시 기본 동작은 자동 `block` 입니다** (승인이 아닙니다 — 응답이 없으면
+도구가 실행되지 않습니다). 대기 시간은 `hook_timeout_secs`(기본 30초), 타임아웃
+동작은 `hook_timeout_action`(`block` | `approve`, 기본 `block`)으로 요청마다
+바꿉니다.
+
+타임아웃이 지난 뒤 `hook_response` 를 보내면 `408 hook_timeout` 이 돌아옵니다.
+이 판정은 `hook_timeout_secs` 와 같은 값을 씁니다.
 
 ---
 

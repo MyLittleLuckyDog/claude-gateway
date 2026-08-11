@@ -164,8 +164,10 @@ async fn run_session_loop(
                                                 *session.state.lock().await = SessionState::Running;
                                             }
                                             AutoResolveOutcome::DeferToClient => {
+                                                // Same source as the watchdog below — see
+                                                // hooks::hook_timeout.
                                                 let deadline = std::time::Instant::now()
-                                                    + std::time::Duration::from_secs(30);
+                                                    + hooks::hook_timeout(&options);
                                                 *session.state.lock().await =
                                                     SessionState::WaitingForHook {
                                                         request_id: ctl.request_id.clone(),
