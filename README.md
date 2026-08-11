@@ -3,7 +3,7 @@
 Claude Code CLI를 래핑하는 Rust 네이티브 REST API 게이트웨이.
 단일 바이너리로 배포되며, Claude Code 구독만으로 API 키 없이 동작합니다.
 
-아키텍처 확장 방향은 [docs/MULTI_PROVIDER_ARCHITECTURE.md](/Volumes/juryu_home/with_AI/projects/06.DenoV8POC/01.Tools/claude-gateway/docs/MULTI_PROVIDER_ARCHITECTURE.md:1)를 참고하세요.
+아키텍처 확장 방향은 [docs/MULTI_PROVIDER_ARCHITECTURE.md](docs/MULTI_PROVIDER_ARCHITECTURE.md)를 참고하세요.
 현재 기준은 `기존 Claude 경로 유지 + Codex 축 추가 + 얇은 공통층 추출`입니다.
 
 ## 두 가지 모드
