@@ -123,6 +123,13 @@ max_codex_sandbox = "read-only"          # Codex sandbox 상한
 > 이 켜져 있거나, `cors_origins` 에 로컬이 아닌 오리진이 있으면 exit 2 입니다.
 > 로컬 개발은 설정 없이 그대로 동작합니다.
 
+> **세션 소유권은 이 게이트웨이에 없습니다.** `GET /sessions` 는 모든 호출자의
+> 세션을 나열하고, session_id 만 알면 누구나 `/stream` 구독·`/send`·`DELETE` 가
+> 됩니다. 앞단에 로그인을 붙여도 로그인한 사용자끼리는 서로의 대화가 보입니다.
+> 다중 사용자로 쓰려면 앞단이 "이 사용자가 이 session_id 를 만질 수 있는가"까지
+> 판정해야 합니다. 이건 인증 모델과 함께 정해질 문제라 상류(upstream)의 설계
+> 영역으로 남겨둡니다 — 근거는 `docs/WEB_CLIENT_FINDINGS.md`.
+
 ### CORS
 
 브라우저에서 붙일 때만 관계있습니다. curl·서버-투-서버 호출은 CORS 를 거치지 않습니다.
