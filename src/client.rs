@@ -133,6 +133,11 @@ async fn run_session_loop(
                         // Lock-free activity timestamp
                         session.last_activity_ms.store(now_epoch_ms(), Ordering::Relaxed);
 
+                        // Set when a hook_rules entry answers this event's
+                        // callback, so the surfaced hook_request can say the
+                        // client has nothing to do.
+                        let mut hook_auto_resolved = false;
+
                         // Batch state mutations: single lock acquisition per event
                         match &cli_event {
                             CliOutputEvent::System(sys) if sys.subtype == SystemSubtype::Init => {
@@ -179,6 +184,7 @@ async fn run_session_loop(
                                                         e
                                                     );
                                                 }
+                                                hook_auto_resolved = true;
                                                 *session.state.lock().await = SessionState::Running;
                                             }
                                             AutoResolveOutcome::DeferToClient => {
@@ -231,8 +237,11 @@ async fn run_session_loop(
                             _ => {}
                         }
 
-                        let message = Arc::new(cli_output_to_message(cli_event));
-                        broadcast_and_record(&session, message).await;
+                        let mut message = cli_output_to_message(cli_event);
+                        if let Message::HookRequest { auto_resolved, .. } = &mut message {
+                            *auto_resolved = hook_auto_resolved;
+                        }
+                        broadcast_and_record(&session, Arc::new(message)).await;
                     }
                     Some(Err(e)) => {
                         let msg = Arc::new(Message::Error {

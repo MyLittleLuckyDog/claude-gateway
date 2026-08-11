@@ -249,6 +249,9 @@ pub fn cli_output_to_message(event: CliOutputEvent) -> Message {
                         tool_name: input.tool_name,
                         tool_input: input.tool_input,
                         tool_use_id: hc.tool_use_id,
+                        // The converter cannot know; the session loop, which
+                        // owns the rule evaluation, sets this.
+                        auto_resolved: false,
                     }
                 }
                 ControlRequestPayload::CanUseTool(req) => Message::PermissionRequest {

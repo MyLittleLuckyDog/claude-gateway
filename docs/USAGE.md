@@ -337,15 +337,24 @@ Claude가 도구(Edit, Bash 등)를 실행하기 전 hook 이벤트가 발생. �
   }
 }
 ```
-- `block` — 도구 실행 차단
-- `approve` — 자동 승인
-- `defer` — SSE로 클라이언트에 위임
+- `block` — 도구 실행 차단 (스트림에 `auto_resolved: true` 로 기록됨)
+- `approve` — 자동 승인 (동일)
+- `defer` — SSE로 클라이언트에 위임 (`auto_resolved: false`, 응답 필요)
 
-**B. 클라이언트 응답** — SSE에서 `hook_request` 수신 시 timeout 내 응답:
+**B. 클라이언트 응답** — SSE에서 `hook_request` 수신 시 timeout 내 응답.
+
+> ⚠️ **`auto_resolved` 를 먼저 보세요.** `hook_request` 는 두 경우 모두 나옵니다.
+>
+> - `auto_resolved: false` — 서버에 매칭되는 규칙이 없어 세션이
+>   `waiting_for_hook` 으로 멈춰 있습니다. **응답은 클라이언트 몫입니다.**
+> - `auto_resolved: true` — `hook_rules` 가 이미 CLI에 답했습니다. 관측용 기록일
+>   뿐이고, 여기에 `hook_response` 를 보내면 `409 invalid_state` 가 납니다.
+
 ```bash
 # SSE에서 수신 (request_id는 CLI 제어 프로토콜의 control_request.request_id):
 # data: {"type":"hook_request","request_id":"req-001","callback_id":"hook_0",
-#        "hook_event_name":"PreToolUse","tool_name":"Edit","tool_use_id":"toolu_..."}
+#        "hook_event_name":"PreToolUse","tool_name":"Edit","tool_use_id":"toolu_...",
+#        "auto_resolved":false}
 
 # hook_timeout_secs(기본 30초) 안에 응답 — decision + reason 혹은 response raw 중 하나:
 curl -X POST http://localhost:8765/sessions/abc-123/hook_response \

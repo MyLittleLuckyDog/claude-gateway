@@ -103,3 +103,44 @@ fn test_parse_stream_event() {
         _ => panic!("Expected StreamEvent"),
     }
 }
+
+// ── hook_request: does the client still own the decision? ──────────
+
+use claude_agent::messages::Message;
+
+fn hook_request(auto_resolved: bool) -> Message {
+    Message::HookRequest {
+        request_id: "req-1".to_string(),
+        callback_id: "hook_0".to_string(),
+        hook_event_name: "PreToolUse".to_string(),
+        tool_name: Some("Bash".to_string()),
+        tool_input: None,
+        tool_use_id: None,
+        auto_resolved,
+    }
+}
+
+/// `auto_resolved: true` means a hook_rules entry already answered the CLI, so
+/// the event is a record rather than a request — posting hook_response for it
+/// would be rejected with 409.
+#[test]
+fn test_hook_request_reports_whether_it_was_auto_resolved() {
+    let deferred = serde_json::to_value(hook_request(false)).unwrap();
+    assert_eq!(deferred["type"], "hook_request");
+    assert_eq!(deferred["auto_resolved"], false);
+
+    let resolved = serde_json::to_value(hook_request(true)).unwrap();
+    assert_eq!(resolved["auto_resolved"], true);
+}
+
+/// Payloads written before the field existed must still parse.
+#[test]
+fn test_hook_request_defaults_auto_resolved_when_absent() {
+    let raw = r#"{"type":"hook_request","request_id":"r","callback_id":"hook_0",
+                  "hook_event_name":"PreToolUse","tool_name":null,
+                  "tool_input":null,"tool_use_id":null}"#;
+    match serde_json::from_str::<Message>(raw).unwrap() {
+        Message::HookRequest { auto_resolved, .. } => assert!(!auto_resolved),
+        other => panic!("expected HookRequest, got {other:?}"),
+    }
+}
