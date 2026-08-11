@@ -6,6 +6,7 @@ use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
 use crate::codex::options::CodexOptions;
+use crate::core::events::Seq;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodexAppSessionState {
@@ -43,8 +44,10 @@ pub struct CodexAppSession {
     pub last_activity_ms: AtomicU64,
     pub options: CodexOptions,
     pub stdin_tx: mpsc::Sender<String>,
-    pub event_tx: broadcast::Sender<Arc<Value>>,
-    pub history: Arc<Mutex<VecDeque<Arc<Value>>>>,
+    pub event_tx: broadcast::Sender<Seq<Value>>,
+    pub history: Arc<Mutex<VecDeque<Seq<Value>>>>,
+    /// See `Session::next_seq`.
+    pub next_seq: AtomicU64,
     pub pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     pub pending_approval: Arc<Mutex<Option<PendingApproval>>>,
     pub next_request_id: AtomicU64,

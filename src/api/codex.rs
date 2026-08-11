@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
+use axum::http::HeaderMap;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -21,7 +22,7 @@ use crate::codex;
 use crate::codex::messages::CodexEvent;
 use crate::codex::options::CodexOptions;
 use crate::codex::session::{CodexSession, CodexSessionState};
-use crate::core::events::sse_replay_then_follow;
+use crate::core::events::{resume_point, sse_replay_then_follow, Replay, Seq};
 use crate::error::GatewayError;
 
 #[derive(Deserialize)]
@@ -58,6 +59,16 @@ pub struct MessagesQuery {
 
 fn default_limit() -> usize {
     50
+}
+
+/// Attach policy for `GET /sessions/:id/stream`.
+///
+/// A query parameter rather than a header because `EventSource` — the browser
+/// API this endpoint exists for — cannot set request headers.
+#[derive(Deserialize, Default)]
+pub struct StreamQuery {
+    #[serde(default)]
+    pub replay: Replay,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -112,7 +123,7 @@ async fn create_session(
     Json(req): Json<CreateCodexSessionRequest>,
 ) -> Response {
     let session_id = uuid::Uuid::new_v4().to_string();
-    let (event_tx, _) = broadcast::channel::<Arc<CodexEvent>>(1024);
+    let (event_tx, _) = broadcast::channel::<Seq<CodexEvent>>(1024);
     let session = Arc::new(CodexSession {
         id: session_id.clone(),
         thread_id: Arc::new(Mutex::new(None)),
@@ -127,6 +138,7 @@ async fn create_session(
         options: req.options.unwrap_or_default(),
         event_tx,
         history: Arc::new(Mutex::new(VecDeque::new())),
+        next_seq: AtomicU64::new(0),
     });
 
     match state.codex_sessions.insert(session.clone()) {
@@ -206,16 +218,21 @@ async fn send_message(
     (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response()
 }
 
-async fn stream_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn stream_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<StreamQuery>,
+    headers: HeaderMap,
+) -> Response {
     let session = match state.codex_sessions.get(&id) {
         Ok(s) => s,
         Err(e) => return gateway_error_response(&e),
     };
 
-    let history: Vec<Arc<CodexEvent>> = session.history.lock().await.iter().cloned().collect();
+    let history: Vec<Seq<CodexEvent>> = session.history.lock().await.iter().cloned().collect();
     let rx = session.event_tx.subscribe();
 
-    sse_replay_then_follow(history, rx).into_response()
+    sse_replay_then_follow(history, rx, resume_point(&headers, query.replay)).into_response()
 }
 
 async fn get_messages(
@@ -234,7 +251,7 @@ async fn get_messages(
         .iter()
         .skip(params.offset)
         .take(params.limit)
-        .map(|event| event.as_ref().clone())
+        .map(|entry| entry.event.as_ref().clone())
         .collect();
 
     Json(serde_json::json!({

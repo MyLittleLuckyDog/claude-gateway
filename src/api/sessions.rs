@@ -1,3 +1,4 @@
+use axum::http::HeaderMap;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -7,11 +8,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::sync::Arc;
 
 use super::{gateway_error_response, AppState};
 use crate::client;
-use crate::core::events::sse_replay_then_follow;
+use crate::core::events::{resume_point, sse_replay_then_follow, Replay, Seq};
 use crate::error::GatewayError;
 use crate::messages::cli_input::{CliInputMessage, CliUserInput, ImageSource, InputContent};
 use crate::messages::Message;
@@ -51,6 +51,16 @@ pub struct MessagesQuery {
 
 fn default_limit() -> usize {
     50
+}
+
+/// Attach policy for `GET /sessions/:id/stream`.
+///
+/// A query parameter rather than a header because `EventSource` — the browser
+/// API this endpoint exists for — cannot set request headers.
+#[derive(Deserialize, Default)]
+pub struct StreamQuery {
+    #[serde(default)]
+    pub replay: Replay,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -186,17 +196,22 @@ fn take_sendable_state(current_state: &SessionState) -> Result<SessionState, Gat
     }
 }
 
-async fn stream_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn stream_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<StreamQuery>,
+    headers: HeaderMap,
+) -> Response {
     let session = match state.sessions.get(&id) {
         Ok(s) => s,
         Err(e) => return gateway_error_response(&e),
     };
 
-    // Clone Arc refs (cheap) not full Messages
-    let history: Vec<Arc<Message>> = session.history.lock().await.iter().cloned().collect();
+    // Clone the Arc refs and their sequence numbers, not the payloads.
+    let history: Vec<Seq<Message>> = session.history.lock().await.iter().cloned().collect();
     let rx = session.event_tx.subscribe();
 
-    sse_replay_then_follow(history, rx).into_response()
+    sse_replay_then_follow(history, rx, resume_point(&headers, query.replay)).into_response()
 }
 
 async fn get_messages(
@@ -212,7 +227,7 @@ async fn get_messages(
     let history = session.history.lock().await;
     let filtered: Vec<&Message> = history
         .iter()
-        .map(|m| m.as_ref())
+        .map(|m| m.event.as_ref())
         .filter(|m| {
             if !params.include_system {
                 !matches!(m, Message::System { .. })

@@ -52,6 +52,7 @@ fn claude_session(id: &str, activity_ms: u64, dead: bool) -> Arc<Session> {
         event_tx,
         history: Arc::new(Mutex::new(VecDeque::new())),
         hook_timeout_handle: Arc::new(Mutex::new(None)),
+        next_seq: AtomicU64::new(0),
     })
 }
 
@@ -70,6 +71,7 @@ fn codex_session(id: &str, activity_ms: u64, dead: bool) -> Arc<CodexSession> {
         options: CodexOptions::default(),
         event_tx,
         history: Arc::new(Mutex::new(VecDeque::new())),
+        next_seq: AtomicU64::new(0),
     })
 }
 
@@ -91,6 +93,7 @@ fn codex_app_session(id: &str, activity_ms: u64, dead: bool) -> Arc<CodexAppSess
         stdin_tx,
         event_tx,
         history: Arc::new(Mutex::new(VecDeque::new())),
+        next_seq: AtomicU64::new(0),
         pending_requests: Arc::new(Mutex::new(HashMap::new())),
         pending_approval: Arc::new(Mutex::new(None)),
         next_request_id: AtomicU64::new(0),

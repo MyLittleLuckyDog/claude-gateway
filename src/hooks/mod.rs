@@ -196,7 +196,13 @@ pub fn spawn_hook_timeout(
                     ),
                     code: "hook_timeout".to_string(),
                 });
-                record_and_broadcast(&session.history, &session.event_tx, timeout_msg).await;
+                record_and_broadcast(
+                    &session.history,
+                    &session.event_tx,
+                    &session.next_seq,
+                    timeout_msg,
+                )
+                .await;
             }
         }
     })

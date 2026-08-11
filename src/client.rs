@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::config::AppConfig;
-use crate::core::events::record_and_broadcast;
+use crate::core::events::{record_and_broadcast, Seq};
 use crate::core::now_epoch_ms;
 use crate::core::stats::Stats;
 use crate::error::GatewayError;
@@ -27,8 +27,8 @@ pub async fn create_session(
 ) -> Result<Arc<Session>, GatewayError> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let (stdin_tx, stdin_rx) = mpsc::channel::<String>(32);
-    let (event_tx, _) = broadcast::channel::<Arc<Message>>(1024);
-    let history = Arc::new(Mutex::new(VecDeque::<Arc<Message>>::new()));
+    let (event_tx, _) = broadcast::channel::<Seq<Message>>(1024);
+    let history = Arc::new(Mutex::new(VecDeque::<Seq<Message>>::new()));
     let state = Arc::new(Mutex::new(SessionState::Initializing));
 
     let session = Arc::new(Session {
@@ -42,6 +42,7 @@ pub async fn create_session(
         event_tx: event_tx.clone(),
         history: history.clone(),
         hook_timeout_handle: Arc::new(Mutex::new(None)),
+        next_seq: std::sync::atomic::AtomicU64::new(0),
     });
 
     store.insert(session.clone())?;
@@ -279,5 +280,11 @@ async fn run_session_loop(
 }
 
 async fn broadcast_and_record(session: &Session, message: Arc<Message>) {
-    record_and_broadcast(&session.history, &session.event_tx, message).await;
+    record_and_broadcast(
+        &session.history,
+        &session.event_tx,
+        &session.next_seq,
+        message,
+    )
+    .await;
 }

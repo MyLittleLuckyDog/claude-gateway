@@ -5,6 +5,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, Mutex};
 
+use crate::core::events::Seq;
 use crate::messages::Message;
 use crate::options::ClaudeAgentOptions;
 
@@ -46,8 +47,11 @@ pub struct Session {
     pub last_activity_ms: AtomicU64,
     pub options: ClaudeAgentOptions,
     pub stdin_tx: mpsc::Sender<String>,
-    pub event_tx: broadcast::Sender<Arc<Message>>,
-    pub history: Arc<Mutex<VecDeque<Arc<Message>>>>,
+    pub event_tx: broadcast::Sender<Seq<Message>>,
+    pub history: Arc<Mutex<VecDeque<Seq<Message>>>>,
+    /// Next sequence number for this session's events. Stable across
+    /// reconnects, so clients can resume with `Last-Event-ID`.
+    pub next_seq: AtomicU64,
     /// Handle for the pending hook timeout task (if any). Aborted on hook_response.
     pub hook_timeout_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
