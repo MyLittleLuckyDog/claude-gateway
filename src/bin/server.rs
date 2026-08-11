@@ -59,6 +59,13 @@ async fn main() -> anyhow::Result<()> {
         config.server.host = host;
     }
 
+    // Checked after the CLI overrides, since --host is how the gateway is
+    // usually exposed.
+    if let Err(e) = config.check_exposure() {
+        eprintln!("Refusing to start: {e}");
+        std::process::exit(2);
+    }
+
     let config = Arc::new(config);
     let sessions = Arc::new(SessionStore::new(config.server.max_sessions));
     let codex_sessions = Arc::new(CodexSessionStore::new(config.server.max_sessions));

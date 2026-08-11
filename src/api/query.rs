@@ -9,7 +9,7 @@ use axum::{
 };
 use serde::Deserialize;
 
-use super::AppState;
+use super::{reject_disallowed_claude_options, AppState};
 use crate::error::ErrorResponse;
 use crate::options::ClaudeAgentOptions;
 
@@ -28,6 +28,9 @@ pub fn routes() -> Router<AppState> {
 
 async fn query_handler(State(state): State<AppState>, Json(req): Json<QueryRequest>) -> Response {
     let options = req.options.unwrap_or_default();
+    if let Some(rejected) = reject_disallowed_claude_options(&state, &options) {
+        return rejected;
+    }
 
     // Track stats
     {
@@ -61,6 +64,9 @@ async fn query_stream_handler(
     Json(req): Json<QueryRequest>,
 ) -> Response {
     let options = req.options.unwrap_or_default();
+    if let Some(rejected) = reject_disallowed_claude_options(&state, &options) {
+        return rejected;
+    }
 
     {
         let mut stats = state.stats.lock().await;

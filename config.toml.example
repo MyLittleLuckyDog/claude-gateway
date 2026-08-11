@@ -40,3 +40,28 @@ cors_origins = ["http://localhost", "http://127.0.0.1"]
 # credential EventSource can carry. Cannot be combined with
 # cors_allow_any_origin — browsers reject that pairing.
 # cors_allow_credentials = true
+
+[request_options]
+# How much of the session option surface a request may set.
+#
+#   "trusted"    — everything, as sent. Right for the loopback gateway this
+#                  ships as: the caller is the local user and gains nothing it
+#                  could not do directly. This is the default.
+#   "restricted" — the server owns process, filesystem and approval settings.
+#
+# The gateway refuses to start with "trusted" once it is reachable beyond this
+# machine — a non-loopback host, cors_allow_any_origin, or a non-local entry in
+# cors_origins. That check is on the actual exposure rather than on a flag,
+# because the flag is the thing people forget.
+# policy = "restricted"
+
+# Directories a request may point cwd/add_dirs at, under "restricted".
+# Resolved before checking, so `..` and symlinks cannot walk out. Empty (the
+# default) means a request may not choose a directory at all.
+# allowed_roots = ["/srv/agent-workspaces"]
+
+# Ceilings a request may not exceed, under "restricted".
+# plan < default < acceptEdits < dontAsk < bypassPermissions
+# max_permission_mode = "plan"
+# read-only < workspace-write < danger-full-access
+# max_codex_sandbox = "read-only"

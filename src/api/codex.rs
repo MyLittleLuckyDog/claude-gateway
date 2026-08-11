@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, Mutex};
 
-use super::{gateway_error_response, AppState};
+use super::{gateway_error_response, reject_disallowed_codex_options, AppState};
 use crate::codex;
 use crate::codex::messages::CodexEvent;
 use crate::codex::options::CodexOptions;
@@ -88,6 +88,9 @@ async fn query_handler(
     Json(req): Json<CodexQueryRequest>,
 ) -> Response {
     let options = req.options.unwrap_or_default();
+    if let Some(rejected) = reject_disallowed_codex_options(&state, &options) {
+        return rejected;
+    }
     match codex::query(&req.prompt, options, &state.config).await {
         Ok(result) => Json(result).into_response(),
         Err(e) => gateway_error_response(&e),
@@ -99,6 +102,9 @@ async fn query_stream_handler(
     Json(req): Json<CodexQueryRequest>,
 ) -> Response {
     let options = req.options.unwrap_or_default();
+    if let Some(rejected) = reject_disallowed_codex_options(&state, &options) {
+        return rejected;
+    }
     match codex::query_stream(&req.prompt, options, &state.config).await {
         Ok(mut rx) => {
             let stream = async_stream::stream! {
@@ -122,6 +128,11 @@ async fn create_session(
     State(state): State<AppState>,
     Json(req): Json<CreateCodexSessionRequest>,
 ) -> Response {
+    let options = req.options.unwrap_or_default();
+    if let Some(rejected) = reject_disallowed_codex_options(&state, &options) {
+        return rejected;
+    }
+
     let session_id = uuid::Uuid::new_v4().to_string();
     let (event_tx, _) = broadcast::channel::<Seq<CodexEvent>>(1024);
     let session = Arc::new(CodexSession {
@@ -135,7 +146,7 @@ async fn create_session(
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0),
         ),
-        options: req.options.unwrap_or_default(),
+        options,
         event_tx,
         history: Arc::new(Mutex::new(VecDeque::new())),
         next_seq: AtomicU64::new(0),

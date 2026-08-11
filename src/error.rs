@@ -20,6 +20,9 @@ pub enum GatewayError {
         source: serde_json::Error,
     },
 
+    #[error("Request option not permitted: {0}")]
+    OptionNotPermitted(String),
+
     #[error("Session not found: {0}")]
     SessionNotFound(String),
 
@@ -45,6 +48,7 @@ impl GatewayError {
             Self::CliNotFound { .. } => 503,
             Self::CliConnection(_) | Self::ProcessExit { .. } | Self::ProcessCrash { .. } => 502,
             Self::JsonDecode { .. } => 502,
+            Self::OptionNotPermitted(_) => 403,
             Self::SessionNotFound(_) => 404,
             Self::InvalidSessionState { .. } => 409,
             Self::SessionLimitReached { .. } => 429,

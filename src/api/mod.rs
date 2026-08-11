@@ -84,6 +84,47 @@ pub fn proxy_error_response(e: crate::proxy::ProxyError) -> Response {
         .into_response()
 }
 
+/// Refuse a request that asks for more of the CLI than the policy allows.
+///
+/// Returns the response to send, so handlers can `if let Some(r) = ... { return r; }`.
+/// The rejection lists every offending field at once rather than one per round
+/// trip, and never silently downgrades: a caller told its tools were
+/// pre-approved when they were not would act on that.
+pub fn reject_disallowed_claude_options(
+    state: &AppState,
+    options: &crate::options::ClaudeAgentOptions,
+) -> Option<Response> {
+    state
+        .config
+        .request_options
+        .to_policy()
+        .check_claude(options)
+        .err()
+        .map(|e| {
+            gateway_error_response(&crate::error::GatewayError::OptionNotPermitted(
+                e.to_string(),
+            ))
+        })
+}
+
+/// Codex counterpart of [`reject_disallowed_claude_options`].
+pub fn reject_disallowed_codex_options(
+    state: &AppState,
+    options: &crate::codex::options::CodexOptions,
+) -> Option<Response> {
+    state
+        .config
+        .request_options
+        .to_policy()
+        .check_codex(options)
+        .err()
+        .map(|e| {
+            gateway_error_response(&crate::error::GatewayError::OptionNotPermitted(
+                e.to_string(),
+            ))
+        })
+}
+
 /// Request headers a browser client needs to send.
 ///
 /// Spelled out rather than `Any` because `Access-Control-Allow-Headers: *` is

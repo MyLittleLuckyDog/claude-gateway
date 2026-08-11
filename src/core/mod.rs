@@ -8,6 +8,7 @@
 //! their provider.
 
 pub mod events;
+pub mod request_policy;
 pub mod session;
 pub mod stats;
 

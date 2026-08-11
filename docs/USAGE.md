@@ -78,6 +78,51 @@ CLAUDE_GATEWAY__SERVER__CORS_ORIGINS=https://app.example.com,http://localhost ./
 조용히 기본값으로 되돌아가면 `cors_origins` 처럼 기본값이 더 느슨한 설정에서
 의도와 반대되는 정책으로 뜨기 때문입니다.
 
+### 요청 옵션 정책
+
+`options` 는 요청 본문에서 CLI subprocess 인자까지 거의 그대로 흘러갑니다. 루프백
+게이트웨이에서는 호출자가 이미 로컬 사용자라 문제가 없지만, 브라우저나 다른 호스트가
+닿는 순간 얘기가 달라집니다 — `cli_path` 는 **실행 바이너리**를, `env` 는 그 환경을,
+`mcp_servers` 는 **또 다른 프로세스**를, `permission_mode` 는 **승인 여부**를 정합니다.
+
+```toml
+[request_options]
+policy = "restricted"                    # "trusted"(기본) | "restricted"
+allowed_roots = ["/srv/agent-workspaces"]  # cwd/add_dirs 가 놓일 수 있는 곳
+max_permission_mode = "plan"             # 요청이 요구할 수 있는 상한
+max_codex_sandbox = "read-only"          # Codex sandbox 상한
+```
+
+`restricted` 에서 **요청이 정할 수 없는 것**:
+
+| 필드 | 이유 |
+|------|------|
+| `cli_path` · `env` · `mcp_servers` | 각각 임의 프로세스 실행 경로 |
+| `setting_sources` | 호스트의 설정·훅을 세션에 로드 |
+| `allowed_tools` | 도구 사전 승인 = 승인 우회 |
+| `resume` · `fork_session` · `continue_conversation` | 남이 시작한 CLI 대화에 접속 |
+| Codex `dangerously_bypass_approvals_and_sandbox` · `full_auto` | 승인·샌드박스 무력화 |
+
+**제한되는 것**: `cwd`/`add_dirs` 는 `allowed_roots` 하위여야 하고(심볼릭 링크·`..`
+포함해 실제 경로로 확인), `permission_mode` 와 Codex `sandbox` 는 설정된 상한 이하여야
+합니다.
+
+위반은 **403** 과 함께 어긋난 항목을 **한 번에 모두** 알려줍니다. 조용히 낮춰주지
+않습니다 — `bypassPermissions` 를 요청하고 `plan` 을 받은 클라이언트는 도구가 승인된
+줄 알고 동작하기 때문입니다.
+
+```
+403 {"error":{"code":"invalid_request", "message":
+  "Request option not permitted: `options.cwd` (/tmp/x) is outside every directory
+   configured for requests; `options.permission_mode` (bypassPermissions) exceeds
+   the configured maximum (plan)"}}
+```
+
+> **`trusted` 인 채로 노출하면 기동을 거부합니다.** 잊어버릴 수 있는 플래그가 아니라
+> 실제 노출 여부로 판정합니다 — `host` 가 루프백이 아니거나, `cors_allow_any_origin`
+> 이 켜져 있거나, `cors_origins` 에 로컬이 아닌 오리진이 있으면 exit 2 입니다.
+> 로컬 개발은 설정 없이 그대로 동작합니다.
+
 ### CORS
 
 브라우저에서 붙일 때만 관계있습니다. curl·서버-투-서버 호출은 CORS 를 거치지 않습니다.

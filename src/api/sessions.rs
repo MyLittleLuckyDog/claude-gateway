@@ -9,7 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{gateway_error_response, AppState};
+use super::{gateway_error_response, reject_disallowed_claude_options, AppState};
 use crate::client;
 use crate::core::events::{resume_point, sse_replay_then_follow, Replay, Seq};
 use crate::error::GatewayError;
@@ -79,6 +79,9 @@ async fn create_session(
     Json(req): Json<CreateSessionRequest>,
 ) -> Response {
     let options = req.options.unwrap_or_default();
+    if let Some(rejected) = reject_disallowed_claude_options(&state, &options) {
+        return rejected;
+    }
     match client::create_session(
         options,
         state.sessions.clone(),
