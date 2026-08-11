@@ -18,10 +18,33 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default = "default_max_sessions")]
     pub max_sessions: usize,
-    /// Allowed CORS origins. Empty = permissive (allow all).
-    /// Default: localhost only.
+    /// Browser origins allowed to call the gateway.
+    ///
+    /// Entries are matched exactly, except that a bare host origin also
+    /// matches any port on it (`http://localhost` covers
+    /// `http://localhost:3000`). The scheme is part of the origin, so
+    /// `https://` needs its own entry.
+    ///
+    /// Empty means no cross-origin caller is allowed. To serve any origin,
+    /// set `cors_allow_any_origin` — that is deliberately something you have
+    /// to type, not something a cleared list gives you by accident.
     #[serde(default = "default_cors_origins")]
     pub cors_origins: Vec<String>,
+    /// Serve every origin, ignoring `cors_origins`.
+    ///
+    /// The gateway has no authentication of its own, so this hands any page
+    /// the user visits the ability to spend their Claude subscription and —
+    /// with `permission_mode: bypassPermissions` — run commands on this host.
+    #[serde(default)]
+    pub cors_allow_any_origin: bool,
+    /// Let browsers send cookies and HTTP auth with cross-origin requests.
+    ///
+    /// Needed when something in front of the gateway authenticates with a
+    /// cookie, which is the only credential `EventSource` can carry. Cannot be
+    /// combined with `cors_allow_any_origin`: browsers reject credentialed
+    /// responses that allow every origin.
+    #[serde(default)]
+    pub cors_allow_credentials: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,6 +68,8 @@ fn default_server_config() -> ServerConfig {
         port: default_port(),
         max_sessions: default_max_sessions(),
         cors_origins: default_cors_origins(),
+        cors_allow_any_origin: false,
+        cors_allow_credentials: false,
     }
 }
 
@@ -120,10 +145,28 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Read `config.toml` (optional) overlaid with `CLAUDE_GATEWAY__*`.
+    ///
+    /// List-valued settings come from the environment comma-separated:
+    ///
+    /// ```text
+    /// CLAUDE_GATEWAY__SERVER__CORS_ORIGINS=https://app.example.com,http://localhost
+    /// ```
+    ///
+    /// Callers must not fall back to defaults on error. A setting the operator
+    /// wrote and the gateway silently ignored is worse than not starting —
+    /// especially for `cors_origins`, where the default is more permissive than
+    /// anything someone would type by hand.
     pub fn load() -> Result<Self, config::ConfigError> {
         let builder = config::Config::builder()
             .add_source(config::File::with_name("config").required(false))
-            .add_source(config::Environment::with_prefix("CLAUDE_GATEWAY").separator("__"));
+            .add_source(
+                config::Environment::with_prefix("CLAUDE_GATEWAY")
+                    .separator("__")
+                    .try_parsing(true)
+                    .list_separator(",")
+                    .with_list_parse_key("server.cors_origins"),
+            );
 
         let cfg = builder.build()?;
         cfg.try_deserialize()

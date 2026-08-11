@@ -47,7 +47,14 @@ claude --version
 host = "127.0.0.1"
 port = 8765
 max_sessions = 100                  # CLI-wrap 세션 상한
-cors_origins = ["http://localhost", "http://127.0.0.1"]  # 빈 배열 = 모두 허용
+
+# 브라우저가 이 게이트웨이를 호출할 수 있는 오리진. 빈 배열 = 교차 오리진 전면 차단.
+# 항목은 정확히 일치해야 하되, 호스트만 적으면 그 호스트의 모든 포트를 덮습니다
+# (`http://localhost` → `http://localhost:3000`). 스킴도 오리진의 일부라
+# `https://` 는 따로 적어야 합니다. 경로(`/chat`)는 붙이면 안 됩니다.
+cors_origins = ["http://localhost", "http://127.0.0.1"]
+cors_allow_any_origin = false       # 모든 오리진 허용(아래 경고 참조)
+cors_allow_credentials = false      # 쿠키/HTTP 인증 동반 요청 허용
 
 [cli]
 bin_path = ""                       # 빈 문자열 = PATH에서 자동 탐색
@@ -60,11 +67,38 @@ max_proxy_sessions = 50             # Proxy 세션 상한
 session_idle_timeout_secs = 1800    # Proxy 세션 idle timeout
 ```
 
-환경변수로도 설정 가능 (섹션/필드 구분은 `__`):
+환경변수로도 설정 가능 (섹션/필드 구분은 `__`). **목록은 쉼표로 구분**합니다:
 ```bash
 CLAUDE_GATEWAY__SERVER__PORT=9000 ./claude-agent-rs
 CLAUDE_GATEWAY__PROXY__MAX_CONCURRENT=4 ./claude-agent-rs
+CLAUDE_GATEWAY__SERVER__CORS_ORIGINS=https://app.example.com,http://localhost ./claude-agent-rs
 ```
+
+읽을 수 없는 설정이 하나라도 있으면 **기동을 거부하고 exit 2** 로 끝납니다.
+조용히 기본값으로 되돌아가면 `cors_origins` 처럼 기본값이 더 느슨한 설정에서
+의도와 반대되는 정책으로 뜨기 때문입니다.
+
+### CORS
+
+브라우저에서 붙일 때만 관계있습니다. curl·서버-투-서버 호출은 CORS 를 거치지 않습니다.
+
+| 설정 | 기본 | 의미 |
+|------|------|------|
+| `cors_origins` | localhost 2개 | 허용할 오리진 목록. **빈 배열이면 교차 오리진 전면 차단** |
+| `cors_allow_any_origin` | `false` | 모든 오리진 허용 |
+| `cors_allow_credentials` | `false` | 쿠키·HTTP 인증 동반 허용 |
+
+- **`cors_allow_any_origin = true` 는 위험합니다.** 게이트웨이 자체에는 인증이
+  없으므로, 사용자가 방문하는 아무 페이지나 이 게이트웨이를 조작할 수 있습니다
+  (구독 소모, `bypassPermissions` 로 호스트 명령 실행). 기동 시 경고가 찍힙니다.
+- **`cors_allow_any_origin` 과 `cors_allow_credentials` 는 함께 못 씁니다.**
+  브라우저가 거부하는 조합이라, 둘 다 켜면 에러 로그를 남기고 **credentials 를
+  끕니다**. 쿠키 인증을 쓰려면 오리진을 명시하세요.
+- `EventSource` 는 요청 헤더를 못 붙이므로, 브라우저 스트림에 인증을 걸 방법은
+  **쿠키 + `cors_allow_credentials`** 이거나 `EventSource` 를 포기하고
+  fetch 스트리밍으로 `Authorization` 을 보내는 것 둘 중 하나입니다.
+- 허용 요청 헤더는 `accept`, `authorization`, `content-type`, `last-event-id`
+  입니다. preflight 결과는 1시간 캐시됩니다.
 
 기타 환경변수:
 
