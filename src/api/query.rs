@@ -37,16 +37,15 @@ async fn query_handler(State(state): State<AppState>, Json(req): Json<QueryReque
 
     match crate::query::query(&req.prompt, options, &state.config).await {
         Ok(result) => {
-            // Track token/cost stats from result
-            if let Some(ref usage) = result.usage {
-                let mut stats = state.stats.lock().await;
-                stats.total_input_tokens += usage.input_tokens;
-                stats.total_output_tokens += usage.output_tokens;
-            }
-            if let Some(cost) = result.cost_usd {
-                let mut stats = state.stats.lock().await;
-                stats.total_cost_usd += cost;
-            }
+            // A stateless query owns its CLI session, so the reported
+            // running total is this call's cost.
+            let mut seen = 0.0;
+            let cost = crate::core::stats::cost_delta(&mut seen, result.total_cost_usd);
+            state
+                .stats
+                .lock()
+                .await
+                .record_turn(result.usage.as_ref(), cost);
             Json(result).into_response()
         }
         Err(e) => {
@@ -70,8 +69,15 @@ async fn query_stream_handler(
 
     match crate::query::query_stream(&req.prompt, options, &state.config).await {
         Ok(mut msg_rx) => {
+            let stats = state.stats.clone();
             let stream = async_stream::stream! {
+                // One CLI session per call, so the running total starts at 0.
+                let mut seen_cost = 0.0;
                 while let Some(msg) = msg_rx.recv().await {
+                    if let crate::messages::Message::Result { usage, total_cost_usd, .. } = &msg {
+                        let cost = crate::core::stats::cost_delta(&mut seen_cost, *total_cost_usd);
+                        stats.lock().await.record_turn(usage.as_ref(), cost);
+                    }
                     match serde_json::to_string(&msg) {
                         Ok(data) => yield Ok::<_, axum::Error>(Event::default().data(data)),
                         Err(_) => continue,

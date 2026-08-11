@@ -69,7 +69,14 @@ async fn create_session(
     Json(req): Json<CreateSessionRequest>,
 ) -> Response {
     let options = req.options.unwrap_or_default();
-    match client::create_session(options, state.sessions.clone(), state.config.clone()).await {
+    match client::create_session(
+        options,
+        state.sessions.clone(),
+        state.config.clone(),
+        state.stats.clone(),
+    )
+    .await
+    {
         Ok(session) => {
             let resp = CreateSessionResponse {
                 session_id: session.id.clone(),
@@ -253,7 +260,14 @@ async fn fork_session(State(state): State<AppState>, Path(id): Path<String>) -> 
     new_options.resume = Some(cli_session_id);
     new_options.fork_session = Some("true".to_string());
 
-    match client::create_session(new_options, state.sessions.clone(), state.config.clone()).await {
+    match client::create_session(
+        new_options,
+        state.sessions.clone(),
+        state.config.clone(),
+        state.stats.clone(),
+    )
+    .await
+    {
         Ok(new_session) => {
             let resp = CreateSessionResponse {
                 session_id: new_session.id.clone(),

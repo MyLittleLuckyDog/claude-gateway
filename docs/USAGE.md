@@ -106,7 +106,7 @@ curl http://localhost:8765/health
 ```
 
 #### `GET /stats`
-누적 통계.
+CLI wrap 경로(`/query`, `/query/stream`, `/sessions`)의 누적 통계.
 ```bash
 curl http://localhost:8765/stats
 ```
@@ -114,12 +114,28 @@ curl http://localhost:8765/stats
 {
   "uptime_seconds": 3600,
   "total_queries": 142,
+  "total_session_turns": 87,
   "active_sessions": 2,
   "total_input_tokens": 45200,
   "total_output_tokens": 12300,
-  "total_cost_usd": 0.107
+  "total_cache_read_tokens": 1560000,
+  "total_cache_creation_tokens": 204000,
+  "total_cost_usd": 0.287
 }
 ```
+
+| 필드 | 의미 |
+|------|------|
+| `total_queries` | stateless `/query` + `/query/stream` 호출 수 |
+| `total_session_turns` | `/sessions` 세션에서 완료된 턴 수 |
+| `total_input_tokens` | **캐시되지 않은** 입력 토큰. 캐시 트래픽은 아래 두 필드에 따로 집계 |
+| `total_cost_usd` | 실제 누적 비용 |
+
+> CLI 는 result 이벤트의 `usage` 를 **턴별**로, `total_cost_usd` 를 **그 CLI 세션의
+> 누적값**으로 보고합니다. 게이트웨이는 비용을 세션별 증분으로만 더합니다 —
+> 턴마다 나온 값을 그대로 합치면 실제보다 몇 배 부풀려집니다.
+>
+> `/v1/*` 프록시 경로는 이 통계에 잡히지 않습니다. `GET /v1/proxy_stats` 를 쓰세요.
 
 #### `GET /config`
 현재 서버 설정 조회.
@@ -194,15 +210,21 @@ curl -X POST http://localhost:8765/query \
   "session_id": "uuid-...",
   "result": "4",
   "subtype": "success",
-  "cost_usd": 0.004,
+  "cost_usd": null,
+  "total_cost_usd": 0.0857,
   "usage": {
-    "input_tokens": 512,
-    "output_tokens": 5
+    "input_tokens": 2,
+    "output_tokens": 3,
+    "cache_read_input_tokens": 18112,
+    "cache_creation_input_tokens": 7594
   },
   "num_turns": 1,
-  "duration_ms": 2400
+  "duration_ms": 3180
 }
 ```
+
+`cost_usd` 는 현재 CLI 가 채우지 않아 항상 `null` 입니다. 비용은 `total_cost_usd`
+를 보세요.
 
 #### `POST /query/stream`
 SSE(Server-Sent Events)로 실시간 스트리밍.

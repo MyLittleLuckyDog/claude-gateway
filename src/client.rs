@@ -6,6 +6,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use crate::config::AppConfig;
 use crate::core::events::record_and_broadcast;
 use crate::core::now_epoch_ms;
+use crate::core::stats::Stats;
 use crate::error::GatewayError;
 use crate::hooks::{self, AutoResolveOutcome};
 use crate::messages::cli_control::{ControlRequestOut, ControlRequestPayload};
@@ -22,6 +23,7 @@ pub async fn create_session(
     options: ClaudeAgentOptions,
     store: Arc<SessionStore>,
     config: Arc<AppConfig>,
+    stats: Arc<Mutex<Stats>>,
 ) -> Result<Arc<Session>, GatewayError> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let (stdin_tx, stdin_rx) = mpsc::channel::<String>(32);
@@ -47,7 +49,9 @@ pub async fn create_session(
     let session_clone = session.clone();
     let config_clone = config.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_session_loop(session_clone, options, config_clone, stdin_rx).await {
+        if let Err(e) =
+            run_session_loop(session_clone, options, config_clone, stdin_rx, stats).await
+        {
             tracing::error!("session {} loop error: {}", session_id, e);
         }
     });
@@ -60,8 +64,13 @@ async fn run_session_loop(
     options: ClaudeAgentOptions,
     config: Arc<AppConfig>,
     mut stdin_rx: mpsc::Receiver<String>,
+    stats: Arc<Mutex<Stats>>,
 ) -> Result<(), GatewayError> {
     let session_id_str = session.id.clone();
+    // The CLI reports total_cost_usd as a running total for this session, so
+    // only the increment per turn is charged. Scoped to the loop, so it dies
+    // with the session.
+    let mut seen_cost = 0.0;
 
     // Wait for the first stdin message before spawning CLI
     let first_msg = match stdin_rx.recv().await {
@@ -134,7 +143,16 @@ async fn run_session_loop(
                             CliOutputEvent::Assistant(_) => {
                                 *session.state.lock().await = SessionState::Running;
                             }
-                            CliOutputEvent::Result(_) => {
+                            CliOutputEvent::Result(r) => {
+                                let cost = crate::core::stats::cost_delta(
+                                    &mut seen_cost,
+                                    r.total_cost_usd,
+                                );
+                                {
+                                    let mut stats = stats.lock().await;
+                                    stats.total_session_turns += 1;
+                                    stats.record_turn(r.usage.as_ref(), cost);
+                                }
                                 *session.state.lock().await = SessionState::Idle;
                             }
                             CliOutputEvent::ControlRequest(ref ctl) => {

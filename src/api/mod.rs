@@ -42,13 +42,7 @@ pub struct AppState {
     pub openai_oauth: Option<Arc<OpenAiOAuthState>>,
 }
 
-#[derive(Debug, Default)]
-pub struct Stats {
-    pub total_queries: u64,
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
-    pub total_cost_usd: f64,
-}
+pub use crate::core::stats::Stats;
 
 // ── Shared error helpers ──────────────────────────────────────────
 

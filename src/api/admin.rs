@@ -16,10 +16,16 @@ struct HealthResponse {
 #[derive(Serialize)]
 struct StatsResponse {
     uptime_seconds: u64,
+    /// Stateless `/query` and `/query/stream` calls.
     total_queries: u64,
+    /// Completed turns on `/sessions` sessions.
+    total_session_turns: u64,
     active_sessions: usize,
+    /// Input tokens billed at full rate — cache traffic is counted separately.
     total_input_tokens: u64,
     total_output_tokens: u64,
+    total_cache_read_tokens: u64,
+    total_cache_creation_tokens: u64,
     total_cost_usd: f64,
 }
 
@@ -47,9 +53,12 @@ async fn stats(State(state): State<AppState>) -> Json<StatsResponse> {
     Json(StatsResponse {
         uptime_seconds: state.start_time.elapsed().as_secs(),
         total_queries: stats.total_queries,
+        total_session_turns: stats.total_session_turns,
         active_sessions: state.sessions.count(),
         total_input_tokens: stats.total_input_tokens,
         total_output_tokens: stats.total_output_tokens,
+        total_cache_read_tokens: stats.total_cache_read_tokens,
+        total_cache_creation_tokens: stats.total_cache_creation_tokens,
         total_cost_usd: stats.total_cost_usd,
     })
 }
