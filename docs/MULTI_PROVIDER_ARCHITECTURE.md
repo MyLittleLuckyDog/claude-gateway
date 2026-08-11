@@ -184,7 +184,7 @@
 
 이 단계 목표는 “Codex도 gateway 뒤에서 headless로 돈다”를 입증하는 것이다.
 
-### Phase 2. 얇은 공통층 추출
+### Phase 2. 얇은 공통층 추출 (진행 중)
 
 - session 상태 관리
 - approval 상태 관리
@@ -193,6 +193,12 @@
 
 이 단계에서는 이미 붙어 있는 Claude/Codex 두 축에서 중복이 보이는 부분만
 추출한다.
+
+진행 상황과 실측 중복량은 [PHASE2_COMMON_LAYER.md](PHASE2_COMMON_LAYER.md) 에
+정리한다. 공통 에러 응답과 이벤트 fanout 은 `src/core/` 로 추출을 마쳤고,
+session store 통합은 미착수다. 측정 결과 위 목록 중 두 항목은 판단을 바꿨다 —
+**proxy 세션은 종류가 달라 공통층에서 제외**하고, **approval 은 기전이 아니라
+와이어 포맷만 맞춘다**. 근거는 같은 문서에 있다.
 
 ### Phase 3. 표면 정리
 
