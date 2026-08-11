@@ -70,8 +70,9 @@ subprocess 세션이 아니라 **stateless API 위에 얹은 대화 버퍼**다.
 
 ```
 src/core/
-  mod.rs       공통층 범위 선언
+  mod.rs       공통층 범위 선언 + now_epoch_ms()
   events.rs    MAX_HISTORY + record_and_broadcast() + sse_replay_then_follow()
+  session.rs   ManagedSession trait + SessionStore<S>
 ```
 
 `api/mod.rs` 에는 `gateway_error_response(&GatewayError)` 를 추가했다. 같은 모듈의
@@ -79,7 +80,36 @@ src/core/
 썼다 — 후자는 `GatewayError` 가 없는 provider 프록시 라우트(`proxy`, `openai`,
 `local_mlx`)가 쓴다.
 
-측정 결과: **13개 파일 +93 / −225**.
+세 store 파일은 각각 **27줄의 얇은 어댑터**만 남았다 — `SessionStore<S>` 타입 별칭과
+자기 세션 타입에 대한 `ManagedSession` 구현이 전부다.
+
+```rust
+pub type CodexSessionStore = crate::core::session::SessionStore<CodexSession>;
+
+#[async_trait]
+impl ManagedSession for CodexSession {
+    fn id(&self) -> &str { &self.id }
+    fn last_activity_ms(&self) -> u64 { /* … */ }
+    fn kind() -> &'static str { "Codex" }
+    async fn is_terminal(&self) -> bool {
+        *self.state.lock().await == CodexSessionState::Dead
+    }
+}
+```
+
+**상태 enum 은 trait 밖에 남는다.** provider 는 "종료 상태인가"라는 boolean 만
+공통층에 노출하므로, `WaitingForHook` / `WaitingForApproval` 같은 대기 variant 가
+공통층에 새지 않는다.
+
+측정 결과: 1·2단계 **13개 파일 +93 / −225**, 3단계 **7개 파일 +61 / −250**
+(+ `core/session.rs` 275줄, 그중 절반이 테스트).
+
+### 보존한 quirk 하나
+
+`insert` 의 용량 검사는 점유 수만 본다. 따라서 store 가 가득 찼을 때는 **이미 있는
+id 를 재삽입해도 거부**된다. 세션 id 는 매번 새로 만드는 UUID 라 실제로는 도달하지
+않는 경로이므로, 순수 리팩터의 원칙대로 원래 동작을 그대로 두고 테스트로 못박았다
+(`at_capacity_even_a_same_id_insert_is_refused`).
 
 ## 4. 남은 단계
 
@@ -87,35 +117,14 @@ src/core/
 |---|---|---|
 | 1 | 공통 에러 응답 (4→1) | ✅ 완료 |
 | 2 | `core::events` — record/broadcast + SSE (8→2) | ✅ 완료 |
-| 3 | `SessionStore<S>` + `ManagedSession` trait (3→1) | ⬜ 미착수 |
-| 4 | cleanup 의 await-holding-guard 수정 | ⬜ 3에 포함 |
+| 3 | `SessionStore<S>` + `ManagedSession` trait (3→1) | ✅ 완료 |
+| 4 | cleanup 의 await-holding-guard 수정 | ✅ 3에 포함 |
 
-### 3단계 설계 (미착수)
+Phase 2 는 여기서 마친다. 남은 후보는 아래 "다음에 볼 것" 참고.
 
-`async-trait` 은 이미 의존성에 있다.
+### 4단계 — 고친 위험
 
-```rust
-#[async_trait]
-pub trait ManagedSession: Send + Sync + 'static {
-    fn id(&self) -> &str;
-    fn last_activity_ms(&self) -> u64;
-    fn kind(&self) -> &'static str;   // 로그 문자열 ("Codex app" 등)
-    async fn is_dead(&self) -> bool;  // 상태 enum 은 provider 소유로 유지
-}
-
-pub struct SessionStore<S: ManagedSession> { /* DashMap<String, Arc<S>>, max, op_lock */ }
-```
-
-상태 enum 을 trait 밖에 두는 게 핵심이다. 그래야 provider별 대기 variant
-(`WaitingForHook`, `WaitingForApproval`)가 공통층에 새지 않는다.
-
-**착수 전 조건**: 현재 store 테스트가 `insert_enforces_max_sessions_inside_store`
-하나뿐이다. 제네릭화 전에 store 계약 테스트(만료 정리 · `Dead` 정리 · 동시 insert)를
-먼저 깔아야 한다.
-
-### 4단계 — 고쳐야 할 실제 위험
-
-세 store 의 `run_cleanup` 이 **DashMap 이터레이터를 들고 await** 한다:
+3단계 이전, 세 store 의 `run_cleanup` 은 **DashMap 이터레이터를 들고 await** 했다:
 
 ```rust
 for entry in self.sessions.iter() {          // shard read guard 보유
@@ -124,13 +133,40 @@ for entry in self.sessions.iter() {          // shard read guard 보유
 
 `DashMap::iter()` 는 샤드 read 가드를 잡고, dashmap 의 샤드 락은 **블로킹 sync
 RwLock** 이다. 다른 task 가 같은 샤드에 `insert`/`remove` 하려 하면 워커 스레드가
-통째로 블록되고, 그 사이 cleanup task 는 `state` 뮤텍스를 기다린다. 재현시키지는
-못했으므로 확정 데드락이라 단정하지 않지만, 워커 수가 적을 때 스톨할 수 있는 실제
-위험이다. clippy 의 `await_holding_lock` 은 DashMap 가드를 잡아내지 못해 조용히
-통과한다.
+통째로 블록되고, 그 사이 cleanup task 는 `state` 뮤텍스를 기다린다. 확정 데드락으로
+재현시키지는 못했으므로 잠재 위험으로 분류하지만, 워커 수가 적을 때 스톨할 수 있다.
+clippy 의 `await_holding_lock` 은 DashMap 가드를 잡아내지 못해 조용히 통과한다.
 
-수정은 `Arc` 를 먼저 수집해 이터레이터를 놓고 그 다음 상태를 검사하는 것이다.
-세 곳에 똑같이 있으므로 3단계로 store 를 합치면 한 번에 고쳐진다.
+통합 store 는 후보를 **먼저 스냅샷**해 이터레이터를 놓은 뒤 상태를 검사한다:
+
+```rust
+let candidates: Vec<Arc<S>> = self.sessions.iter().map(|r| r.value().clone()).collect();
+for session in candidates {
+    if expired || session.is_terminal().await { /* … */ }
+}
+```
+
+회귀 방지로 계약 테스트에
+`cleanup_runs_concurrently_with_inserts_and_removes` 를 뒀다 — cleanup 과 삽입/삭제를
+동시에 돌리고 10초 타임아웃을 건다.
+
+## 검증
+
+| 항목 | 결과 |
+|---|---|
+| store 계약 테스트 | 39개 — 3단계 **전후 모두 변경 없이 통과**(동작 보존의 증거) |
+| 전체 테스트 | 159 passed |
+| `cargo clippy --all-targets -- -D warnings` | 경고 0 |
+| 실사격 | `max_sessions=2` 초과 시 429 · 라이브 턴 `system`→`assistant`→`result` · DELETE 후 재생성 201 |
+
+## 다음에 볼 것
+
+Phase 2 범위는 아니지만 측정 중 눈에 띈 것:
+
+- `api/{sessions,codex,codex_app}.rs` 의 CRUD 핸들러(생성/목록/삭제/messages 페이지네이션)가
+  아직 provider별로 거의 같은 모양이다. 다만 응답 JSON 필드가 provider마다 달라
+  (`thread_id`, `turn_id`, `include_system`) 공통화 이득이 store만큼 크지 않다.
+- `codex/store.rs` 와 `codex_app/store.rs` 의 `CodexOptions` 공유는 이미 되어 있다.
 
 ## 5. 하지 말 것
 

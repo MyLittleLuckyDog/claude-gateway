@@ -5,6 +5,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::config::AppConfig;
 use crate::core::events::record_and_broadcast;
+use crate::core::now_epoch_ms;
 use crate::error::GatewayError;
 use crate::hooks::{self, AutoResolveOutcome};
 use crate::messages::cli_control::{ControlRequestOut, ControlRequestPayload};
@@ -16,13 +17,6 @@ use crate::session::store::SessionStore;
 use crate::session::{Session, SessionState};
 use crate::transport::cli::CliTransport;
 use crate::transport::Transport;
-
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 pub async fn create_session(
     options: ClaudeAgentOptions,

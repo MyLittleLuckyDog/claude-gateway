@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::config::AppConfig;
+use crate::core::now_epoch_ms;
 use crate::error::GatewayError;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -20,13 +21,6 @@ use self::messages::{
 use self::options::{CodexApprovalPolicy, CodexOptions, CodexSandboxMode};
 use self::session::{CodexSession, CodexSessionState};
 use crate::core::events::record_and_broadcast;
-
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
 
 fn codex_cli_path(options: &CodexOptions) -> String {
     options
