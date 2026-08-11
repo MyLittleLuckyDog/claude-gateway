@@ -283,6 +283,20 @@ curl -N http://localhost:8765/sessions/abc-123/stream
 ```
 세션의 모든 이벤트를 실시간으로 수신. 기존 히스토리도 먼저 재전송됨.
 
+`options.include_partial_messages: true` 로 세션을 만들면 완성된 메시지 사이에
+`stream_event` 프레임이 끼어 들어옵니다 — 채팅 UI 의 토큰 단위 렌더링용입니다.
+
+```
+data: {"type":"stream_event","session_id":"...","uuid":"...",
+       "stream_event":{"type":"content_block_delta","index":0,
+                       "delta":{"type":"text_delta","text":"stre"}}}
+```
+
+`stream_event` 안은 Messages API 의 스트리밍 이벤트 그대로입니다
+(`message_start` → `content_block_start` → `content_block_delta`* →
+`content_block_stop` → `message_delta` → `message_stop`). `delta.text` 를 순서대로
+이어붙이면 최종 텍스트가 됩니다.
+
 #### `GET /sessions/:id/messages` — 히스토리 조회
 ```bash
 curl "http://localhost:8765/sessions/abc-123/messages?limit=50&offset=0&include_system=false"
@@ -449,7 +463,7 @@ decision 값:
 | `env` | object | null | CLI 환경변수 |
 | `cli_path` | string | null | claude CLI 경로 (기본: PATH 탐색) |
 | `add_dirs` | string[] | null | CLI에 추가로 노출할 작업 디렉토리(`--add-dir`) |
-| `include_partial_messages` | bool | false | 스트리밍 중간 메시지 포함 |
+| `include_partial_messages` | bool | false | 토큰 단위 증분 프레임(`stream_event`) 수신. Messages API 의 `message_start`/`content_block_delta`/`message_stop` 이 그대로 실려 옴 |
 | `output_format` | string | null | CLI wrap 경로에서는 `stream-json`만 지원 |
 | `agents` | object | null | subagent 정의 맵. `initialize` control_request로 전달 |
 | `betas` | string[] | null | 베타 기능 활성화 |

@@ -99,6 +99,13 @@ pub struct CliStreamEventWrapper {
     pub session_id: String,
     pub parent_tool_use_id: Option<String>,
     pub uuid: Option<String>,
+    /// The Messages API streaming event — `message_start`,
+    /// `content_block_delta`, `message_stop`, and so on.
+    ///
+    /// The CLI names this field `event`; it is kept as `stream_event` here to
+    /// match the name the gateway publishes to its own clients. `message_start`
+    /// lines also carry `ttft_ms`, which is ignored.
+    #[serde(rename = "event")]
     pub stream_event: Value,
 }
 

@@ -94,11 +94,32 @@ fn test_parse_hook_request() {
 
 #[test]
 fn test_parse_stream_event() {
+    // Fixture is a real `--include-partial-messages` line, with only the ids
+    // pinned. An earlier hand-written fixture used the wrong key for the
+    // payload, so this test passed while every live partial frame failed to
+    // parse — hence the assertions on the payload itself below.
     let raw = include_str!("fixtures/stream_event.json");
     let event: CliOutputEvent = serde_json::from_str(raw).expect("parse stream event");
     match event {
         CliOutputEvent::StreamEvent(se) => {
             assert_eq!(se.uuid.as_deref(), Some("uuid-v4-123"));
+            assert_eq!(se.session_id, "550e8400-e29b-41d4-a716-446655440000");
+            assert_eq!(se.stream_event["type"], "content_block_delta");
+            assert_eq!(se.stream_event["delta"]["text"], "1");
+        }
+        _ => panic!("Expected StreamEvent"),
+    }
+}
+
+/// `message_start` carries a `ttft_ms` the other frames don't. An unknown
+/// field must not fail the whole line.
+#[test]
+fn test_parse_stream_event_tolerates_extra_fields() {
+    let raw = r#"{"type":"stream_event","event":{"type":"message_start"},
+                  "session_id":"s","parent_tool_use_id":null,"uuid":"u","ttft_ms":812}"#;
+    match serde_json::from_str::<CliOutputEvent>(raw).expect("parse message_start") {
+        CliOutputEvent::StreamEvent(se) => {
+            assert_eq!(se.stream_event["type"], "message_start");
         }
         _ => panic!("Expected StreamEvent"),
     }
