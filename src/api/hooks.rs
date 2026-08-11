@@ -8,8 +8,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::AppState;
-use crate::error::{ErrorResponse, GatewayError};
+use super::{gateway_error_response, AppState};
+use crate::error::GatewayError;
 use crate::messages::cli_control::ControlResponseOut;
 use crate::messages::cli_input::CliInputMessage;
 use crate::session::SessionState;
@@ -64,7 +64,7 @@ async fn hook_response(
 ) -> Response {
     let session = match state.sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
 
     {
@@ -75,19 +75,19 @@ async fn hook_response(
                 deadline,
             } => {
                 if *request_id != body.request_id {
-                    return error_response(&GatewayError::InvalidSessionState {
+                    return gateway_error_response(&GatewayError::InvalidSessionState {
                         expected: format!("waiting for request {}", body.request_id),
                         actual: format!("waiting for request {}", request_id),
                     });
                 }
                 if std::time::Instant::now() > *deadline {
-                    return error_response(&GatewayError::HookTimeout {
+                    return gateway_error_response(&GatewayError::HookTimeout {
                         hook_id: body.request_id,
                     });
                 }
             }
             other => {
-                return error_response(&GatewayError::InvalidSessionState {
+                return gateway_error_response(&GatewayError::InvalidSessionState {
                     expected: "waiting_for_hook".to_string(),
                     actual: other.to_string(),
                 });
@@ -118,7 +118,9 @@ async fn hook_response(
     let response = ControlResponseOut::success(body.request_id, payload);
     let json = match serde_json::to_string(&response) {
         Ok(j) => j,
-        Err(e) => return error_response(&GatewayError::Internal(format!("JSON error: {}", e))),
+        Err(e) => {
+            return gateway_error_response(&GatewayError::Internal(format!("JSON error: {}", e)))
+        }
     };
 
     if let Some(handle) = session.hook_timeout_handle.lock().await.take() {
@@ -130,25 +132,27 @@ async fn hook_response(
             *session.state.lock().await = SessionState::Running;
             (StatusCode::ACCEPTED, Json(json!({}))).into_response()
         }
-        Err(_) => error_response(&GatewayError::Internal("stdin closed".to_string())),
+        Err(_) => gateway_error_response(&GatewayError::Internal("stdin closed".to_string())),
     }
 }
 
 async fn interrupt(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
 
     let msg = CliInputMessage::Interrupt;
     let json = match serde_json::to_string(&msg) {
         Ok(j) => j,
-        Err(e) => return error_response(&GatewayError::Internal(format!("JSON error: {}", e))),
+        Err(e) => {
+            return gateway_error_response(&GatewayError::Internal(format!("JSON error: {}", e)))
+        }
     };
 
     match session.stdin_tx.send(json).await {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(_) => error_response(&GatewayError::Internal("stdin closed".to_string())),
+        Err(_) => gateway_error_response(&GatewayError::Internal("stdin closed".to_string())),
     }
 }
 
@@ -159,7 +163,7 @@ async fn permission_response(
 ) -> Response {
     let session = match state.sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
 
     let payload = {
@@ -170,7 +174,7 @@ async fn permission_response(
                 original_input,
             } => {
                 if *request_id != body.request_id {
-                    return error_response(&GatewayError::InvalidSessionState {
+                    return gateway_error_response(&GatewayError::InvalidSessionState {
                         expected: format!("waiting for request {}", body.request_id),
                         actual: format!("waiting for request {}", request_id),
                     });
@@ -183,11 +187,11 @@ async fn permission_response(
                     original_input.clone(),
                 ) {
                     Ok(v) => v,
-                    Err(e) => return error_response(&e),
+                    Err(e) => return gateway_error_response(&e),
                 }
             }
             other => {
-                return error_response(&GatewayError::InvalidSessionState {
+                return gateway_error_response(&GatewayError::InvalidSessionState {
                     expected: "waiting_for_permission".to_string(),
                     actual: other.to_string(),
                 });
@@ -206,7 +210,9 @@ async fn send_permission_response(
     let response = ControlResponseOut::success(request_id, payload);
     let json = match serde_json::to_string(&response) {
         Ok(j) => j,
-        Err(e) => return error_response(&GatewayError::Internal(format!("JSON error: {}", e))),
+        Err(e) => {
+            return gateway_error_response(&GatewayError::Internal(format!("JSON error: {}", e)))
+        }
     };
 
     match session.stdin_tx.send(json).await {
@@ -214,7 +220,7 @@ async fn send_permission_response(
             *session.state.lock().await = SessionState::Running;
             (StatusCode::ACCEPTED, Json(json!({}))).into_response()
         }
-        Err(_) => error_response(&GatewayError::Internal("stdin closed".to_string())),
+        Err(_) => gateway_error_response(&GatewayError::Internal("stdin closed".to_string())),
     }
 }
 
@@ -253,12 +259,6 @@ fn build_permission_response_payload(
             other
         ))),
     }
-}
-
-fn error_response(e: &GatewayError) -> Response {
-    let status = axum::http::StatusCode::from_u16(e.http_status())
-        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(ErrorResponse::from(e))).into_response()
 }
 
 #[cfg(test)]

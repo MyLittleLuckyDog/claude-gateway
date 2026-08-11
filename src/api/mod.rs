@@ -66,6 +66,15 @@ pub fn error_response(status: u16, code: &str, message: &str) -> Response {
         .into_response()
 }
 
+/// Render a [`GatewayError`](crate::error::GatewayError) as an HTTP response.
+///
+/// Distinct from [`error_response`], which takes a hand-built status/code/message
+/// triple for the provider-proxy routes that have no `GatewayError` to hand.
+pub fn gateway_error_response(e: &crate::error::GatewayError) -> Response {
+    let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(crate::error::ErrorResponse::from(e))).into_response()
+}
+
 pub fn proxy_error_response(e: crate::proxy::ProxyError) -> Response {
     let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (
