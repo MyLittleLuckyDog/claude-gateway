@@ -124,9 +124,9 @@ async fn responses_handler(
                     return (status, Json(body)).into_response();
                 }
 
-                let byte_stream = resp.bytes_stream().map(|chunk| {
-                    chunk.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
-                });
+                let byte_stream = resp
+                    .bytes_stream()
+                    .map(|chunk| chunk.map_err(std::io::Error::other));
                 let body = axum::body::Body::from_stream(byte_stream);
 
                 Response::builder()
@@ -198,7 +198,7 @@ async fn responses_stream_handler(
             // Pass SSE stream through, scanning for event: error lines
             let byte_stream = resp
                 .bytes_stream()
-                .map(|chunk| chunk.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
+                .map(|chunk| chunk.map_err(std::io::Error::other));
             let body = axum::body::Body::from_stream(byte_stream);
 
             Response::builder()

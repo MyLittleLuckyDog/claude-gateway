@@ -554,7 +554,7 @@ impl ResponseAccumulator {
             let output_missing_or_empty = obj
                 .get("output")
                 .and_then(Value::as_array)
-                .map_or(true, |a| a.is_empty());
+                .is_none_or(|a| a.is_empty());
             if output_missing_or_empty {
                 obj.insert(
                     "output".to_string(),
@@ -1023,7 +1023,7 @@ fn extract_account_id_from_jwt(token: &str) -> Option<String> {
     let padded = {
         let part = parts[1];
         let mut s = part.replace('-', "+").replace('_', "/");
-        while s.len() % 4 != 0 {
+        while !s.len().is_multiple_of(4) {
             s.push('=');
         }
         s
@@ -1064,6 +1064,10 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 // ── Tests ─────────────────────────────────────────────────────────
 
 #[cfg(test)]
+// ENV_LOCK is intentionally held across awaits: it guards process-wide env vars
+// for the whole body of an async test, and #[tokio::test] runs single-threaded,
+// so the guard cannot block another worker.
+#[allow(clippy::await_holding_lock)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
