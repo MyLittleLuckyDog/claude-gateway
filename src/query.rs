@@ -231,6 +231,7 @@ pub fn cli_output_to_message(event: CliOutputEvent) -> Message {
             usage: r.usage,
             num_turns: r.num_turns,
             duration_ms: r.duration_ms,
+            duration_api_ms: r.duration_api_ms,
         },
         CliOutputEvent::StreamEvent(se) => Message::StreamEvent {
             session_id: se.session_id,

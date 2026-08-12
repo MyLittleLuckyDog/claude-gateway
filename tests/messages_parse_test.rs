@@ -52,6 +52,7 @@ fn test_parse_result_success() {
             assert_eq!(r.subtype, "success");
             assert_eq!(r.result.as_deref(), Some("The answer is 4."));
             assert_eq!(r.num_turns, Some(3));
+            assert_eq!(r.duration_api_ms, Some(3100));
         }
         _ => panic!("Expected Result event"),
     }
@@ -71,6 +72,8 @@ fn test_parse_result_error() {
             assert_eq!(r.subtype, "error_max_turns");
             assert_eq!(r.num_turns, Some(7));
             assert_eq!(r.duration_ms, Some(105_453));
+            // Summed over API calls, so it is free to exceed duration_ms.
+            assert_eq!(r.duration_api_ms, Some(77_814));
             // Cost and usage are what the stats path needs; dropping the line
             // lost them, and a turn that failed is exactly the expensive kind.
             assert_eq!(r.total_cost_usd, Some(0.664_044_499_999_999_9));
