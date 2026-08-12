@@ -182,7 +182,7 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    if state.codex_sessions.remove(&id) {
+    if state.codex_sessions.remove(&id).await {
         StatusCode::NO_CONTENT.into_response()
     } else {
         gateway_error_response(&GatewayError::SessionNotFound(id))

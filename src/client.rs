@@ -30,6 +30,7 @@ pub async fn create_session(
     let (event_tx, _) = broadcast::channel::<Seq<Message>>(1024);
     let history = Arc::new(Mutex::new(VecDeque::<Seq<Message>>::new()));
     let state = Arc::new(Mutex::new(SessionState::Initializing));
+    let cancel = Arc::new(tokio::sync::Notify::new());
 
     let session = Arc::new(Session {
         id: session_id.clone(),
@@ -43,6 +44,7 @@ pub async fn create_session(
         history: history.clone(),
         hook_timeout_handle: Arc::new(Mutex::new(None)),
         next_seq: std::sync::atomic::AtomicU64::new(0),
+        cancel: cancel.clone(),
     });
 
     store.insert(session.clone())?;
@@ -270,6 +272,10 @@ async fn run_session_loop(
                         break;
                     }
                 }
+            }
+            _ = session.cancel.notified() => {
+                tracing::info!("session {} cancelled, stopping CLI", session_id_str);
+                break;
             }
         }
     }

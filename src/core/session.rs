@@ -33,6 +33,18 @@ pub trait ManagedSession: Send + Sync + 'static {
     /// Terminal sessions are reaped regardless of how recently they were
     /// active — the process behind them is already gone.
     async fn is_terminal(&self) -> bool;
+
+    /// Stop whatever is running behind the session. Called when it leaves the
+    /// store, by an explicit delete or by the idle sweep.
+    ///
+    /// Dropping the store's `Arc` frees nothing on its own: the task driving a
+    /// session holds an `Arc` to the same session, and typically waits on a
+    /// channel whose sender lives inside it — so it can never observe the
+    /// close. Without this the subprocess outlives every session that is ever
+    /// deleted.
+    ///
+    /// Defaults to doing nothing, for sessions with no process to stop.
+    async fn shutdown(&self) {}
 }
 
 /// Bounded registry of live sessions for one provider axis.
@@ -79,9 +91,21 @@ impl<S: ManagedSession> SessionStore<S> {
             .ok_or_else(|| GatewayError::SessionNotFound(id.to_string()))
     }
 
-    pub fn remove(&self, id: &str) -> bool {
-        let _guard = self.op_lock.lock().unwrap();
-        self.sessions.remove(id).is_some()
+    pub async fn remove(&self, id: &str) -> bool {
+        // The guard is scoped so it is released before the await — `op_lock` is
+        // a blocking std lock and holding it across one would park a worker
+        // thread that a concurrent insert needs.
+        let removed = {
+            let _guard = self.op_lock.lock().unwrap();
+            self.sessions.remove(id)
+        };
+        match removed {
+            Some((_, session)) => {
+                session.shutdown().await;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn count(&self) -> usize {
@@ -113,7 +137,9 @@ impl<S: ManagedSession> SessionStore<S> {
 
         for id in to_remove {
             tracing::info!("Cleaning up idle {} session: {}", S::kind(), id);
-            self.sessions.remove(&id);
+            if let Some((_, session)) = self.sessions.remove(&id) {
+                session.shutdown().await;
+            }
         }
     }
 }
@@ -129,6 +155,7 @@ mod tests {
         id: String,
         last_activity_ms: AtomicU64,
         terminal: bool,
+        shutdowns: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeSession {
@@ -137,7 +164,12 @@ mod tests {
                 id: id.to_string(),
                 last_activity_ms: AtomicU64::new(last_activity_ms),
                 terminal,
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
             })
+        }
+
+        fn shutdowns(&self) -> usize {
+            self.shutdowns.load(Ordering::Relaxed)
         }
     }
 
@@ -155,6 +187,46 @@ mod tests {
         async fn is_terminal(&self) -> bool {
             self.terminal
         }
+        async fn shutdown(&self) {
+            self.shutdowns.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Leaving the store has to stop the session, not just forget it. The task
+    /// behind a session holds its own `Arc`, so dropping the store's copy ends
+    /// nothing — that is how deleted sessions kept their subprocess alive.
+    #[tokio::test]
+    async fn remove_shuts_the_session_down() {
+        let store = SessionStore::new(4);
+        let session = FakeSession::new("a", now_epoch_ms(), false);
+        store.insert(session.clone()).unwrap();
+
+        assert!(store.remove("a").await);
+        assert_eq!(session.shutdowns(), 1);
+    }
+
+    #[tokio::test]
+    async fn remove_of_an_absent_id_shuts_nothing_down() {
+        let store = SessionStore::new(4);
+        let session = FakeSession::new("a", now_epoch_ms(), false);
+        store.insert(session.clone()).unwrap();
+
+        assert!(!store.remove("b").await);
+        assert_eq!(session.shutdowns(), 0);
+    }
+
+    #[tokio::test]
+    async fn cleanup_shuts_down_what_it_reaps() {
+        let store = SessionStore::new(4);
+        let idle = FakeSession::new("idle", 0, false);
+        let live = FakeSession::new("live", now_epoch_ms(), false);
+        store.insert(idle.clone()).unwrap();
+        store.insert(live.clone()).unwrap();
+
+        store.run_cleanup(1).await;
+
+        assert_eq!(idle.shutdowns(), 1);
+        assert_eq!(live.shutdowns(), 0, "a live session must be left running");
     }
 
     #[tokio::test]
@@ -248,7 +320,7 @@ mod tests {
             tokio::spawn(async move {
                 for i in 0..512 {
                     let _ = store.insert(FakeSession::new(&format!("w{i}"), now_epoch_ms(), false));
-                    store.remove(&format!("w{i}"));
+                    store.remove(&format!("w{i}")).await;
                     tokio::task::yield_now().await;
                 }
             })

@@ -53,6 +53,7 @@ fn claude_session(id: &str, activity_ms: u64, dead: bool) -> Arc<Session> {
         history: Arc::new(Mutex::new(VecDeque::new())),
         hook_timeout_handle: Arc::new(Mutex::new(None)),
         next_seq: AtomicU64::new(0),
+        cancel: Arc::new(tokio::sync::Notify::new()),
     })
 }
 
@@ -149,7 +150,7 @@ macro_rules! store_contract {
             async fn removing_a_session_frees_a_slot() {
                 let store = <$store>::new(1);
                 store.insert($make("a", now_ms(), false)).unwrap();
-                assert!(store.remove("a"));
+                assert!(store.remove("a").await);
 
                 store.insert($make("b", now_ms(), false)).unwrap();
                 assert_eq!(store.list().len(), 1);
@@ -160,8 +161,8 @@ macro_rules! store_contract {
                 let store = <$store>::new(4);
                 store.insert($make("a", now_ms(), false)).unwrap();
 
-                assert!(store.remove("a"));
-                assert!(!store.remove("a"));
+                assert!(store.remove("a").await);
+                assert!(!store.remove("a").await);
             }
 
             #[tokio::test]
@@ -275,7 +276,7 @@ macro_rules! store_contract {
                     tokio::spawn(async move {
                         for i in 0..256 {
                             let _ = store.insert($make(&format!("w{i}"), now_ms(), false));
-                            store.remove(&format!("w{i}"));
+                            store.remove(&format!("w{i}")).await;
                             tokio::task::yield_now().await;
                         }
                     })
