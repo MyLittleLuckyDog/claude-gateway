@@ -49,7 +49,7 @@ fn test_parse_result_success() {
     let event: CliOutputEvent = serde_json::from_str(raw).expect("parse result success");
     match event {
         CliOutputEvent::Result(r) => {
-            assert_eq!(r.subtype, ResultSubtype::Success);
+            assert_eq!(r.subtype, "success");
             assert_eq!(r.result.as_deref(), Some("The answer is 4."));
             assert_eq!(r.num_turns, Some(3));
         }
@@ -57,14 +57,41 @@ fn test_parse_result_success() {
     }
 }
 
+/// A real `error_max_turns` line, captured from the CLI.
+///
+/// The fixture this replaced was hand-written with `error_during_generation` —
+/// a name the CLI has never sent — so it confirmed the code's own mistake and
+/// every failed turn was dropped in production while this test stayed green.
 #[test]
 fn test_parse_result_error() {
     let raw = include_str!("fixtures/result_error.json");
     let event: CliOutputEvent = serde_json::from_str(raw).expect("parse result error");
     match event {
         CliOutputEvent::Result(r) => {
-            assert_eq!(r.subtype, ResultSubtype::ErrorDuringGeneration);
-            assert!(r.error.is_some());
+            assert_eq!(r.subtype, "error_max_turns");
+            assert_eq!(r.num_turns, Some(7));
+            assert_eq!(r.duration_ms, Some(105_453));
+            // Cost and usage are what the stats path needs; dropping the line
+            // lost them, and a turn that failed is exactly the expensive kind.
+            assert_eq!(r.total_cost_usd, Some(0.664_044_499_999_999_9));
+            assert_eq!(r.usage.expect("usage").output_tokens, 5476);
+        }
+        _ => panic!("Expected Result event"),
+    }
+}
+
+/// The CLI is free to add verdicts. A new one must not cost us the line —
+/// with it goes the turn's cost, its usage, and the client's only signal that
+/// the turn is over.
+#[test]
+fn result_survives_a_subtype_we_have_never_seen() {
+    let raw = r#"{"type":"result","subtype":"error_something_new_in_2027",
+                  "session_id":"s1","duration_ms":10,"total_cost_usd":0.5}"#;
+    let event: CliOutputEvent = serde_json::from_str(raw).expect("parse unknown subtype");
+    match event {
+        CliOutputEvent::Result(r) => {
+            assert_eq!(r.subtype, "error_something_new_in_2027");
+            assert_eq!(r.total_cost_usd, Some(0.5));
         }
         _ => panic!("Expected Result event"),
     }

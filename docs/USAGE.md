@@ -312,6 +312,12 @@ curl -X POST http://localhost:8765/query \
 `cost_usd` 는 현재 CLI 가 채우지 않아 항상 `null` 입니다. 비용은 `total_cost_usd`
 를 보세요.
 
+`subtype` 은 CLI 의 판정을 **그대로** 전달합니다. 지금까지 관측된 값은
+`success`, `error_max_turns`, `error_during_execution`, `error_max_budget_usd`,
+`error_max_structured_output_retries` 이지만, CLI 가 값을 추가하면 게이트웨이는
+그것도 그대로 넘깁니다. `success` 인지만 확인하고 나머지는 문자열로 다루세요 —
+목록을 열거해 분기하면 CLI 가 늘어날 때 깨집니다.
+
 #### `POST /query/stream`
 SSE(Server-Sent Events)로 실시간 스트리밍.
 

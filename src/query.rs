@@ -223,7 +223,7 @@ pub fn cli_output_to_message(event: CliOutputEvent) -> Message {
         },
         CliOutputEvent::Result(r) => Message::Result {
             session_id: r.session_id,
-            subtype: format!("{:?}", r.subtype).to_lowercase(),
+            subtype: r.subtype,
             result: r.result,
             error: r.error,
             cost_usd: r.cost_usd,
