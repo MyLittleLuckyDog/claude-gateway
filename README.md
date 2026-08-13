@@ -3,7 +3,7 @@
 Claude Code CLI를 래핑하는 Rust 네이티브 REST API 게이트웨이.
 단일 바이너리로 배포되며, Claude Code 구독만으로 API 키 없이 동작합니다.
 
-아키텍처 확장 방향은 [docs/MULTI_PROVIDER_ARCHITECTURE.md](/Volumes/juryu_home/with_AI/projects/06.DenoV8POC/01.Tools/claude-gateway/docs/MULTI_PROVIDER_ARCHITECTURE.md:1)를 참고하세요.
+아키텍처 확장 방향은 [docs/MULTI_PROVIDER_ARCHITECTURE.md](docs/MULTI_PROVIDER_ARCHITECTURE.md)를 참고하세요.
 현재 기준은 `기존 Claude 경로 유지 + Codex 축 추가 + 얇은 공통층 추출`입니다.
 
 ## 두 가지 모드
@@ -172,19 +172,30 @@ CLI subprocess 오버헤드 없이 빠르고, Haiku/Sonnet/Opus 자유 선택 �
 
 ### 모델 별칭
 
-| 별칭 | 정규 ID |
-|------|---------|
-| `haiku`, `haiku4.5`, `claude-haiku` | `claude-haiku-4-5-20251001` |
-| `sonnet4` | `claude-sonnet-4-20250514` |
-| `sonnet4.5` | `claude-sonnet-4-5-20250929` |
-| `sonnet`, `claude-sonnet` | `claude-sonnet-4-6` |
-| `opus4` | `claude-opus-4-20250514` |
-| `opus4.5` | `claude-opus-4-5-20251101` |
-| `opus`, `claude-opus` | `claude-opus-4-6` |
+| 별칭 | 정규 ID | 컨텍스트 | 최대 출력 |
+|------|---------|---------|----------|
+| `fable`, `fable5`, `claude-fable` | `claude-fable-5` | 1M | 128K |
+| `opus`, `opus5`, `claude-opus` | `claude-opus-5` | 1M | 128K |
+| `opus4.8` | `claude-opus-4-8` | 1M | 128K |
+| `opus4.7` | `claude-opus-4-7` | 1M | 128K |
+| `opus4.6` | `claude-opus-4-6` | 1M | 128K |
+| `opus4.5` | `claude-opus-4-5` | 200K | 32K |
+| `opus4` | `claude-opus-4-0` | 200K | 32K |
+| `sonnet`, `sonnet5`, `claude-sonnet` | `claude-sonnet-5` | 1M | 128K |
+| `sonnet4.6` | `claude-sonnet-4-6` | 1M | 128K |
+| `sonnet4.5` | `claude-sonnet-4-5` | 200K | 64K |
+| `sonnet4` | `claude-sonnet-4-0` | 200K | 64K |
+| `haiku`, `haiku4.5`, `claude-haiku` | `claude-haiku-4-5` | 200K | 64K |
 
-정규 ID를 직접 써도 되고, 접두사 매치(`claude-sonnet-4-6-...`)도 통합니다.
+정규 ID를 직접 써도 되고, 접두사 매치(`claude-sonnet-5-...`)도 통합니다.
+날짜 접미사가 붙은 옛 ID(`claude-haiku-4-5-20251001` 등)도 같은 모델로 해석됩니다.
+카탈로그에 없는 모델은 보정 없이 그대로 상류에 전달됩니다.
+
 `POST /v1/messages`는 `model`이 필수입니다. 기본 모델 보정은 `/v1/sessions`
-세션 경로에서만 적용됩니다.
+세션 경로에서만 적용되며, 기본값은 `claude-sonnet-5`입니다.
+
+> 128K 출력을 실제로 받으려면 스트리밍(`/v1/messages/stream`)을 써야 합니다.
+> 비스트리밍 요청은 그만한 양을 뽑기 전에 HTTP 타임아웃에 걸립니다.
 
 ### 단일 요청 (Stateless)
 

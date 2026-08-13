@@ -97,7 +97,7 @@ impl ProxySession {
 
     /// Is the context approaching the limit?
     pub fn is_context_near_limit(&self) -> bool {
-        self.estimated_context_tokens() >= models::CONTEXT_CLEANUP_THRESHOLD as u64
+        self.estimated_context_tokens() >= models::context_cleanup_threshold(&self.model) as u64
     }
 
     /// Preflight check: will the next request likely exceed the context window?
@@ -107,9 +107,7 @@ impl ProxySession {
             // First turn — no prior data, allow it
             return Ok(());
         }
-        let model_context = models::resolve_model(&self.model)
-            .map(|m| m.context_window as u64)
-            .unwrap_or(200_000);
+        let model_context = models::context_window(&self.model) as u64;
         if estimated + max_tokens as u64 > model_context {
             return Err(format!(
                 "Estimated context ({} tokens) + max_tokens ({}) exceeds \

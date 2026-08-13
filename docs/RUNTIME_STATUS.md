@@ -2,7 +2,7 @@
 
 이 문서는 현재 `claude-gateway`의 CLI wrap / SDK-style control flow 구현 상태를
 소스 기준으로 정리한 운영 메모다. README/USAGE보다 더 구현 지향적인 상태 문서다.
-멀티 provider 확장 방향은 [MULTI_PROVIDER_ARCHITECTURE.md](/Volumes/juryu_home/with_AI/projects/06.DenoV8POC/01.Tools/claude-gateway/docs/MULTI_PROVIDER_ARCHITECTURE.md:1)에 따로 정리한다.
+멀티 provider 확장 방향은 [MULTI_PROVIDER_ARCHITECTURE.md](MULTI_PROVIDER_ARCHITECTURE.md)에 따로 정리한다.
 
 ## 현재 포지션
 
