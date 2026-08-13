@@ -106,7 +106,7 @@ curl http://localhost:8765/health
 ```
 
 #### `GET /stats`
-누적 통계.
+CLI wrap 경로(`/query`, `/query/stream`, `/sessions`)의 누적 통계.
 ```bash
 curl http://localhost:8765/stats
 ```
@@ -114,12 +114,28 @@ curl http://localhost:8765/stats
 {
   "uptime_seconds": 3600,
   "total_queries": 142,
+  "total_session_turns": 87,
   "active_sessions": 2,
   "total_input_tokens": 45200,
   "total_output_tokens": 12300,
-  "total_cost_usd": 0.107
+  "total_cache_read_tokens": 1560000,
+  "total_cache_creation_tokens": 204000,
+  "total_cost_usd": 0.287
 }
 ```
+
+| 필드 | 의미 |
+|------|------|
+| `total_queries` | stateless `/query` + `/query/stream` 호출 수 |
+| `total_session_turns` | `/sessions` 세션에서 완료된 턴 수 |
+| `total_input_tokens` | **캐시되지 않은** 입력 토큰. 캐시 트래픽은 아래 두 필드에 따로 집계 |
+| `total_cost_usd` | 실제 누적 비용 |
+
+> CLI 는 result 이벤트의 `usage` 를 **턴별**로, `total_cost_usd` 를 **그 CLI 세션의
+> 누적값**으로 보고합니다. 게이트웨이는 비용을 세션별 증분으로만 더합니다 —
+> 턴마다 나온 값을 그대로 합치면 실제보다 몇 배 부풀려집니다.
+>
+> `/v1/*` 프록시 경로는 이 통계에 잡히지 않습니다. `GET /v1/proxy_stats` 를 쓰세요.
 
 #### `GET /config`
 현재 서버 설정 조회.
@@ -194,15 +210,21 @@ curl -X POST http://localhost:8765/query \
   "session_id": "uuid-...",
   "result": "4",
   "subtype": "success",
-  "cost_usd": 0.004,
+  "cost_usd": null,
+  "total_cost_usd": 0.0857,
   "usage": {
-    "input_tokens": 512,
-    "output_tokens": 5
+    "input_tokens": 2,
+    "output_tokens": 3,
+    "cache_read_input_tokens": 18112,
+    "cache_creation_input_tokens": 7594
   },
   "num_turns": 1,
-  "duration_ms": 2400
+  "duration_ms": 3180
 }
 ```
+
+`cost_usd` 는 현재 CLI 가 채우지 않아 항상 `null` 입니다. 비용은 `total_cost_usd`
+를 보세요.
 
 #### `POST /query/stream`
 SSE(Server-Sent Events)로 실시간 스트리밍.
@@ -261,6 +283,20 @@ curl -N http://localhost:8765/sessions/abc-123/stream
 ```
 세션의 모든 이벤트를 실시간으로 수신. 기존 히스토리도 먼저 재전송됨.
 
+`options.include_partial_messages: true` 로 세션을 만들면 완성된 메시지 사이에
+`stream_event` 프레임이 끼어 들어옵니다 — 채팅 UI 의 토큰 단위 렌더링용입니다.
+
+```
+data: {"type":"stream_event","session_id":"...","uuid":"...",
+       "stream_event":{"type":"content_block_delta","index":0,
+                       "delta":{"type":"text_delta","text":"stre"}}}
+```
+
+`stream_event` 안은 Messages API 의 스트리밍 이벤트 그대로입니다
+(`message_start` → `content_block_start` → `content_block_delta`* →
+`content_block_stop` → `message_delta` → `message_stop`). `delta.text` 를 순서대로
+이어붙이면 최종 텍스트가 됩니다.
+
 #### `GET /sessions/:id/messages` — 히스토리 조회
 ```bash
 curl "http://localhost:8765/sessions/abc-123/messages?limit=50&offset=0&include_system=false"
@@ -315,17 +351,26 @@ Claude가 도구(Edit, Bash 등)를 실행하기 전 hook 이벤트가 발생. �
   }
 }
 ```
-- `block` — 도구 실행 차단
-- `approve` — 자동 승인
-- `defer` — SSE로 클라이언트에 위임
+- `block` — 도구 실행 차단 (스트림에 `auto_resolved: true` 로 기록됨)
+- `approve` — 자동 승인 (동일)
+- `defer` — SSE로 클라이언트에 위임 (`auto_resolved: false`, 응답 필요)
 
-**B. 클라이언트 응답** — SSE에서 `hook_request` 수신 시 timeout 내 응답:
+**B. 클라이언트 응답** — SSE에서 `hook_request` 수신 시 timeout 내 응답.
+
+> ⚠️ **`auto_resolved` 를 먼저 보세요.** `hook_request` 는 두 경우 모두 나옵니다.
+>
+> - `auto_resolved: false` — 서버에 매칭되는 규칙이 없어 세션이
+>   `waiting_for_hook` 으로 멈춰 있습니다. **응답은 클라이언트 몫입니다.**
+> - `auto_resolved: true` — `hook_rules` 가 이미 CLI에 답했습니다. 관측용 기록일
+>   뿐이고, 여기에 `hook_response` 를 보내면 `409 invalid_state` 가 납니다.
+
 ```bash
 # SSE에서 수신 (request_id는 CLI 제어 프로토콜의 control_request.request_id):
 # data: {"type":"hook_request","request_id":"req-001","callback_id":"hook_0",
-#        "hook_event_name":"PreToolUse","tool_name":"Edit","tool_use_id":"toolu_..."}
+#        "hook_event_name":"PreToolUse","tool_name":"Edit","tool_use_id":"toolu_...",
+#        "auto_resolved":false}
 
-# 30초 내 응답 (decision + reason 혹은 response raw 둘 중 하나 사용):
+# hook_timeout_secs(기본 30초) 안에 응답 — decision + reason 혹은 response raw 중 하나:
 curl -X POST http://localhost:8765/sessions/abc-123/hook_response \
   -H "Content-Type: application/json" \
   -d '{"request_id": "req-001", "decision": "approve"}'
@@ -358,7 +403,13 @@ decision 값:
 | `block` | 도구 실행 차단 (reason 권장) |
 | `defer` | CLI 기본 동작 |
 
-30초 타임아웃 시 자동 `approve`.
+**타임아웃 시 기본 동작은 자동 `block` 입니다** (승인이 아닙니다 — 응답이 없으면
+도구가 실행되지 않습니다). 대기 시간은 `hook_timeout_secs`(기본 30초), 타임아웃
+동작은 `hook_timeout_action`(`block` | `approve`, 기본 `block`)으로 요청마다
+바꿉니다.
+
+타임아웃이 지난 뒤 `hook_response` 를 보내면 `408 hook_timeout` 이 돌아옵니다.
+이 판정은 `hook_timeout_secs` 와 같은 값을 씁니다.
 
 ---
 
@@ -412,7 +463,7 @@ decision 값:
 | `env` | object | null | CLI 환경변수 |
 | `cli_path` | string | null | claude CLI 경로 (기본: PATH 탐색) |
 | `add_dirs` | string[] | null | CLI에 추가로 노출할 작업 디렉토리(`--add-dir`) |
-| `include_partial_messages` | bool | false | 스트리밍 중간 메시지 포함 |
+| `include_partial_messages` | bool | false | 토큰 단위 증분 프레임(`stream_event`) 수신. Messages API 의 `message_start`/`content_block_delta`/`message_stop` 이 그대로 실려 옴 |
 | `output_format` | string | null | CLI wrap 경로에서는 `stream-json`만 지원 |
 | `agents` | object | null | subagent 정의 맵. `initialize` control_request로 전달 |
 | `betas` | string[] | null | 베타 기능 활성화 |

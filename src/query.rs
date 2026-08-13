@@ -19,7 +19,12 @@ pub struct QueryResult {
     pub session_id: String,
     pub result: Option<String>,
     pub subtype: String,
+    /// Per-turn cost. The CLI stopped populating this — prefer
+    /// `total_cost_usd`.
     pub cost_usd: Option<f64>,
+    /// Running cost for the CLI session behind this call. A stateless query
+    /// gets its own CLI session, so this is the cost of this call.
+    pub total_cost_usd: Option<f64>,
     pub usage: Option<SessionUsage>,
     pub num_turns: Option<u32>,
     pub duration_ms: Option<u64>,
@@ -102,6 +107,7 @@ pub async fn query(
             result: r.result,
             subtype: format!("{:?}", r.subtype).to_lowercase(),
             cost_usd: r.cost_usd,
+            total_cost_usd: r.total_cost_usd,
             usage: r.usage,
             num_turns: r.num_turns,
             duration_ms: r.duration_ms,
@@ -243,6 +249,9 @@ pub fn cli_output_to_message(event: CliOutputEvent) -> Message {
                         tool_name: input.tool_name,
                         tool_input: input.tool_input,
                         tool_use_id: hc.tool_use_id,
+                        // The converter cannot know; the session loop, which
+                        // owns the rule evaluation, sets this.
+                        auto_resolved: false,
                     }
                 }
                 ControlRequestPayload::CanUseTool(req) => Message::PermissionRequest {

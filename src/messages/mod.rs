@@ -45,9 +45,14 @@ pub enum Message {
         uuid: Option<String>,
         stream_event: Value,
     },
-    /// A hook_callback control_request surfaced to streaming clients. The
-    /// `request_id` lets the client respond via `/sessions/:id/hook_response`
-    /// when the server has no matching rule (the defer path).
+    /// A hook_callback control_request surfaced to streaming clients.
+    ///
+    /// Check `auto_resolved` before acting. When it is `false` the session is
+    /// parked in `waiting_for_hook` and the client owns the decision — answer
+    /// via `/sessions/:id/hook_response` with `request_id` before
+    /// `hook_timeout_secs` elapses. When it is `true` a server-side
+    /// `hook_rules` entry already answered the CLI and the event is only a
+    /// record of that; responding to it returns `409 invalid_state`.
     HookRequest {
         request_id: String,
         callback_id: String,
@@ -55,6 +60,9 @@ pub enum Message {
         tool_name: Option<String>,
         tool_input: Option<Value>,
         tool_use_id: Option<String>,
+        /// `true` when a `hook_rules` entry already answered this callback.
+        #[serde(default)]
+        auto_resolved: bool,
     },
     /// A can_use_tool control_request surfaced to streaming clients. Clients
     /// answer via `/sessions/:id/permission_response`.

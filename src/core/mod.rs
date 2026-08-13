@@ -9,6 +9,7 @@
 
 pub mod events;
 pub mod session;
+pub mod stats;
 
 /// Epoch millis, saturating to 0 if the clock is before the epoch.
 ///

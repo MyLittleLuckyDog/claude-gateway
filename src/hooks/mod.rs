@@ -111,6 +111,26 @@ fn emit(request_id: String, payload: Value) -> AutoResolveOutcome {
     }
 }
 
+/// How long a deferred hook callback may stay unanswered when the request
+/// doesn't say.
+pub const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
+
+/// The deferred-hook wait for a session.
+///
+/// Both the `WaitingForHook` deadline (which decides whether a client's
+/// `hook_response` is still accepted) and the watchdog that auto-resolves the
+/// callback must come from here. When they diverged, a session configured with
+/// `hook_timeout_secs` above the default rejected client responses past 30s
+/// while the watchdog had not fired yet — the CLI stayed blocked and the
+/// client had no way back in.
+pub fn hook_timeout(options: &ClaudeAgentOptions) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        options
+            .hook_timeout_secs
+            .unwrap_or(DEFAULT_HOOK_TIMEOUT_SECS),
+    )
+}
+
 /// Start a watchdog for a deferred hook callback. The timeout behavior is
 /// request-scoped via session options so callers can choose block vs approve
 /// per task rather than relying on a fixed global policy.
@@ -119,14 +139,15 @@ pub fn spawn_hook_timeout(
     request_id: String,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let timeout_secs = session.options.hook_timeout_secs.unwrap_or(30);
+        let timeout = hook_timeout(&session.options);
+        let timeout_secs = timeout.as_secs();
         let timeout_action = session
             .options
             .hook_timeout_action
             .clone()
             .unwrap_or(HookTimeoutAction::Block);
 
-        tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
+        tokio::time::sleep(timeout).await;
 
         let mut state = session.state.lock().await;
         if let SessionState::WaitingForHook {
@@ -185,8 +206,28 @@ pub fn spawn_hook_timeout(
 mod tests {
     use std::collections::HashMap;
 
-    use super::{build_initialize_request, HookTimeoutAction};
+    use super::{build_initialize_request, hook_timeout, HookTimeoutAction};
     use crate::options::{AgentDefinition, ClaudeAgentOptions, HookAction, HookRule};
+
+    /// The `WaitingForHook` deadline and the watchdog both read this. They
+    /// used to be computed separately, and a session with a longer timeout
+    /// rejected client responses after 30s while still blocking the CLI.
+    #[test]
+    fn hook_timeout_follows_the_request_option() {
+        let opts = ClaudeAgentOptions {
+            hook_timeout_secs: Some(90),
+            ..Default::default()
+        };
+        assert_eq!(hook_timeout(&opts).as_secs(), 90);
+    }
+
+    #[test]
+    fn hook_timeout_defaults_to_30s() {
+        assert_eq!(
+            hook_timeout(&ClaudeAgentOptions::default()).as_secs(),
+            super::DEFAULT_HOOK_TIMEOUT_SECS
+        );
+    }
 
     #[test]
     fn initialize_request_includes_hooks_and_agents() {

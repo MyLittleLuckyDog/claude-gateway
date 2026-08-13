@@ -94,12 +94,74 @@ fn test_parse_hook_request() {
 
 #[test]
 fn test_parse_stream_event() {
+    // Fixture is a real `--include-partial-messages` line, with only the ids
+    // pinned. An earlier hand-written fixture used the wrong key for the
+    // payload, so this test passed while every live partial frame failed to
+    // parse — hence the assertions on the payload itself below.
     let raw = include_str!("fixtures/stream_event.json");
     let event: CliOutputEvent = serde_json::from_str(raw).expect("parse stream event");
     match event {
         CliOutputEvent::StreamEvent(se) => {
             assert_eq!(se.uuid.as_deref(), Some("uuid-v4-123"));
+            assert_eq!(se.session_id, "550e8400-e29b-41d4-a716-446655440000");
+            assert_eq!(se.stream_event["type"], "content_block_delta");
+            assert_eq!(se.stream_event["delta"]["text"], "1");
         }
         _ => panic!("Expected StreamEvent"),
+    }
+}
+
+/// `message_start` carries a `ttft_ms` the other frames don't. An unknown
+/// field must not fail the whole line.
+#[test]
+fn test_parse_stream_event_tolerates_extra_fields() {
+    let raw = r#"{"type":"stream_event","event":{"type":"message_start"},
+                  "session_id":"s","parent_tool_use_id":null,"uuid":"u","ttft_ms":812}"#;
+    match serde_json::from_str::<CliOutputEvent>(raw).expect("parse message_start") {
+        CliOutputEvent::StreamEvent(se) => {
+            assert_eq!(se.stream_event["type"], "message_start");
+        }
+        _ => panic!("Expected StreamEvent"),
+    }
+}
+
+// ── hook_request: does the client still own the decision? ──────────
+
+use claude_agent::messages::Message;
+
+fn hook_request(auto_resolved: bool) -> Message {
+    Message::HookRequest {
+        request_id: "req-1".to_string(),
+        callback_id: "hook_0".to_string(),
+        hook_event_name: "PreToolUse".to_string(),
+        tool_name: Some("Bash".to_string()),
+        tool_input: None,
+        tool_use_id: None,
+        auto_resolved,
+    }
+}
+
+/// `auto_resolved: true` means a hook_rules entry already answered the CLI, so
+/// the event is a record rather than a request — posting hook_response for it
+/// would be rejected with 409.
+#[test]
+fn test_hook_request_reports_whether_it_was_auto_resolved() {
+    let deferred = serde_json::to_value(hook_request(false)).unwrap();
+    assert_eq!(deferred["type"], "hook_request");
+    assert_eq!(deferred["auto_resolved"], false);
+
+    let resolved = serde_json::to_value(hook_request(true)).unwrap();
+    assert_eq!(resolved["auto_resolved"], true);
+}
+
+/// Payloads written before the field existed must still parse.
+#[test]
+fn test_hook_request_defaults_auto_resolved_when_absent() {
+    let raw = r#"{"type":"hook_request","request_id":"r","callback_id":"hook_0",
+                  "hook_event_name":"PreToolUse","tool_name":null,
+                  "tool_input":null,"tool_use_id":null}"#;
+    match serde_json::from_str::<Message>(raw).unwrap() {
+        Message::HookRequest { auto_resolved, .. } => assert!(!auto_resolved),
+        other => panic!("expected HookRequest, got {other:?}"),
     }
 }
