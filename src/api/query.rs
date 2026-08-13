@@ -26,10 +26,7 @@ pub fn routes() -> Router<AppState> {
         .route("/query/stream", post(query_stream_handler))
 }
 
-async fn query_handler(
-    State(state): State<AppState>,
-    Json(req): Json<QueryRequest>,
-) -> Response {
+async fn query_handler(State(state): State<AppState>, Json(req): Json<QueryRequest>) -> Response {
     let options = req.options.unwrap_or_default();
 
     // Track stats
@@ -82,7 +79,9 @@ async fn query_stream_handler(
                 }
                 yield Ok(Event::default().data("[DONE]"));
             };
-            Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
         }
         Err(e) => {
             let status = axum::http::StatusCode::from_u16(e.http_status())

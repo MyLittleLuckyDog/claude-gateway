@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::messages::Message;
 use crate::messages::cli_control::{ControlResponseOut, HookCallbackInput, HookCallbackRequest};
+use crate::messages::Message;
 use crate::options::{ClaudeAgentOptions, HookTimeoutAction};
 use crate::session::{Session, SessionState, MAX_HISTORY_SIZE};
 
@@ -24,9 +24,14 @@ use server_rules::{evaluate_hook_rules, ResolvedDecision};
 ///   ]
 /// }
 /// ```
-pub fn build_initialize_request(options: &ClaudeAgentOptions) -> Option<(Value, HashMap<String, usize>)> {
+pub fn build_initialize_request(
+    options: &ClaudeAgentOptions,
+) -> Option<(Value, HashMap<String, usize>)> {
     let mut request = serde_json::Map::new();
-    request.insert("subtype".to_string(), Value::String("initialize".to_string()));
+    request.insert(
+        "subtype".to_string(),
+        Value::String("initialize".to_string()),
+    );
 
     let mut callback_map: HashMap<String, usize> = HashMap::new();
     if let Some(rules) = options.hook_rules.as_ref() {
@@ -108,10 +113,15 @@ fn emit(request_id: String, payload: Value) -> AutoResolveOutcome {
 /// Start a watchdog for a deferred hook callback. The timeout behavior is
 /// request-scoped via session options so callers can choose block vs approve
 /// per task rather than relying on a fixed global policy.
-pub fn spawn_hook_timeout(session: Arc<Session>, request_id: String) -> tokio::task::JoinHandle<()> {
+pub fn spawn_hook_timeout(
+    session: Arc<Session>,
+    request_id: String,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let timeout_secs = session.options.hook_timeout_secs.unwrap_or(30);
-        let timeout_action = session.options.hook_timeout_action
+        let timeout_action = session
+            .options
+            .hook_timeout_action
             .clone()
             .unwrap_or(HookTimeoutAction::Block);
 

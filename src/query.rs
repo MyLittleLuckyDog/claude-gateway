@@ -3,7 +3,9 @@ use tokio::sync::mpsc;
 use crate::config::AppConfig;
 use crate::error::GatewayError;
 use crate::hooks::{self, AutoResolveOutcome};
-use crate::messages::cli_control::{ControlRequest, ControlRequestOut, ControlRequestPayload, ControlResponseOut};
+use crate::messages::cli_control::{
+    ControlRequest, ControlRequestOut, ControlRequestPayload, ControlResponseOut,
+};
 use crate::messages::cli_input::{CliInputMessage, CliUserInput, InputContent};
 use crate::messages::cli_output::{CliOutputEvent, CliResultEvent, SystemSubtype};
 use crate::messages::{AssistantMessage, Message, SessionUsage};
@@ -50,7 +52,8 @@ pub async fn query(
     let mut transport = CliTransport::new(options.clone(), config.clone());
     transport.connect().await?;
 
-    let mut event_rx = transport.event_receiver()
+    let mut event_rx = transport
+        .event_receiver()
         .ok_or_else(|| GatewayError::Internal("No event receiver".to_string()))?;
 
     send_initialize_if_needed(&transport, &options).await?;
@@ -119,7 +122,8 @@ pub async fn query_stream(
     let mut transport = CliTransport::new(options.clone(), config.clone());
     transport.connect().await?;
 
-    let mut event_rx = transport.event_receiver()
+    let mut event_rx = transport
+        .event_receiver()
         .ok_or_else(|| GatewayError::Internal("No event receiver".to_string()))?;
 
     send_initialize_if_needed(&transport, &options).await?;
@@ -269,10 +273,7 @@ async fn send_initialize_if_needed<T: Transport>(
     options: &ClaudeAgentOptions,
 ) -> Result<(), GatewayError> {
     if let Some((payload, _)) = hooks::build_initialize_request(options) {
-        let request = ControlRequestOut::new(
-            format!("init-{}", uuid::Uuid::new_v4()),
-            payload,
-        );
+        let request = ControlRequestOut::new(format!("init-{}", uuid::Uuid::new_v4()), payload);
         let json = serde_json::to_string(&request)
             .map_err(|e| GatewayError::Internal(format!("JSON serialize error: {}", e)))?;
         transport.write(&json).await?;
@@ -300,11 +301,13 @@ async fn handle_stateless_control_request<T: Transport>(
                             "reason": "stateless /query cannot service deferred hook callbacks; use /sessions instead",
                         }),
                     );
-                    let json = serde_json::to_string(&response)
-                        .map_err(|e| GatewayError::Internal(format!("JSON serialize error: {}", e)))?;
+                    let json = serde_json::to_string(&response).map_err(|e| {
+                        GatewayError::Internal(format!("JSON serialize error: {}", e))
+                    })?;
                     transport.write(&json).await?;
                     Ok(Some(Message::Error {
-                        message: "Deferred hook callback auto-blocked in stateless /query".to_string(),
+                        message: "Deferred hook callback auto-blocked in stateless /query"
+                            .to_string(),
                         code: "stateless_hook_callback".to_string(),
                     }))
                 }
@@ -349,9 +352,9 @@ mod tests {
 
     use super::{cli_output_to_message, handle_stateless_control_request};
     use crate::error::GatewayError;
-    use crate::messages::Message;
     use crate::messages::cli_control::ControlRequest;
     use crate::messages::cli_output::CliOutputEvent;
+    use crate::messages::Message;
     use crate::options::{ClaudeAgentOptions, HookAction, HookRule};
     use crate::transport::Transport;
     use tokio::sync::mpsc;
@@ -362,15 +365,27 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Transport for RecordingTransport {
-        async fn connect(&mut self) -> Result<(), GatewayError> { Ok(()) }
+        async fn connect(&mut self) -> Result<(), GatewayError> {
+            Ok(())
+        }
         async fn write(&self, data: &str) -> Result<(), GatewayError> {
             self.writes.lock().unwrap().push(data.to_string());
             Ok(())
         }
-        async fn close(&mut self) -> Result<(), GatewayError> { Ok(()) }
-        fn is_ready(&self) -> bool { true }
-        fn session_id(&self) -> Option<&str> { None }
-        fn event_receiver(&mut self) -> Option<mpsc::Receiver<Result<CliOutputEvent, GatewayError>>> { None }
+        async fn close(&mut self) -> Result<(), GatewayError> {
+            Ok(())
+        }
+        fn is_ready(&self) -> bool {
+            true
+        }
+        fn session_id(&self) -> Option<&str> {
+            None
+        }
+        fn event_receiver(
+            &mut self,
+        ) -> Option<mpsc::Receiver<Result<CliOutputEvent, GatewayError>>> {
+            None
+        }
     }
 
     #[test]

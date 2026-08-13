@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};

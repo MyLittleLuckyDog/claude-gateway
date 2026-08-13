@@ -1,9 +1,9 @@
+use async_trait::async_trait;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
-use async_trait::async_trait;
 
 use crate::config::AppConfig;
 use crate::error::GatewayError;
@@ -46,10 +46,15 @@ impl CliTransport {
         }
     }
 
-    fn build_command(options: &ClaudeAgentOptions, config: &AppConfig) -> Result<Command, GatewayError> {
+    fn build_command(
+        options: &ClaudeAgentOptions,
+        config: &AppConfig,
+    ) -> Result<Command, GatewayError> {
         Self::validate_output_format(options)?;
 
-        let cli_path = options.cli_path.clone()
+        let cli_path = options
+            .cli_path
+            .clone()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| {
                 if config.cli.bin_path.is_empty() {
@@ -68,15 +73,16 @@ impl CliTransport {
             cmd.arg("--model").arg(model);
         }
 
-        let perm_mode = options.permission_mode.as_ref()
+        let perm_mode = options
+            .permission_mode
+            .as_ref()
             .map(|m| m.as_str())
             .unwrap_or("default");
         cmd.arg("--permission-mode").arg(perm_mode);
 
-        let permission_prompt_tool = options.permission_prompt_tool
-            .as_deref()
-            .unwrap_or("stdio");
-        cmd.arg("--permission-prompt-tool").arg(permission_prompt_tool);
+        let permission_prompt_tool = options.permission_prompt_tool.as_deref().unwrap_or("stdio");
+        cmd.arg("--permission-prompt-tool")
+            .arg(permission_prompt_tool);
 
         if let Some(sp) = &options.system_prompt {
             cmd.arg("--system-prompt").arg(sp);
@@ -149,9 +155,9 @@ impl CliTransport {
         }
 
         cmd.stdin(Stdio::piped())
-           .stdout(Stdio::piped())
-           .stderr(Stdio::piped())
-           .kill_on_drop(true);
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
 
         Ok(cmd)
     }
@@ -176,14 +182,18 @@ impl Transport for CliTransport {
         }
 
         tracing::debug!("spawning CLI: {:?}", cmd.as_std());
-        let mut child = cmd.spawn().map_err(|e| {
-            GatewayError::CliConnection(format!("Failed to spawn CLI: {}", e))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| GatewayError::CliConnection(format!("Failed to spawn CLI: {}", e)))?;
         tracing::debug!("CLI process spawned, pid={:?}", child.id());
 
-        let stdout = child.stdout.take()
+        let stdout = child
+            .stdout
+            .take()
             .ok_or_else(|| GatewayError::CliConnection("No stdout pipe".to_string()))?;
-        let stdin = child.stdin.take()
+        let stdin = child
+            .stdin
+            .take()
             .ok_or_else(|| GatewayError::CliConnection("No stdin pipe".to_string()))?;
         let stderr = child.stderr.take();
 
@@ -208,9 +218,12 @@ impl Transport for CliTransport {
     }
 
     async fn write(&self, data: &str) -> Result<(), GatewayError> {
-        let tx = self.stdin_tx.as_ref()
+        let tx = self
+            .stdin_tx
+            .as_ref()
             .ok_or_else(|| GatewayError::Internal("Transport not connected".to_string()))?;
-        tx.send(data.to_string()).await
+        tx.send(data.to_string())
+            .await
             .map_err(|_| GatewayError::Internal("stdin channel closed".to_string()))
     }
 
@@ -220,13 +233,11 @@ impl Transport for CliTransport {
 
         if let Some(ref mut child) = self.child {
             // Wait up to 3 seconds for graceful exit
-            let wait_result = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                child.wait(),
-            ).await;
+            let wait_result =
+                tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
 
             match wait_result {
-                Ok(Ok(_status)) => {},
+                Ok(Ok(_status)) => {}
                 Ok(Err(e)) => {
                     tracing::warn!("Error waiting for CLI process: {}", e);
                 }
@@ -278,11 +289,12 @@ async fn stdout_parser_task(
                     continue;
                 }
 
-                let event = serde_json::from_str::<CliOutputEvent>(&trimmed)
-                    .map_err(|e| GatewayError::JsonDecode {
+                let event = serde_json::from_str::<CliOutputEvent>(&trimmed).map_err(|e| {
+                    GatewayError::JsonDecode {
                         line: trimmed,
                         source: e,
-                    });
+                    }
+                });
 
                 if event_tx.send(event).await.is_err() {
                     break;
@@ -297,10 +309,7 @@ async fn stdout_parser_task(
     }
 }
 
-async fn stdin_writer_task(
-    mut stdin: tokio::process::ChildStdin,
-    mut rx: mpsc::Receiver<String>,
-) {
+async fn stdin_writer_task(mut stdin: tokio::process::ChildStdin, mut rx: mpsc::Receiver<String>) {
     while let Some(data) = rx.recv().await {
         let line = if data.ends_with('\n') {
             data
@@ -379,9 +388,13 @@ mod tests {
             .map(|arg| arg.to_string_lossy().to_string())
             .collect();
 
-        assert!(args.windows(2).any(|w| w == ["--fallback-model", "claude-opus-4-1"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--fallback-model", "claude-opus-4-1"]));
         assert!(args.windows(2).any(|w| w == ["--max-budget-usd", "2.5"]));
-        assert!(args.windows(2).any(|w| w == ["--permission-prompt-tool", "stdio"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["--permission-prompt-tool", "stdio"]));
         assert!(args.iter().any(|arg| arg == "--include-partial-messages"));
         assert!(args.iter().any(|arg| arg == "--include-hook-events"));
         assert!(args.iter().any(|arg| arg == "--fork-session"));

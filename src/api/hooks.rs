@@ -50,7 +50,10 @@ pub struct PermissionResponseRequest {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/sessions/:id/hook_response", post(hook_response))
-        .route("/sessions/:id/permission_response", post(permission_response))
+        .route(
+            "/sessions/:id/permission_response",
+            post(permission_response),
+        )
         .route("/sessions/:id/interrupt", post(interrupt))
 }
 
@@ -67,7 +70,10 @@ async fn hook_response(
     {
         let current_state = session.state.lock().await;
         match &*current_state {
-            SessionState::WaitingForHook { request_id, deadline } => {
+            SessionState::WaitingForHook {
+                request_id,
+                deadline,
+            } => {
                 if *request_id != body.request_id {
                     return error_response(&GatewayError::InvalidSessionState {
                         expected: format!("waiting for request {}", body.request_id),
@@ -128,10 +134,7 @@ async fn hook_response(
     }
 }
 
-async fn interrupt(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn interrupt(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.sessions.get(&id) {
         Ok(s) => s,
         Err(e) => return error_response(&e),

@@ -1,5 +1,10 @@
 use std::sync::Arc;
 
+use super::AppState;
+use crate::codex::options::CodexOptions;
+use crate::codex_app;
+use crate::codex_app::session::CodexAppSessionState;
+use crate::error::{ErrorResponse, GatewayError};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -12,11 +17,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use super::AppState;
-use crate::codex::options::CodexOptions;
-use crate::codex_app;
-use crate::codex_app::session::CodexAppSessionState;
-use crate::error::{ErrorResponse, GatewayError};
 
 #[derive(Deserialize)]
 pub struct CreateCodexAppSessionRequest {
@@ -64,7 +64,10 @@ pub fn routes() -> Router<AppState> {
         .route("/codex/app/sessions/:id/send", post(send_message))
         .route("/codex/app/sessions/:id/stream", get(stream_session))
         .route("/codex/app/sessions/:id/messages", get(get_messages))
-        .route("/codex/app/sessions/:id/approval_response", post(approval_response))
+        .route(
+            "/codex/app/sessions/:id/approval_response",
+            post(approval_response),
+        )
 }
 
 async fn create_session(
@@ -105,10 +108,7 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
     Json(json!(list))
 }
 
-async fn delete_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     if state.codex_app_sessions.remove(&id) {
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -163,10 +163,7 @@ async fn approval_response(
     }
 }
 
-async fn stream_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn stream_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.codex_app_sessions.get(&id) {
         Ok(s) => s,
         Err(e) => return error_response(&e),
@@ -200,7 +197,9 @@ async fn stream_session(
         }
     };
 
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 async fn get_messages(

@@ -52,23 +52,47 @@ pub fn routes() -> Router<AppState> {
 fn validate_request(body: &serde_json::Value) -> Option<Response> {
     let obj = match body.as_object() {
         Some(o) => o,
-        None => return Some(error_response(400, "invalid_request", "Request body must be a JSON object")),
+        None => {
+            return Some(error_response(
+                400,
+                "invalid_request",
+                "Request body must be a JSON object",
+            ))
+        }
     };
 
     // model is required
     if !obj.contains_key("model") {
-        return Some(error_response(400, "invalid_request", "Missing required field: model"));
+        return Some(error_response(
+            400,
+            "invalid_request",
+            "Missing required field: model",
+        ));
     }
 
     // messages is required and must be non-empty array
     match obj.get("messages") {
-        None => return Some(error_response(400, "invalid_request", "Missing required field: messages")),
+        None => {
+            return Some(error_response(
+                400,
+                "invalid_request",
+                "Missing required field: messages",
+            ))
+        }
         Some(v) => {
             if !v.is_array() {
-                return Some(error_response(400, "invalid_request", "messages must be an array"));
+                return Some(error_response(
+                    400,
+                    "invalid_request",
+                    "messages must be an array",
+                ));
             }
             if v.as_array().map(|a| a.is_empty()).unwrap_or(true) {
-                return Some(error_response(400, "invalid_request", "messages must not be empty"));
+                return Some(error_response(
+                    400,
+                    "invalid_request",
+                    "messages must not be empty",
+                ));
             }
         }
     }
@@ -77,10 +101,18 @@ fn validate_request(body: &serde_json::Value) -> Option<Response> {
     if let Some(mt) = obj.get("max_tokens") {
         if let Some(n) = mt.as_u64() {
             if n == 0 {
-                return Some(error_response(400, "invalid_request", "max_tokens must be > 0"));
+                return Some(error_response(
+                    400,
+                    "invalid_request",
+                    "max_tokens must be > 0",
+                ));
             }
             if n > 128_000 {
-                return Some(error_response(400, "invalid_request", "max_tokens exceeds maximum (128000)"));
+                return Some(error_response(
+                    400,
+                    "invalid_request",
+                    "max_tokens exceeds maximum (128000)",
+                ));
             }
         }
     }
@@ -91,14 +123,18 @@ fn validate_request(body: &serde_json::Value) -> Option<Response> {
 /// Common request preprocessing: validate, extract betas, normalize model,
 /// default max_tokens. Returns (forward_body, extra_betas) or an error Response.
 #[allow(clippy::result_large_err)]
-fn preprocess_request(body: &serde_json::Value) -> Result<(serde_json::Value, Option<Vec<String>>), Response> {
+fn preprocess_request(
+    body: &serde_json::Value,
+) -> Result<(serde_json::Value, Option<Vec<String>>), Response> {
     if let Some(err) = validate_request(body) {
         return Err(err);
     }
 
-    let extra_betas = body.get("betas")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>());
+    let extra_betas = body.get("betas").and_then(|v| v.as_array()).map(|arr| {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect::<Vec<_>>()
+    });
 
     let mut forward_body = body.clone();
     if let Some(obj) = forward_body.as_object_mut() {
@@ -112,7 +148,10 @@ fn preprocess_request(body: &serde_json::Value) -> Result<(serde_json::Value, Op
             let default_mt = crate::models::default_max_tokens(&canonical);
             obj.insert("model".to_string(), serde_json::Value::String(canonical));
             if needs_max_tokens {
-                obj.insert("max_tokens".to_string(), serde_json::Value::Number(default_mt.into()));
+                obj.insert(
+                    "max_tokens".to_string(),
+                    serde_json::Value::Number(default_mt.into()),
+                );
             }
         }
     }
@@ -143,10 +182,12 @@ async fn messages_handler(
         forward_body,
         extra_betas.as_deref(),
         &session_id,
-    ).await {
+    )
+    .await
+    {
         Ok((resp_body, upstream_status)) => {
-            let status = StatusCode::from_u16(upstream_status)
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status =
+                StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (status, Json(resp_body)).into_response()
         }
         Err(e) => proxy_error_response(e),
@@ -176,12 +217,15 @@ async fn messages_stream_handler(
         forward_body,
         extra_betas.as_deref(),
         &session_id,
-    ).await {
+    )
+    .await
+    {
         Ok((resp, upstream_status)) => {
             if upstream_status != 200 {
                 // Non-200: read body as JSON error
-                let body = resp.json::<serde_json::Value>().await
-                    .unwrap_or_else(|_| json!({"error": {"type": "unknown", "message": "Unknown upstream error"}}));
+                let body = resp.json::<serde_json::Value>().await.unwrap_or_else(
+                    |_| json!({"error": {"type": "unknown", "message": "Unknown upstream error"}}),
+                );
                 let status = StatusCode::from_u16(upstream_status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return (status, Json(body)).into_response();
@@ -204,9 +248,7 @@ async fn messages_stream_handler(
 }
 
 /// GET /v1/rate_limit — current rate limit status
-async fn rate_limit_handler(
-    State(state): State<AppState>,
-) -> Response {
+async fn rate_limit_handler(State(state): State<AppState>) -> Response {
     let proxy_state = match state.proxy.as_ref() {
         Some(ps) => ps,
         None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
@@ -222,13 +264,12 @@ async fn rate_limit_handler(
         "rate_limit_type": rl.rate_limit_type,
         "overage_status": rl.overage_status,
         "overage_disabled_reason": rl.overage_disabled_reason,
-    })).into_response()
+    }))
+    .into_response()
 }
 
 /// GET /v1/proxy_stats — proxy usage statistics
-async fn proxy_stats_handler(
-    State(state): State<AppState>,
-) -> Response {
+async fn proxy_stats_handler(State(state): State<AppState>) -> Response {
     let proxy_state = match state.proxy.as_ref() {
         Some(ps) => ps,
         None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
@@ -239,7 +280,8 @@ async fn proxy_stats_handler(
         "total_input_tokens": proxy_state.total_input_tokens.load(Ordering::Relaxed),
         "total_output_tokens": proxy_state.total_output_tokens.load(Ordering::Relaxed),
         "concurrent_permits_available": proxy_state.semaphore.available_permits(),
-    })).into_response()
+    }))
+    .into_response()
 }
 
 /// GET /v1/auth_status — check OAuth token status
@@ -253,13 +295,13 @@ async fn auth_status_handler() -> Response {
                 "subscription_type": token.subscription_type,
                 "rate_limit_tier": token.rate_limit_tier,
                 "expires_at": token.expires_at,
-            })).into_response()
+            }))
+            .into_response()
         }
-        Err(msg) => {
-            Json(json!({
-                "authenticated": false,
-                "error": msg,
-            })).into_response()
-        }
+        Err(msg) => Json(json!({
+            "authenticated": false,
+            "error": msg,
+        }))
+        .into_response(),
     }
 }

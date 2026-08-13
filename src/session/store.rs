@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use dashmap::DashMap;
-use crate::error::GatewayError;
 use super::Session;
+use crate::error::GatewayError;
+use dashmap::DashMap;
+use std::sync::Arc;
 
 pub struct SessionStore {
     sessions: DashMap<String, Arc<Session>>,
@@ -21,14 +21,17 @@ impl SessionStore {
     pub fn insert(&self, session: Arc<Session>) -> Result<(), GatewayError> {
         let _guard = self.op_lock.lock().unwrap();
         if self.sessions.len() >= self.max_sessions {
-            return Err(GatewayError::SessionLimitReached { max: self.max_sessions });
+            return Err(GatewayError::SessionLimitReached {
+                max: self.max_sessions,
+            });
         }
         self.sessions.insert(session.id.clone(), session);
         Ok(())
     }
 
     pub fn get(&self, id: &str) -> Result<Arc<Session>, GatewayError> {
-        self.sessions.get(id)
+        self.sessions
+            .get(id)
             .map(|r| r.value().clone())
             .ok_or_else(|| GatewayError::SessionNotFound(id.to_string()))
     }
@@ -56,7 +59,9 @@ impl SessionStore {
 
         for entry in self.sessions.iter() {
             let session = entry.value();
-            let last_ms = session.last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
+            let last_ms = session
+                .last_activity_ms
+                .load(std::sync::atomic::Ordering::Relaxed);
             let state = session.state.lock().await.clone();
             if (now_ms.saturating_sub(last_ms)) > timeout_ms || state == super::SessionState::Dead {
                 to_remove.push(entry.key().clone());
@@ -73,8 +78,8 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
 
     use tokio::sync::{broadcast, mpsc, Mutex};
 

@@ -5,7 +5,9 @@ use crate::options::{ClaudeAgentOptions, HookAction};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedDecision {
     Approve,
-    Block { reason: Option<String> },
+    Block {
+        reason: Option<String>,
+    },
     /// No rule fully resolved this callback — let the client decide.
     Defer,
 }

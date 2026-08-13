@@ -111,8 +111,14 @@ pub struct ToolInfo {
 
 /// Parse a tools array that could be either Vec<String> or Vec<ToolInfo>
 pub fn parse_tool_names(tools: &[Value]) -> Vec<String> {
-    tools.iter().filter_map(|t| {
-        t.as_str().map(|s| s.to_string())
-            .or_else(|| t.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()))
-    }).collect()
+    tools
+        .iter()
+        .filter_map(|t| {
+            t.as_str().map(|s| s.to_string()).or_else(|| {
+                t.get("name")
+                    .and_then(|n| n.as_str())
+                    .map(|s| s.to_string())
+            })
+        })
+        .collect()
 }

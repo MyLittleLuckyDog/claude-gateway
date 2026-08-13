@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
 
 use axum::{
     extract::{Path, Query, State},
@@ -98,7 +98,9 @@ async fn query_stream_handler(
                 }
                 yield Ok(Event::default().data("[DONE]"));
             };
-            Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
         }
         Err(e) => error_response(&e),
     }
@@ -155,10 +157,7 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
     Json(serde_json::json!(list))
 }
 
-async fn delete_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     if state.codex_sessions.remove(&id) {
         StatusCode::NO_CONTENT.into_response()
     } else {
@@ -206,10 +205,7 @@ async fn send_message(
     (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response()
 }
 
-async fn stream_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Response {
+async fn stream_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.codex_sessions.get(&id) {
         Ok(s) => s,
         Err(e) => return error_response(&e),
@@ -243,7 +239,9 @@ async fn stream_session(
         }
     };
 
-    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 async fn get_messages(

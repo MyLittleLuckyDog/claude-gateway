@@ -243,10 +243,7 @@ pub fn inject_billing_system_block(body: &mut serde_json::Value) {
         }
         // No system field — create a fresh array with just the marker.
         _ => {
-            obj.insert(
-                "system".to_string(),
-                serde_json::json!([marker_block]),
-            );
+            obj.insert("system".to_string(), serde_json::json!([marker_block]));
         }
     }
 }

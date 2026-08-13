@@ -194,7 +194,10 @@ mod tests {
 
     #[test]
     fn test_resolve_aliases() {
-        assert_eq!(resolve_model("haiku").unwrap().id, "claude-haiku-4-5-20251001");
+        assert_eq!(
+            resolve_model("haiku").unwrap().id,
+            "claude-haiku-4-5-20251001"
+        );
         assert_eq!(resolve_model("sonnet").unwrap().id, "claude-sonnet-4-6");
         assert_eq!(resolve_model("opus").unwrap().id, "claude-opus-4-6");
         assert_eq!(resolve_model("claude-opus").unwrap().id, "claude-opus-4-6");
@@ -202,7 +205,10 @@ mod tests {
 
     #[test]
     fn test_resolve_full_id() {
-        assert_eq!(resolve_model("claude-sonnet-4-20250514").unwrap().id, "claude-sonnet-4-20250514");
+        assert_eq!(
+            resolve_model("claude-sonnet-4-20250514").unwrap().id,
+            "claude-sonnet-4-20250514"
+        );
     }
 
     #[test]

@@ -23,7 +23,9 @@ impl CodexSessionStore {
     pub fn insert(&self, session: Arc<CodexSession>) -> Result<(), GatewayError> {
         let _guard = self.op_lock.lock().unwrap();
         if self.sessions.len() >= self.max_sessions {
-            return Err(GatewayError::SessionLimitReached { max: self.max_sessions });
+            return Err(GatewayError::SessionLimitReached {
+                max: self.max_sessions,
+            });
         }
         self.sessions.insert(session.id.clone(), session);
         Ok(())

@@ -15,7 +15,10 @@ pub enum GatewayError {
     ProcessCrash { detail: String },
 
     #[error("JSON decode error for line `{line}`: {source}")]
-    JsonDecode { line: String, source: serde_json::Error },
+    JsonDecode {
+        line: String,
+        source: serde_json::Error,
+    },
 
     #[error("Session not found: {0}")]
     SessionNotFound(String),

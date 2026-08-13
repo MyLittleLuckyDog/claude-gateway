@@ -80,16 +80,34 @@ fn default_proxy_config() -> ProxyConfig {
     }
 }
 
-fn default_max_concurrent() -> usize { 1 }
-fn default_max_proxy_sessions() -> usize { 50 }
-fn default_proxy_idle_timeout() -> u64 { 1800 }
-fn default_proxy_enabled() -> bool { true }
+fn default_max_concurrent() -> usize {
+    1
+}
+fn default_max_proxy_sessions() -> usize {
+    50
+}
+fn default_proxy_idle_timeout() -> u64 {
+    1800
+}
+fn default_proxy_enabled() -> bool {
+    true
+}
 
-fn default_host() -> String { "127.0.0.1".to_string() }
-fn default_port() -> u16 { 8765 }
-fn default_max_sessions() -> usize { 100 }
-fn default_bin_path() -> String { String::new() }
-fn default_idle_timeout() -> u64 { 1800 }
+fn default_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_port() -> u16 {
+    8765
+}
+fn default_max_sessions() -> usize {
+    100
+}
+fn default_bin_path() -> String {
+    String::new()
+}
+fn default_idle_timeout() -> u64 {
+    1800
+}
 
 impl Default for AppConfig {
     fn default() -> Self {

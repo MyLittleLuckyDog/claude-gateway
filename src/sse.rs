@@ -311,7 +311,10 @@ impl StreamAccumulator {
                 }
             }
 
-            StreamEvent::ContentBlockStart { index, content_block } => {
+            StreamEvent::ContentBlockStart {
+                index,
+                content_block,
+            } => {
                 self.init_block(*index, content_block);
             }
 
@@ -381,13 +384,14 @@ impl StreamAccumulator {
                 name: name.clone(),
                 json_fragments: String::new(),
             },
-            ContentBlock::Thinking { thinking, signature } => AccBlock::Thinking {
+            ContentBlock::Thinking {
+                thinking,
+                signature,
+            } => AccBlock::Thinking {
                 thinking: thinking.clone(),
                 signature: signature.clone(),
             },
-            ContentBlock::RedactedThinking { data } => {
-                AccBlock::RedactedThinking(data.clone())
-            }
+            ContentBlock::RedactedThinking { data } => AccBlock::RedactedThinking(data.clone()),
         };
         self.blocks.insert(index, acc);
     }
@@ -398,39 +402,39 @@ impl StreamAccumulator {
                 match self.blocks.get_mut(&index) {
                     Some(AccBlock::Text(buf)) => buf.push_str(text),
                     // If block wasn't started, create it
-                    None => { self.blocks.insert(index, AccBlock::Text(text.clone())); }
+                    None => {
+                        self.blocks.insert(index, AccBlock::Text(text.clone()));
+                    }
                     _ => {}
                 }
             }
-            ContentDelta::InputJsonDelta { partial_json } => {
-                match self.blocks.get_mut(&index) {
-                    Some(AccBlock::ToolUse { json_fragments, .. }) => {
-                        json_fragments.push_str(partial_json);
-                    }
-                    _ => {
-                        tracing::warn!(
-                            "input_json_delta for index {index} without matching tool_use block"
-                        );
-                    }
+            ContentDelta::InputJsonDelta { partial_json } => match self.blocks.get_mut(&index) {
+                Some(AccBlock::ToolUse { json_fragments, .. }) => {
+                    json_fragments.push_str(partial_json);
                 }
-            }
-            ContentDelta::ThinkingDelta { thinking } => {
-                match self.blocks.get_mut(&index) {
-                    Some(AccBlock::Thinking { thinking: buf, .. }) => {
-                        buf.push_str(thinking);
-                    }
-                    None => {
-                        self.blocks.insert(index, AccBlock::Thinking {
+                _ => {
+                    tracing::warn!(
+                        "input_json_delta for index {index} without matching tool_use block"
+                    );
+                }
+            },
+            ContentDelta::ThinkingDelta { thinking } => match self.blocks.get_mut(&index) {
+                Some(AccBlock::Thinking { thinking: buf, .. }) => {
+                    buf.push_str(thinking);
+                }
+                None => {
+                    self.blocks.insert(
+                        index,
+                        AccBlock::Thinking {
                             thinking: thinking.clone(),
                             signature: None,
-                        });
-                    }
-                    _ => {}
+                        },
+                    );
                 }
-            }
+                _ => {}
+            },
             ContentDelta::SignatureDelta { signature } => {
-                if let Some(AccBlock::Thinking { signature: sig, .. }) =
-                    self.blocks.get_mut(&index)
+                if let Some(AccBlock::Thinking { signature: sig, .. }) = self.blocks.get_mut(&index)
                 {
                     match sig {
                         Some(s) => s.push_str(signature),
@@ -456,16 +460,18 @@ impl AccBlock {
                     "text": text,
                 }))
             }
-            AccBlock::ToolUse { id, name, json_fragments } => {
+            AccBlock::ToolUse {
+                id,
+                name,
+                json_fragments,
+            } => {
                 // Parse accumulated JSON fragments into a Value.
                 // If parsing fails, store as raw string to avoid data loss.
                 let input = if json_fragments.is_empty() {
                     serde_json::json!({})
                 } else {
                     serde_json::from_str(json_fragments).unwrap_or_else(|e| {
-                        tracing::warn!(
-                            "Failed to parse tool_use input JSON for {name}: {e}"
-                        );
+                        tracing::warn!("Failed to parse tool_use input JSON for {name}: {e}");
                         serde_json::json!({"_raw": json_fragments})
                     })
                 };
@@ -476,19 +482,18 @@ impl AccBlock {
                     "input": input,
                 }))
             }
-            AccBlock::Thinking { thinking, signature } => {
-                Some(serde_json::json!({
-                    "type": "thinking",
-                    "thinking": thinking,
-                    "signature": signature,
-                }))
-            }
-            AccBlock::RedactedThinking(data) => {
-                Some(serde_json::json!({
-                    "type": "redacted_thinking",
-                    "data": data,
-                }))
-            }
+            AccBlock::Thinking {
+                thinking,
+                signature,
+            } => Some(serde_json::json!({
+                "type": "thinking",
+                "thinking": thinking,
+                "signature": signature,
+            })),
+            AccBlock::RedactedThinking(data) => Some(serde_json::json!({
+                "type": "redacted_thinking",
+                "data": data,
+            })),
         }
     }
 }
@@ -612,15 +617,21 @@ mod tests {
 
         acc.process_event(&StreamEvent::ContentBlockStart {
             index: 0,
-            content_block: ContentBlock::Text { text: String::new() },
+            content_block: ContentBlock::Text {
+                text: String::new(),
+            },
         });
         acc.process_event(&StreamEvent::ContentBlockDelta {
             index: 0,
-            delta: ContentDelta::TextDelta { text: "Hello ".to_string() },
+            delta: ContentDelta::TextDelta {
+                text: "Hello ".to_string(),
+            },
         });
         acc.process_event(&StreamEvent::ContentBlockDelta {
             index: 0,
-            delta: ContentDelta::TextDelta { text: "world".to_string() },
+            delta: ContentDelta::TextDelta {
+                text: "world".to_string(),
+            },
         });
         acc.process_event(&StreamEvent::ContentBlockStop { index: 0 });
         acc.process_event(&StreamEvent::MessageStop {});
@@ -681,11 +692,15 @@ mod tests {
         // Text at index 0
         acc.process_event(&StreamEvent::ContentBlockStart {
             index: 0,
-            content_block: ContentBlock::Text { text: String::new() },
+            content_block: ContentBlock::Text {
+                text: String::new(),
+            },
         });
         acc.process_event(&StreamEvent::ContentBlockDelta {
             index: 0,
-            delta: ContentDelta::TextDelta { text: "Let me check.".to_string() },
+            delta: ContentDelta::TextDelta {
+                text: "Let me check.".to_string(),
+            },
         });
         acc.process_event(&StreamEvent::ContentBlockStop { index: 0 });
 
@@ -767,15 +782,21 @@ mod tests {
         });
         acc.process_event(&StreamEvent::ContentBlockDelta {
             index: 0,
-            delta: ContentDelta::ThinkingDelta { thinking: "step 1, ".to_string() },
+            delta: ContentDelta::ThinkingDelta {
+                thinking: "step 1, ".to_string(),
+            },
         });
         acc.process_event(&StreamEvent::ContentBlockDelta {
             index: 0,
-            delta: ContentDelta::ThinkingDelta { thinking: "step 2".to_string() },
+            delta: ContentDelta::ThinkingDelta {
+                thinking: "step 2".to_string(),
+            },
         });
         acc.process_event(&StreamEvent::ContentBlockDelta {
             index: 0,
-            delta: ContentDelta::SignatureDelta { signature: "sig_abc".to_string() },
+            delta: ContentDelta::SignatureDelta {
+                signature: "sig_abc".to_string(),
+            },
         });
         acc.process_event(&StreamEvent::ContentBlockStop { index: 0 });
         acc.process_event(&StreamEvent::MessageStop {});
