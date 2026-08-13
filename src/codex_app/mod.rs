@@ -17,7 +17,7 @@ use crate::core::now_epoch_ms;
 use crate::error::GatewayError;
 
 use self::session::{CodexAppSession, CodexAppSessionState, PendingApproval};
-use crate::core::events::record_and_broadcast;
+use crate::core::events::{record_and_broadcast, Seq};
 
 fn codex_cli_path(options: &CodexOptions) -> String {
     options
@@ -144,7 +144,13 @@ fn build_history_event(event_type: &str, payload: Value) -> Arc<Value> {
 }
 
 async fn record_event(session: &CodexAppSession, event: Arc<Value>) {
-    record_and_broadcast(&session.history, &session.event_tx, event).await;
+    record_and_broadcast(
+        &session.history,
+        &session.event_tx,
+        &session.next_seq,
+        event,
+    )
+    .await;
 }
 
 async fn handle_incoming_value(session: Arc<CodexAppSession>, value: Value) {
@@ -371,7 +377,7 @@ pub async fn create_session(
     let stderr = child.stderr.take();
 
     let (stdin_tx, stdin_rx) = mpsc::channel::<String>(64);
-    let (event_tx, _) = broadcast::channel::<Arc<Value>>(1024);
+    let (event_tx, _) = broadcast::channel::<Seq<Value>>(1024);
     let session = Arc::new(CodexAppSession {
         id: session_id.clone(),
         thread_id: Arc::new(Mutex::new(None)),
@@ -383,6 +389,7 @@ pub async fn create_session(
         stdin_tx,
         event_tx,
         history: Arc::new(Mutex::new(VecDeque::new())),
+        next_seq: AtomicU64::new(0),
         pending_requests: Arc::new(Mutex::new(HashMap::new())),
         pending_approval: Arc::new(Mutex::new(None)),
         next_request_id: AtomicU64::new(1000),

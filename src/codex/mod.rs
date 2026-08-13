@@ -399,7 +399,13 @@ pub async fn run_session_turn(
                 *session.thread_id.lock().await = Some(thread_id);
             }
             for event in result.events {
-                record_and_broadcast(&session.history, &session.event_tx, Arc::new(event)).await;
+                record_and_broadcast(
+                    &session.history,
+                    &session.event_tx,
+                    &session.next_seq,
+                    Arc::new(event),
+                )
+                .await;
             }
             *session.state.lock().await = CodexSessionState::Idle;
             session
@@ -412,7 +418,13 @@ pub async fn run_session_turn(
                 message: e.to_string(),
                 code: e.error_code().to_string(),
             });
-            record_and_broadcast(&session.history, &session.event_tx, event).await;
+            record_and_broadcast(
+                &session.history,
+                &session.event_tx,
+                &session.next_seq,
+                event,
+            )
+            .await;
             *session.state.lock().await = CodexSessionState::Idle;
             Err(e)
         }

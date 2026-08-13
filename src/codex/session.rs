@@ -6,6 +6,7 @@ use tokio::sync::{broadcast, Mutex};
 
 use crate::codex::messages::CodexEvent;
 use crate::codex::options::CodexOptions;
+use crate::core::events::Seq;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodexSessionState {
@@ -31,6 +32,8 @@ pub struct CodexSession {
     pub created_at: std::time::Instant,
     pub last_activity_ms: AtomicU64,
     pub options: CodexOptions,
-    pub event_tx: broadcast::Sender<Arc<CodexEvent>>,
-    pub history: Arc<Mutex<VecDeque<Arc<CodexEvent>>>>,
+    pub event_tx: broadcast::Sender<Seq<CodexEvent>>,
+    pub history: Arc<Mutex<VecDeque<Seq<CodexEvent>>>>,
+    /// See `Session::next_seq`.
+    pub next_seq: AtomicU64,
 }

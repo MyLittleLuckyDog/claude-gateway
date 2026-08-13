@@ -1,11 +1,10 @@
-use std::sync::Arc;
-
 use super::{gateway_error_response, AppState};
 use crate::codex::options::CodexOptions;
 use crate::codex_app;
 use crate::codex_app::session::CodexAppSessionState;
-use crate::core::events::sse_replay_then_follow;
+use crate::core::events::{resume_point, sse_replay_then_follow, Replay, Seq};
 use crate::error::GatewayError;
+use axum::http::HeaderMap;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -52,6 +51,16 @@ pub struct MessagesQuery {
 
 fn default_limit() -> usize {
     50
+}
+
+/// Attach policy for `GET /sessions/:id/stream`.
+///
+/// A query parameter rather than a header because `EventSource` — the browser
+/// API this endpoint exists for — cannot set request headers.
+#[derive(Deserialize, Default)]
+pub struct StreamQuery {
+    #[serde(default)]
+    pub replay: Replay,
 }
 
 pub fn routes() -> Router<AppState> {
@@ -161,16 +170,21 @@ async fn approval_response(
     }
 }
 
-async fn stream_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+async fn stream_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<StreamQuery>,
+    headers: HeaderMap,
+) -> Response {
     let session = match state.codex_app_sessions.get(&id) {
         Ok(s) => s,
         Err(e) => return gateway_error_response(&e),
     };
 
-    let history: Vec<Arc<Value>> = session.history.lock().await.iter().cloned().collect();
+    let history: Vec<Seq<Value>> = session.history.lock().await.iter().cloned().collect();
     let rx = session.event_tx.subscribe();
 
-    sse_replay_then_follow(history, rx).into_response()
+    sse_replay_then_follow(history, rx, resume_point(&headers, query.replay)).into_response()
 }
 
 async fn get_messages(
@@ -189,7 +203,7 @@ async fn get_messages(
         .iter()
         .skip(params.offset)
         .take(params.limit)
-        .map(|event| event.as_ref().clone())
+        .map(|entry| entry.event.as_ref().clone())
         .collect();
 
     Json(json!({
