@@ -1,4 +1,4 @@
-use super::{gateway_error_response, AppState};
+use super::{gateway_error_response, reject_disallowed_codex_options, AppState};
 use crate::codex::options::CodexOptions;
 use crate::codex_app;
 use crate::codex_app::session::CodexAppSessionState;
@@ -81,8 +81,13 @@ async fn create_session(
     State(state): State<AppState>,
     Json(req): Json<CreateCodexAppSessionRequest>,
 ) -> Response {
+    let options = req.options.unwrap_or_default();
+    if let Some(rejected) = reject_disallowed_codex_options(&state, &options) {
+        return rejected;
+    }
+
     match codex_app::create_session(
-        req.options.unwrap_or_default(),
+        options,
         state.codex_app_sessions.clone(),
         state.config.clone(),
     )

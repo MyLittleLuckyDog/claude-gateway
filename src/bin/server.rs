@@ -38,7 +38,18 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let mut config = AppConfig::load().unwrap_or_default();
+    // Falling back to defaults here would be silent: one unreadable setting
+    // would revert every other one too, including the CORS allow-list.
+    let mut config = match AppConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Configuration error: {e}");
+            eprintln!(
+                "Fix config.toml or the CLAUDE_GATEWAY__* environment, or unset it to use defaults."
+            );
+            std::process::exit(2);
+        }
+    };
 
     // CLI args override config
     if let Some(port) = cli.port {
@@ -46,6 +57,13 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(host) = cli.host {
         config.server.host = host;
+    }
+
+    // Checked after the CLI overrides, since --host is how the gateway is
+    // usually exposed.
+    if let Err(e) = config.check_exposure() {
+        eprintln!("Refusing to start: {e}");
+        std::process::exit(2);
     }
 
     let config = Arc::new(config);
