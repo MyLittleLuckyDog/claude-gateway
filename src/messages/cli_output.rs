@@ -72,7 +72,16 @@ pub struct CliUserEvent {
 
 #[derive(Debug, Deserialize)]
 pub struct CliResultEvent {
-    pub subtype: ResultSubtype,
+    /// The CLI's own verdict on the turn: `success`, `error_max_turns`,
+    /// `error_during_execution`, `error_max_budget_usd`,
+    /// `error_max_structured_output_retries`, and whatever it adds next.
+    ///
+    /// Kept as the raw string on purpose. Nothing here branches on it — the
+    /// gateway forwards the verdict rather than interpreting it — so a typed
+    /// enum bought nothing and cost the whole line whenever the CLI used a name
+    /// it didn't know. It did: three of the five names never matched, so every
+    /// failed turn was dropped instead of reported.
+    pub subtype: String,
     pub session_id: String,
     pub result: Option<String>,
     pub error: Option<String>,
@@ -82,16 +91,6 @@ pub struct CliResultEvent {
     pub num_turns: Option<u32>,
     pub duration_ms: Option<u64>,
     pub duration_api_ms: Option<u64>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum ResultSubtype {
-    Success,
-    ErrorDuringGeneration,
-    MaxTurnsReached,
-    MaxBudgetUsdExceeded,
-    ErrorMaxStructuredOutputRetries,
 }
 
 #[derive(Debug, Deserialize)]

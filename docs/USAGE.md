@@ -305,12 +305,29 @@ curl -X POST http://localhost:8765/query \
     "cache_creation_input_tokens": 7594
   },
   "num_turns": 1,
-  "duration_ms": 3180
+  "duration_ms": 3180,
+  "duration_api_ms": 2960
 }
 ```
 
 `cost_usd` 는 현재 CLI 가 채우지 않아 항상 `null` 입니다. 비용은 `total_cost_usd`
 를 보세요.
+
+`duration_ms` 는 CLI 가 잰 턴의 실제 경과 시간입니다. 호출자가 잰 시간에서 이걸
+빼면 게이트웨이와 프로세스 기동 비용이 나옵니다 — `duration_ms` 는 CLI 자신의
+기동 시간을 제외하므로, 세션의 **첫 턴**에서는 그 차이에 `claude` 프로세스가 뜨는
+약 400ms 가 들어갑니다. 워밍된 턴에서는 10ms 미만입니다.
+
+`duration_api_ms` 는 API 호출에 쓴 시간의 **합계**이지 `duration_ms` 의 부분집합이
+아닙니다. 한 턴이 API 를 여러 번 부르면 합이 경과 시간을 넘길 수 있습니다
+(실측: `duration_ms` 7,395 에 `duration_api_ms` 8,106, `num_turns` 2). 비율로
+쓰지 말고 API 부하의 크기로만 보세요.
+
+`subtype` 은 CLI 의 판정을 **그대로** 전달합니다. 지금까지 관측된 값은
+`success`, `error_max_turns`, `error_during_execution`, `error_max_budget_usd`,
+`error_max_structured_output_retries` 이지만, CLI 가 값을 추가하면 게이트웨이는
+그것도 그대로 넘깁니다. `success` 인지만 확인하고 나머지는 문자열로 다루세요 —
+목록을 열거해 분기하면 CLI 가 늘어날 때 깨집니다.
 
 #### `POST /query/stream`
 SSE(Server-Sent Events)로 실시간 스트리밍.

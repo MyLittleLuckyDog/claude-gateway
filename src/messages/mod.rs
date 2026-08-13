@@ -38,7 +38,14 @@ pub enum Message {
         total_cost_usd: Option<f64>,
         usage: Option<SessionUsage>,
         num_turns: Option<u32>,
+        /// Wall time for the turn, as the CLI measures it. Excludes the CLI's
+        /// own startup, so on a session's first turn it runs ~400ms short of
+        /// what the caller sees.
         duration_ms: Option<u64>,
+        /// Time the CLI spent waiting on the API. Subtracting it from
+        /// `duration_ms` is the only way a client can tell model latency from
+        /// gateway latency.
+        duration_api_ms: Option<u64>,
     },
     StreamEvent {
         session_id: String,

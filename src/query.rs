@@ -18,6 +18,7 @@ use crate::transport::Transport;
 pub struct QueryResult {
     pub session_id: String,
     pub result: Option<String>,
+    /// The CLI's verdict, forwarded verbatim — `success`, `error_max_turns`, …
     pub subtype: String,
     /// Per-turn cost. The CLI stopped populating this — prefer
     /// `total_cost_usd`.
@@ -28,6 +29,9 @@ pub struct QueryResult {
     pub usage: Option<SessionUsage>,
     pub num_turns: Option<u32>,
     pub duration_ms: Option<u64>,
+    /// Total API time for the turn, summed over calls. Not a share of
+    /// `duration_ms` — it can exceed it.
+    pub duration_api_ms: Option<u64>,
 }
 
 /// Build the user message JSON string
@@ -105,12 +109,13 @@ pub async fn query(
         Some(r) => Ok(QueryResult {
             session_id,
             result: r.result,
-            subtype: format!("{:?}", r.subtype).to_lowercase(),
+            subtype: r.subtype,
             cost_usd: r.cost_usd,
             total_cost_usd: r.total_cost_usd,
             usage: r.usage,
             num_turns: r.num_turns,
             duration_ms: r.duration_ms,
+            duration_api_ms: r.duration_api_ms,
         }),
         None => Err(GatewayError::CliConnection(
             "CLI process exited without result".to_string(),
@@ -223,7 +228,7 @@ pub fn cli_output_to_message(event: CliOutputEvent) -> Message {
         },
         CliOutputEvent::Result(r) => Message::Result {
             session_id: r.session_id,
-            subtype: format!("{:?}", r.subtype).to_lowercase(),
+            subtype: r.subtype,
             result: r.result,
             error: r.error,
             cost_usd: r.cost_usd,
@@ -231,6 +236,7 @@ pub fn cli_output_to_message(event: CliOutputEvent) -> Message {
             usage: r.usage,
             num_turns: r.num_turns,
             duration_ms: r.duration_ms,
+            duration_api_ms: r.duration_api_ms,
         },
         CliOutputEvent::StreamEvent(se) => Message::StreamEvent {
             session_id: se.session_id,
@@ -359,7 +365,7 @@ async fn handle_stateless_control_request<T: Transport>(
 mod tests {
     use serde_json::json;
 
-    use super::{cli_output_to_message, handle_stateless_control_request};
+    use super::{cli_output_to_message, handle_stateless_control_request, QueryResult};
     use crate::error::GatewayError;
     use crate::messages::cli_control::ControlRequest;
     use crate::messages::cli_output::CliOutputEvent;
@@ -463,5 +469,38 @@ mod tests {
         let writes = transport.writes.lock().unwrap();
         let response: serde_json::Value = serde_json::from_str(&writes[0]).unwrap();
         assert_eq!(response["response"]["response"]["decision"], "block");
+    }
+
+    /// The verdict has to reach the caller as the CLI wrote it.
+    ///
+    /// This is the shape a client actually receives, which is where two bugs
+    /// hid: `format!("{:?}")` on the old enum flattened
+    /// `ErrorMaxStructuredOutputRetries` to one word, and once the field became
+    /// a String the same call started wrapping every value in quote characters
+    /// — `"success"`, quotes and all. Parsing tests could not see either,
+    /// because both happened on the way out.
+    #[test]
+    fn query_result_reports_the_subtype_verbatim() {
+        for subtype in [
+            "success",
+            "error_max_turns",
+            "error_max_structured_output_retries",
+        ] {
+            let wire = serde_json::to_value(QueryResult {
+                session_id: "s1".to_string(),
+                result: Some("ok".to_string()),
+                subtype: subtype.to_string(),
+                cost_usd: None,
+                total_cost_usd: Some(0.5),
+                usage: None,
+                num_turns: Some(1),
+                duration_ms: Some(3180),
+                duration_api_ms: Some(2960),
+            })
+            .unwrap();
+
+            assert_eq!(wire["subtype"], subtype);
+            assert_eq!(wire["duration_api_ms"], 2960);
+        }
     }
 }
