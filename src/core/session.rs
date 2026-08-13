@@ -108,6 +108,30 @@ impl<S: ManagedSession> SessionStore<S> {
         }
     }
 
+    /// Empty the store, stopping every session in it.
+    ///
+    /// Used on shutdown. Sessions stop concurrently because each one waits on
+    /// its own process to exit; serially, a hundred sessions would take a
+    /// hundred times as long to drain.
+    pub async fn shutdown_all(&self) {
+        let sessions: Vec<Arc<S>> = {
+            let _guard = self.op_lock.lock().unwrap();
+            let all = self.sessions.iter().map(|r| r.value().clone()).collect();
+            self.sessions.clear();
+            all
+        };
+        if sessions.is_empty() {
+            return;
+        }
+        tracing::info!("Stopping {} {} session(s)", sessions.len(), S::kind());
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for session in sessions {
+            tasks.spawn(async move { session.shutdown().await });
+        }
+        while tasks.join_next().await.is_some() {}
+    }
+
     pub fn count(&self) -> usize {
         self.sessions.len()
     }
@@ -290,13 +314,18 @@ mod tests {
         assert_eq!(ids, vec!["live".to_string()]);
     }
 
-    /// A zero timeout must not reap a session that was just active: the
-    /// comparison is strictly greater-than.
+    /// Reaping is strictly greater-than, so elapsed == timeout keeps the
+    /// session. Zero is the boundary worth pinning: every session is momentarily
+    /// at zero elapsed.
+    ///
+    /// The stamp is nudged ahead because `run_cleanup` reads the clock itself.
+    /// Stamping a bare `now_epoch_ms()` only held while both calls landed in the
+    /// same millisecond — which failed roughly one run in fifteen.
     #[tokio::test]
-    async fn zero_timeout_keeps_a_session_active_this_instant() {
+    async fn zero_elapsed_is_not_past_a_zero_timeout() {
         let store = SessionStore::new(4);
         store
-            .insert(FakeSession::new("now", now_epoch_ms(), false))
+            .insert(FakeSession::new("now", now_epoch_ms() + 60_000, false))
             .unwrap();
 
         store.run_cleanup(0).await;
