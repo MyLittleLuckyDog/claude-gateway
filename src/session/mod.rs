@@ -8,9 +8,6 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use crate::messages::Message;
 use crate::options::ClaudeAgentOptions;
 
-/// Maximum number of messages retained in session history.
-pub const MAX_HISTORY_SIZE: usize = 500;
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionState {
     Initializing,

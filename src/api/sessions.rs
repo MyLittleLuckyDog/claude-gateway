@@ -1,10 +1,7 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
-    },
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -12,9 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
-use super::AppState;
+use super::{gateway_error_response, AppState};
 use crate::client;
-use crate::error::{ErrorResponse, GatewayError};
+use crate::core::events::sse_replay_then_follow;
+use crate::error::GatewayError;
 use crate::messages::cli_input::{CliInputMessage, CliUserInput, ImageSource, InputContent};
 use crate::messages::Message;
 use crate::options::ClaudeAgentOptions;
@@ -79,7 +77,7 @@ async fn create_session(
             };
             (StatusCode::CREATED, Json(resp)).into_response()
         }
-        Err(e) => error_response(&e),
+        Err(e) => gateway_error_response(&e),
     }
 }
 
@@ -101,7 +99,7 @@ async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -
     if state.sessions.remove(&id) {
         StatusCode::NO_CONTENT.into_response()
     } else {
-        error_response(&GatewayError::SessionNotFound(id))
+        gateway_error_response(&GatewayError::SessionNotFound(id))
     }
 }
 
@@ -112,7 +110,7 @@ async fn send_message(
 ) -> Response {
     let session = match state.sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
 
     // Atomic check-and-set: acquire lock once, verify state, transition to Running
@@ -123,7 +121,7 @@ async fn send_message(
                 *current_state = SessionState::Running;
                 previous
             }
-            Err(e) => return error_response(&e),
+            Err(e) => return gateway_error_response(&e),
         }
     };
 
@@ -148,7 +146,9 @@ async fn send_message(
 
     let json = match serde_json::to_string(&msg) {
         Ok(j) => j,
-        Err(e) => return error_response(&GatewayError::Internal(format!("JSON error: {}", e))),
+        Err(e) => {
+            return gateway_error_response(&GatewayError::Internal(format!("JSON error: {}", e)))
+        }
     };
 
     // Lock-free activity timestamp
@@ -164,7 +164,7 @@ async fn send_message(
         Ok(_) => (StatusCode::ACCEPTED, Json(serde_json::json!({}))).into_response(),
         Err(_) => {
             *session.state.lock().await = previous_state;
-            error_response(&GatewayError::Internal("stdin closed".to_string()))
+            gateway_error_response(&GatewayError::Internal("stdin closed".to_string()))
         }
     }
 }
@@ -182,46 +182,14 @@ fn take_sendable_state(current_state: &SessionState) -> Result<SessionState, Gat
 async fn stream_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
 
     // Clone Arc refs (cheap) not full Messages
     let history: Vec<Arc<Message>> = session.history.lock().await.iter().cloned().collect();
-    let mut rx = session.event_tx.subscribe();
+    let rx = session.event_tx.subscribe();
 
-    let stream = async_stream::stream! {
-        // Send history first
-        for (idx, msg) in history.iter().enumerate() {
-            if let Ok(data) = serde_json::to_string(msg.as_ref()) {
-                yield Ok::<_, axum::Error>(Event::default().id(idx.to_string()).data(data));
-            }
-        }
-
-        let mut current_idx = history.len();
-        loop {
-            match rx.recv().await {
-                Ok(msg) => {
-                    let is_terminal = matches!(msg.as_ref(), Message::Result { .. } | Message::Error { .. });
-                    if let Ok(data) = serde_json::to_string(msg.as_ref()) {
-                        yield Ok(Event::default().id(current_idx.to_string()).data(data));
-                    }
-                    current_idx += 1;
-                    if is_terminal {
-                        // Don't break for multi-turn — wait for more
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    let err = serde_json::json!({"type":"error","message":format!("Lagged: {} events skipped", n),"code":"stream_lagged"});
-                    yield Ok(Event::default().data(err.to_string()));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    };
-
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    sse_replay_then_follow(history, rx).into_response()
 }
 
 async fn get_messages(
@@ -231,7 +199,7 @@ async fn get_messages(
 ) -> Response {
     let session = match state.sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
 
     let history = session.history.lock().await;
@@ -265,7 +233,7 @@ async fn get_messages(
 async fn fork_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
 
     // Get the CLI session ID to use with --resume
@@ -273,7 +241,7 @@ async fn fork_session(State(state): State<AppState>, Path(id): Path<String>) -> 
     let cli_session_id = match cli_session_id {
         Some(id) => id,
         None => {
-            return error_response(&GatewayError::InvalidSessionState {
+            return gateway_error_response(&GatewayError::InvalidSessionState {
                 expected: "session with CLI session ID".to_string(),
                 actual: "no CLI session ID (not yet initialized)".to_string(),
             });
@@ -293,14 +261,8 @@ async fn fork_session(State(state): State<AppState>, Path(id): Path<String>) -> 
             };
             (StatusCode::CREATED, Json(resp)).into_response()
         }
-        Err(e) => error_response(&e),
+        Err(e) => gateway_error_response(&e),
     }
-}
-
-fn error_response(e: &GatewayError) -> Response {
-    let status = axum::http::StatusCode::from_u16(e.http_status())
-        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(ErrorResponse::from(e))).into_response()
 }
 
 #[cfg(test)]

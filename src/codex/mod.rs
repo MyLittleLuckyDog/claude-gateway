@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use crate::config::AppConfig;
+use crate::core::now_epoch_ms;
 use crate::error::GatewayError;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -18,14 +19,8 @@ use self::messages::{
     RawCodexEvent,
 };
 use self::options::{CodexApprovalPolicy, CodexOptions, CodexSandboxMode};
-use self::session::{CodexSession, CodexSessionState, MAX_CODEX_HISTORY_SIZE};
-
-fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use self::session::{CodexSession, CodexSessionState};
+use crate::core::events::record_and_broadcast;
 
 fn codex_cli_path(options: &CodexOptions) -> String {
     options
@@ -404,14 +399,7 @@ pub async fn run_session_turn(
                 *session.thread_id.lock().await = Some(thread_id);
             }
             for event in result.events {
-                let arc = Arc::new(event);
-                let mut history = session.history.lock().await;
-                history.push_back(arc.clone());
-                while history.len() > MAX_CODEX_HISTORY_SIZE {
-                    history.pop_front();
-                }
-                drop(history);
-                let _ = session.event_tx.send(arc);
+                record_and_broadcast(&session.history, &session.event_tx, Arc::new(event)).await;
             }
             *session.state.lock().await = CodexSessionState::Idle;
             session
@@ -424,13 +412,7 @@ pub async fn run_session_turn(
                 message: e.to_string(),
                 code: e.error_code().to_string(),
             });
-            let mut history = session.history.lock().await;
-            history.push_back(event.clone());
-            while history.len() > MAX_CODEX_HISTORY_SIZE {
-                history.pop_front();
-            }
-            drop(history);
-            let _ = session.event_tx.send(event);
+            record_and_broadcast(&session.history, &session.event_tx, event).await;
             *session.state.lock().await = CodexSessionState::Idle;
             Err(e)
         }

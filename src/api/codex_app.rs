@@ -1,17 +1,15 @@
 use std::sync::Arc;
 
-use super::AppState;
+use super::{gateway_error_response, AppState};
 use crate::codex::options::CodexOptions;
 use crate::codex_app;
 use crate::codex_app::session::CodexAppSessionState;
-use crate::error::{ErrorResponse, GatewayError};
+use crate::core::events::sse_replay_then_follow;
+use crate::error::GatewayError;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::{
-        sse::{Event, KeepAlive, Sse},
-        IntoResponse, Response,
-    },
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -89,7 +87,7 @@ async fn create_session(
             }),
         )
             .into_response(),
-        Err(e) => error_response(&e),
+        Err(e) => gateway_error_response(&e),
     }
 }
 
@@ -112,7 +110,7 @@ async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -
     if state.codex_app_sessions.remove(&id) {
         StatusCode::NO_CONTENT.into_response()
     } else {
-        error_response(&GatewayError::SessionNotFound(id))
+        gateway_error_response(&GatewayError::SessionNotFound(id))
     }
 }
 
@@ -123,12 +121,12 @@ async fn send_message(
 ) -> Response {
     let session = match state.codex_app_sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
     {
         let state = session.state.lock().await.clone();
         if state != CodexAppSessionState::Idle {
-            return error_response(&GatewayError::InvalidSessionState {
+            return gateway_error_response(&GatewayError::InvalidSessionState {
                 expected: "idle".to_string(),
                 actual: state.to_string(),
             });
@@ -136,7 +134,7 @@ async fn send_message(
     }
     match codex_app::send_turn(session, req.message).await {
         Ok(_) => (StatusCode::ACCEPTED, Json(json!({}))).into_response(),
-        Err(e) => error_response(&e),
+        Err(e) => gateway_error_response(&e),
     }
 }
 
@@ -147,7 +145,7 @@ async fn approval_response(
 ) -> Response {
     let session = match state.codex_app_sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
 
     let response = match req.response {
@@ -159,47 +157,20 @@ async fn approval_response(
 
     match codex_app::send_approval_response(session, &req.request_id, response).await {
         Ok(_) => (StatusCode::ACCEPTED, Json(json!({}))).into_response(),
-        Err(e) => error_response(&e),
+        Err(e) => gateway_error_response(&e),
     }
 }
 
 async fn stream_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.codex_app_sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
 
     let history: Vec<Arc<Value>> = session.history.lock().await.iter().cloned().collect();
-    let mut rx = session.event_tx.subscribe();
+    let rx = session.event_tx.subscribe();
 
-    let stream = async_stream::stream! {
-        for (idx, event) in history.iter().enumerate() {
-            if let Ok(data) = serde_json::to_string(event.as_ref()) {
-                yield Ok::<_, axum::Error>(Event::default().id(idx.to_string()).data(data));
-            }
-        }
-
-        let mut current_idx = history.len();
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if let Ok(data) = serde_json::to_string(event.as_ref()) {
-                        yield Ok(Event::default().id(current_idx.to_string()).data(data));
-                    }
-                    current_idx += 1;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    let err = json!({"type":"error","message":format!("Lagged: {} events skipped", n),"code":"stream_lagged"});
-                    yield Ok(Event::default().data(err.to_string()));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    };
-
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    sse_replay_then_follow(history, rx).into_response()
 }
 
 async fn get_messages(
@@ -209,7 +180,7 @@ async fn get_messages(
 ) -> Response {
     let session = match state.codex_app_sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
 
     let history = session.history.lock().await;
@@ -229,12 +200,6 @@ async fn get_messages(
         "messages": messages,
     }))
     .into_response()
-}
-
-fn error_response(e: &GatewayError) -> Response {
-    let status = axum::http::StatusCode::from_u16(e.http_status())
-        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(ErrorResponse::from(e))).into_response()
 }
 
 #[cfg(test)]

@@ -16,12 +16,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, Mutex};
 
-use super::AppState;
+use super::{gateway_error_response, AppState};
 use crate::codex;
 use crate::codex::messages::CodexEvent;
 use crate::codex::options::CodexOptions;
 use crate::codex::session::{CodexSession, CodexSessionState};
-use crate::error::{ErrorResponse, GatewayError};
+use crate::core::events::sse_replay_then_follow;
+use crate::error::GatewayError;
 
 #[derive(Deserialize)]
 pub struct CodexQueryRequest {
@@ -78,7 +79,7 @@ async fn query_handler(
     let options = req.options.unwrap_or_default();
     match codex::query(&req.prompt, options, &state.config).await {
         Ok(result) => Json(result).into_response(),
-        Err(e) => error_response(&e),
+        Err(e) => gateway_error_response(&e),
     }
 }
 
@@ -102,7 +103,7 @@ async fn query_stream_handler(
                 .keep_alive(KeepAlive::default())
                 .into_response()
         }
-        Err(e) => error_response(&e),
+        Err(e) => gateway_error_response(&e),
     }
 }
 
@@ -137,7 +138,7 @@ async fn create_session(
             }),
         )
             .into_response(),
-        Err(e) => error_response(&e),
+        Err(e) => gateway_error_response(&e),
     }
 }
 
@@ -161,7 +162,7 @@ async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -
     if state.codex_sessions.remove(&id) {
         StatusCode::NO_CONTENT.into_response()
     } else {
-        error_response(&GatewayError::SessionNotFound(id))
+        gateway_error_response(&GatewayError::SessionNotFound(id))
     }
 }
 
@@ -172,13 +173,13 @@ async fn send_message(
 ) -> Response {
     let session = match state.codex_sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
 
     {
         let mut current_state = session.state.lock().await;
         if *current_state != CodexSessionState::Idle {
-            return error_response(&GatewayError::InvalidSessionState {
+            return gateway_error_response(&GatewayError::InvalidSessionState {
                 expected: "idle".to_string(),
                 actual: current_state.to_string(),
             });
@@ -208,40 +209,13 @@ async fn send_message(
 async fn stream_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.codex_sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
 
     let history: Vec<Arc<CodexEvent>> = session.history.lock().await.iter().cloned().collect();
-    let mut rx = session.event_tx.subscribe();
+    let rx = session.event_tx.subscribe();
 
-    let stream = async_stream::stream! {
-        for (idx, event) in history.iter().enumerate() {
-            if let Ok(data) = serde_json::to_string(event.as_ref()) {
-                yield Ok::<_, axum::Error>(Event::default().id(idx.to_string()).data(data));
-            }
-        }
-
-        let mut current_idx = history.len();
-        loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    if let Ok(data) = serde_json::to_string(event.as_ref()) {
-                        yield Ok(Event::default().id(current_idx.to_string()).data(data));
-                    }
-                    current_idx += 1;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    let err = serde_json::json!({"type":"error","message":format!("Lagged: {} events skipped", n),"code":"stream_lagged"});
-                    yield Ok(Event::default().data(err.to_string()));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    };
-
-    Sse::new(stream)
-        .keep_alive(KeepAlive::default())
-        .into_response()
+    sse_replay_then_follow(history, rx).into_response()
 }
 
 async fn get_messages(
@@ -251,7 +225,7 @@ async fn get_messages(
 ) -> Response {
     let session = match state.codex_sessions.get(&id) {
         Ok(s) => s,
-        Err(e) => return error_response(&e),
+        Err(e) => return gateway_error_response(&e),
     };
 
     let history = session.history.lock().await;
@@ -270,10 +244,4 @@ async fn get_messages(
         "messages": messages,
     }))
     .into_response()
-}
-
-fn error_response(e: &GatewayError) -> Response {
-    let status = axum::http::StatusCode::from_u16(e.http_status())
-        .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(ErrorResponse::from(e))).into_response()
 }

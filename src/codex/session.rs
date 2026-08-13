@@ -7,8 +7,6 @@ use tokio::sync::{broadcast, Mutex};
 use crate::codex::messages::CodexEvent;
 use crate::codex::options::CodexOptions;
 
-pub const MAX_CODEX_HISTORY_SIZE: usize = 500;
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodexSessionState {
     Idle,
