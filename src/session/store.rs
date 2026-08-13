@@ -24,4 +24,10 @@ impl ManagedSession for Session {
     async fn is_terminal(&self) -> bool {
         *self.state.lock().await == SessionState::Dead
     }
+
+    async fn shutdown(&self) {
+        // A permit is stored if the loop is not parked on `notified()` right
+        // now, so a delete that lands mid-turn still stops it.
+        self.cancel.notify_one();
+    }
 }

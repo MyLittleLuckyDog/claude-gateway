@@ -194,18 +194,60 @@ async fn main() -> anyhow::Result<()> {
         openai_oauth,
     };
 
+    let shutdown_state = state.clone();
     let app = api::build_router(state);
 
     let addr = format!("{}:{}", config.server.host, config.server.port);
     tracing::info!("Starting claude-agent-rs on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
 
-    tracing::info!("Server shut down gracefully");
+    // Fires once the signal has arrived *and* the sessions are stopped, so the
+    // grace period below times only what is left over.
+    let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+
+    let server = std::future::IntoFuture::into_future(
+        axum::serve(listener, app).with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            // Stop sessions before axum starts waiting on connections. A session
+            // stream ends when the last sender for its events drops, so draining
+            // the stores is what lets those connections finish on their own —
+            // without it axum waits for a stream that by design never ends.
+            stop_all_sessions(&shutdown_state).await;
+            let _ = drained_tx.send(());
+        }),
+    );
+    tokio::pin!(server);
+
+    tokio::select! {
+        result = &mut server => {
+            result?;
+            tracing::info!("Server shut down gracefully");
+        }
+        _ = async {
+            let _ = drained_rx.await;
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+        } => {
+            // Something is still holding a connection — an in-flight /query, a
+            // client that stopped reading. Exiting is correct: the sessions and
+            // their subprocesses are already gone, which is what leaked before.
+            tracing::warn!(
+                "Connections still open {}s after draining; exiting anyway",
+                SHUTDOWN_GRACE.as_secs()
+            );
+        }
+    }
     Ok(())
+}
+
+/// How long to wait for connections that outlive the sessions they were
+/// watching, before exiting regardless.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn stop_all_sessions(state: &AppState) {
+    state.sessions.shutdown_all().await;
+    state.codex_sessions.shutdown_all().await;
+    state.codex_app_sessions.shutdown_all().await;
 }
 
 async fn shutdown_signal() {

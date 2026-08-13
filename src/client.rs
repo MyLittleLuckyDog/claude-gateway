@@ -30,6 +30,7 @@ pub async fn create_session(
     let (event_tx, _) = broadcast::channel::<Seq<Message>>(1024);
     let history = Arc::new(Mutex::new(VecDeque::<Seq<Message>>::new()));
     let state = Arc::new(Mutex::new(SessionState::Initializing));
+    let cancel = Arc::new(tokio::sync::Notify::new());
 
     let session = Arc::new(Session {
         id: session_id.clone(),
@@ -43,6 +44,7 @@ pub async fn create_session(
         history: history.clone(),
         hook_timeout_handle: Arc::new(Mutex::new(None)),
         next_seq: std::sync::atomic::AtomicU64::new(0),
+        cancel: cancel.clone(),
     });
 
     store.insert(session.clone())?;
@@ -73,34 +75,49 @@ async fn run_session_loop(
     // with the session.
     let mut seen_cost = 0.0;
 
-    // Wait for the first stdin message before spawning CLI
-    let first_msg = match stdin_rx.recv().await {
-        Some(msg) => msg,
-        None => {
-            tracing::info!(
-                "session {} stdin closed before first message",
-                session_id_str
-            );
+    // Start the CLI now rather than on the first message. Everything the spawn
+    // needs is in `options`, which the caller supplied at creation, and the
+    // process takes ~400ms to become ready — time an interactive client spends
+    // waiting for someone to finish typing. Waiting put that on the critical
+    // path of the first answer instead.
+    //
+    // The cost is that an abandoned session holds a `claude` process until the
+    // idle sweep takes it, where before it held only a struct.
+    tracing::debug!("session {}: spawning CLI", session_id_str);
+
+    let mut transport = CliTransport::new(options.clone(), (*config).clone());
+
+    // Failing to start is now a creation-time event, so it has to reach the
+    // client rather than only the server log. Returning `?` here would skip the
+    // `Dead` at the end of this function, and `is_terminal` only recognises
+    // `Dead` — the session would sit in `Initializing`, answering nothing,
+    // until the idle sweep eventually noticed it.
+    let start = transport.connect().await.and_then(|()| {
+        transport
+            .event_receiver()
+            .ok_or_else(|| GatewayError::Internal("No event receiver".to_string()))
+    });
+    let mut event_rx = match start {
+        Ok(rx) => rx,
+        Err(e) => {
+            tracing::error!("session {} failed to start CLI: {}", session_id_str, e);
+            broadcast_and_record(
+                &session,
+                Arc::new(Message::Error {
+                    message: e.to_string(),
+                    code: e.error_code().to_string(),
+                }),
+            )
+            .await;
             *session.state.lock().await = SessionState::Dead;
-            return Ok(());
+            return Err(e);
         }
     };
 
-    tracing::debug!(
-        "session {}: first message received, spawning CLI",
-        session_id_str
-    );
-
-    let mut transport = CliTransport::new(options.clone(), (*config).clone());
-    transport.connect().await?;
-
-    let mut event_rx = transport
-        .event_receiver()
-        .ok_or_else(|| GatewayError::Internal("No event receiver".to_string()))?;
-
     // Register hook callbacks with the CLI via an initialize control_request
-    // BEFORE we relay the user's first message. Without this step the CLI
-    // never routes PreToolUse events back to us and hook_rules are dead.
+    // before any user message reaches it. Without this step the CLI never
+    // routes PreToolUse events back to us and hook_rules are dead. Ordering is
+    // guaranteed because nothing reads stdin_rx until the loop below.
     let callback_map: HashMap<String, usize> = match hooks::build_initialize_request(&options) {
         Some((init_payload, cbmap)) => {
             let req_id = format!("init-{}", uuid::Uuid::new_v4());
@@ -124,8 +141,8 @@ async fn run_session_loop(
         None => HashMap::new(),
     };
 
-    transport.write(&first_msg).await?;
-
+    // The first user message is no longer special: the loop's stdin arm relays
+    // it exactly as it relays every later one.
     loop {
         tokio::select! {
             event = event_rx.recv() => {
@@ -270,6 +287,10 @@ async fn run_session_loop(
                         break;
                     }
                 }
+            }
+            _ = session.cancel.notified() => {
+                tracing::info!("session {} cancelled, stopping CLI", session_id_str);
+                break;
             }
         }
     }

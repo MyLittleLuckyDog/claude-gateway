@@ -54,4 +54,9 @@ pub struct Session {
     pub next_seq: AtomicU64,
     /// Handle for the pending hook timeout task (if any). Aborted on hook_response.
     pub hook_timeout_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Asks the session loop to stop, so it can shut the CLI down properly.
+    ///
+    /// `stdin_tx` above cannot serve this purpose: the loop holds an `Arc` to
+    /// this struct, so a sender is always alive and `stdin_rx` never closes.
+    pub cancel: Arc<tokio::sync::Notify>,
 }

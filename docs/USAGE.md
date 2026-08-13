@@ -67,6 +67,15 @@ max_proxy_sessions = 50             # Proxy 세션 상한
 session_idle_timeout_secs = 1800    # Proxy 세션 idle timeout
 ```
 
+> **`max_sessions` 는 곧 `claude` 프로세스 수입니다.** `POST /sessions` 는 CLI 를
+> **바로 띄웁니다** — 기동에 ~400ms 가 들고, 그걸 첫 답변에서 빼기 위해서입니다.
+> 대신 메시지를 한 번도 안 보낸 세션도 프로세스를 하나 붙들고 있습니다(실측 RSS
+> 약 176MB). 기본값 100 이면 최악의 경우 17GB 입니다. 브라우저처럼 세션을 만들고
+> 버릴 수 있는 클라이언트를 붙인다면 `max_sessions` 와
+> `session_idle_timeout_secs` 를 실제 동시 사용자 수에 맞춰 낮추세요.
+>
+> `DELETE /sessions/{id}` 는 CLI 를 **즉시 종료합니다**. 유휴 정리도 마찬가지입니다.
+
 환경변수로도 설정 가능 (섹션/필드 구분은 `__`). **목록은 쉼표로 구분**합니다:
 ```bash
 CLAUDE_GATEWAY__SERVER__PORT=9000 ./claude-agent-rs
