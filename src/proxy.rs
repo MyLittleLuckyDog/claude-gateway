@@ -241,6 +241,11 @@ const NON_HAIKU_BETAS: &[&str] = &[
     "prompt-caching-scope-2026-01-05",
     "advanced-tool-use-2025-11-20",
     "effort-2025-11-24",
+    // Lets `fallbacks: "default"` on the request body retry a safety-classifier
+    // refusal (stop_reason: "refusal") on Anthropic's recommended fallback model,
+    // inside the same call. Harmless when nothing is refused. See
+    // https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback
+    "server-side-fallback-2026-07-01",
 ];
 
 /// True if the given model ID is in the Haiku family. The CLI decides by
@@ -485,6 +490,15 @@ pub async fn messages_sync(
         crate::client_identity::inject_billing_system_block(&mut body);
     }
 
+    // Retry a safety-classifier refusal on Anthropic's recommended fallback
+    // model inside this same call, instead of returning an empty
+    // stop_reason:"refusal" completion that just sits there (norma has no
+    // refusal handling, so without this it silently stalls until its own
+    // idle-round retry nudges it to try again later).
+    if let Some(obj) = body.as_object_mut() {
+        obj.entry("fallbacks").or_insert(serde_json::json!("default"));
+    }
+
     // Pre-flight: check cached rate limit
     if let Some(msg) = state.pre_flight_check().await {
         let resets_at = state.rate_limit.read().await.resets_at;
@@ -523,6 +537,27 @@ pub async fn messages_sync(
     // non-Haiku OAuth traffic with 429 `{message:"Error"}`.
     let url = format!("{ANTHROPIC_API_BASE}/v1/messages?beta=true");
 
+    // Measurement, not inference: log the actual outgoing request shape so a
+    // long-context rejection can be matched to the request that caused it.
+    let req_bytes = serde_json::to_vec(&body).map(|v| v.len()).unwrap_or(0);
+    let msg_count = body
+        .get("messages")
+        .and_then(|m| m.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let system_bytes = body
+        .get("system")
+        .map(|s| serde_json::to_string(s).map(|s| s.len()).unwrap_or(0))
+        .unwrap_or(0);
+    tracing::info!(
+        "[measure] outgoing request: model={:?} session={} req_bytes={} messages={} system_bytes={}",
+        model_in_body,
+        session_id,
+        req_bytes,
+        msg_count,
+        system_bytes,
+    );
+
     // Retry loop for 529 (overloaded) only
     let mut last_status = 0u16;
     for attempt in 1..=(MAX_OVERLOAD_RETRIES + 1) {
@@ -556,6 +591,35 @@ pub async fn messages_sync(
                         state
                             .total_output_tokens
                             .fetch_add(output, Ordering::Relaxed);
+                    }
+                    tracing::info!(
+                        "[measure] response usage: {}",
+                        serde_json::to_string(usage).unwrap_or_default(),
+                    );
+                    // Root-caused 2026-10-23: output_tokens:0 responses are Anthropic
+                    // safety-classifier refusals (stop_reason:"refusal"), not a bug —
+                    // norma has no refusal handling, so without a fallback it silently
+                    // stalls until its own idle-round retry nudges it. `fallbacks:
+                    // "default"` (added above) now retries those server-side. Keep a
+                    // light signal, per Anthropic's own guidance, instead of a raw body
+                    // dump: a refusal is an HTTP 200, so error-rate monitoring never
+                    // sees it, and the gap between "refusal" and "served by fallback"
+                    // counts is the thing worth watching.
+                    let served_by_fallback = usage
+                        .get("iterations")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().any(|it| it.get("type").and_then(|t| t.as_str()) == Some("fallback_message")))
+                        .unwrap_or(false);
+                    let stop_reason = resp_body.get("stop_reason").and_then(|v| v.as_str());
+                    if stop_reason == Some("refusal") || served_by_fallback {
+                        tracing::warn!(
+                            "[refusal] session={} stop_reason={:?} served_by_fallback={} category={:?} model={:?}",
+                            session_id,
+                            stop_reason,
+                            served_by_fallback,
+                            resp_body.get("stop_details").and_then(|d| d.get("category")),
+                            resp_body.get("model"),
+                        );
                     }
                 }
 
@@ -674,6 +738,12 @@ pub async fn messages_stream(
         .unwrap_or(false)
     {
         crate::client_identity::inject_billing_system_block(&mut body);
+    }
+
+    // See messages_sync: retry a safety-classifier refusal on Anthropic's
+    // recommended fallback model inside this same call.
+    if let Some(obj) = body.as_object_mut() {
+        obj.entry("fallbacks").or_insert(serde_json::json!("default"));
     }
 
     // Pre-flight: check cached rate limit
