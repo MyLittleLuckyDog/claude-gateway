@@ -251,8 +251,21 @@ const NON_HAIKU_BETAS: &[&str] = &[
 
 /// True if the given model ID is in the Haiku family. The CLI decides by
 /// checking whether the canonical model name contains "haiku".
+/// True for a Haiku model confirmed to need the REDUCED treatment (no
+/// billing system block, no NON_HAIKU_BETAS).
+///
+/// Confirmed via live testing 2026-10-24: Haiku 5.5 needs the SAME treatment
+/// as Sonnet/Opus — omitting the billing block produces the exact generic
+/// `{type:"rate_limit_error",message:"Error"}` a non-Haiku model gets
+/// without it (see client_identity::BILLING_SYSTEM_BLOCK's doc comment);
+/// adding just the block (no extra betas needed) fixed it. Only Haiku 4.5 is
+/// confirmed exempt, so exclude 5.5 explicitly rather than matching any
+/// model whose name merely contains "haiku" — a future Haiku should default
+/// to the safe (full) treatment until proven otherwise, the same way 5.5
+/// turned out to need it despite the name match.
 fn is_haiku_model(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("haiku")
+    let lower = model.to_ascii_lowercase();
+    lower.contains("haiku") && !lower.contains("5-5")
 }
 
 fn build_headers(
@@ -913,5 +926,20 @@ impl ProxyError {
 
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Transport(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn haiku_5_5_is_not_treated_as_reduced_haiku() {
+        // Regression: 2026-10-24 — Haiku 5.5 needs the billing block and
+        // NON_HAIKU_BETAS just like Sonnet/Opus; only Haiku 4.5 is exempt.
+        assert!(!is_haiku_model("claude-haiku-5-5"));
+        assert!(!is_haiku_model("CLAUDE-HAIKU-5-5"));
+        assert!(is_haiku_model("claude-haiku-4-5"));
+        assert!(is_haiku_model("claude-haiku-4-5-20251001"));
     }
 }
