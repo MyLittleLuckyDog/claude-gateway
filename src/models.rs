@@ -39,6 +39,53 @@ pub enum ModelFamily {
 // with. Verify against `GET /v1/models/{id}` (`max_input_tokens`, `max_tokens`)
 // before relying on them for anything load-bearing.
 
+// 2026-10-24: catalog was missing the whole 5.5 tier (plus Fable 5.1), so
+// resolve_model's exact-match lookup fell through to its prefix-scan
+// fallback for e.g. "claude-sonnet-5-5" — which legitimately matches
+// SONNET_5 ("claude-sonnet-5-5".starts_with("claude-sonnet-5")) the same way
+// a dated snapshot ID is meant to. That silently downgraded every "5.5"
+// request to plain "5" before it ever reached Anthropic (canonical_model_id
+// overwrites the request's `model` field in src/api/proxy.rs) — caught by
+// comparing against Claude Code's own model-catalog cache
+// (~/.claude/cache/model-catalog/*.json), which lists these as real, exact
+// IDs. Exact-match entries below make MODEL_LOOKUP hit before the
+// prefix-scan is ever consulted, independent of catalog order.
+pub const FABLE_5_1: ModelDef = ModelDef {
+    id: "claude-fable-5-1",
+    alias: "fable5.1",
+    default_max_tokens: 8_000,
+    max_output_tokens: 128_000,
+    context_window: 1_000_000,
+    family: ModelFamily::Fable,
+};
+
+pub const OPUS_5_5: ModelDef = ModelDef {
+    id: "claude-opus-5-5",
+    alias: "opus5.5",
+    default_max_tokens: 8_000,
+    max_output_tokens: 128_000,
+    context_window: 1_000_000,
+    family: ModelFamily::Opus,
+};
+
+pub const SONNET_5_5: ModelDef = ModelDef {
+    id: "claude-sonnet-5-5",
+    alias: "sonnet5.5",
+    default_max_tokens: 8_000,
+    max_output_tokens: 128_000,
+    context_window: 1_000_000,
+    family: ModelFamily::Sonnet,
+};
+
+pub const HAIKU_5_5: ModelDef = ModelDef {
+    id: "claude-haiku-5-5",
+    alias: "haiku5.5",
+    default_max_tokens: 8_000,
+    max_output_tokens: 128_000,
+    context_window: 1_000_000,
+    family: ModelFamily::Haiku,
+};
+
 pub const FABLE_5: ModelDef = ModelDef {
     id: "claude-fable-5",
     alias: "fable",
@@ -152,6 +199,10 @@ pub const HAIKU_4_5: ModelDef = ModelDef {
 /// Newest first: `resolve_model` falls back to a prefix scan in this order, so
 /// a dated ID resolves to the newest entry it actually extends.
 pub const ALL_MODELS: &[&ModelDef] = &[
+    &FABLE_5_1,
+    &OPUS_5_5,
+    &SONNET_5_5,
+    &HAIKU_5_5,
     &FABLE_5,
     &OPUS_5,
     &OPUS_4_8,
@@ -297,6 +348,19 @@ mod tests {
         assert_eq!(resolve_model("opus4.8").unwrap().id, "claude-opus-4-8");
         assert_eq!(resolve_model("opus4.6").unwrap().id, "claude-opus-4-6");
         assert_eq!(resolve_model("sonnet4.6").unwrap().id, "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn test_5_5_tier_does_not_collapse_to_5() {
+        // Regression: these must hit MODEL_LOOKUP's exact match. Before the
+        // 5.5-tier entries existed, resolve_model fell through to the
+        // prefix scan, where "claude-sonnet-5-5".starts_with("claude-sonnet-5")
+        // silently resolved it (and canonical_model_id/the request body with
+        // it) down to plain Sonnet 5 — same bug for Opus 5.5 / Opus 5.
+        assert_eq!(resolve_model("claude-sonnet-5-5").unwrap().id, "claude-sonnet-5-5");
+        assert_eq!(resolve_model("claude-opus-5-5").unwrap().id, "claude-opus-5-5");
+        assert_eq!(resolve_model("claude-haiku-5-5").unwrap().id, "claude-haiku-5-5");
+        assert_eq!(resolve_model("claude-fable-5-1").unwrap().id, "claude-fable-5-1");
     }
 
     #[test]
