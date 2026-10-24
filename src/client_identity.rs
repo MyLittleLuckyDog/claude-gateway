@@ -40,9 +40,18 @@ use uuid::Uuid;
 const USER_AGENT_PREFIX: &str = "claude-cli";
 
 /// Version embedded in the User-Agent. Bumped in lockstep with the upstream
-/// CLI — the server logs may correlate by this. Verified against the real
-/// CLI (2.1.81) via a fetch-hook capture; see DEBUG_SONNET_429.md.
-const CLAUDE_CLI_VERSION: &str = "2.1.81";
+/// CLI — the server logs may correlate by this. Originally verified against
+/// the real CLI (2.1.81) via a fetch-hook capture; see DEBUG_SONNET_429.md
+/// (file not present in this checkout). Bumped 2026-10-24 to the version
+/// this account's installed CLI actually reports (`claude-code@2.1.302` via
+/// `npm list -g`, matching `~/.claude.json`'s `lastClawdEntranceVersion`) —
+/// Opus 5.5 / Fable 5.1 requests were otherwise rejected with
+/// `claude_code_version_too_old` (server requires >=2.1.280). The exact
+/// cc_version format (`${VERSION}.${counter}`) and the gating logic were
+/// read directly out of the installed CLI's bundled JS
+/// (`~/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe`,
+/// function `PPo`) rather than guessed.
+const CLAUDE_CLI_VERSION: &str = "2.1.302";
 
 #[derive(Debug, Deserialize)]
 struct GlobalConfig {
@@ -197,10 +206,14 @@ pub fn user_agent() -> String {
 /// with a generic `{type:"rate_limit_error",message:"Error"}` plus
 /// `x-should-retry: true` and no `anthropic-ratelimit-unified-*` headers.
 /// Any other system content (empty array, plain assistant instructions)
-/// triggers the same rejection. Verified via fetch-hook capture against
-/// the real CLI 2.1.81 and curl ablation; see DEBUG_SONNET_429.md.
+/// triggers the same rejection. Originally verified via fetch-hook capture
+/// against the real CLI 2.1.81 and curl ablation; see DEBUG_SONNET_429.md
+/// (file not present in this checkout). `cc_version`'s number bumped
+/// 2026-10-24 in lockstep with CLAUDE_CLI_VERSION above — see that constant's
+/// comment. Only the version changed; `cc_entrypoint`/`cch` are untouched
+/// since they weren't implicated in the Opus 5.5 rejection this was fixing.
 pub const BILLING_SYSTEM_BLOCK: &str =
-    "x-anthropic-billing-header: cc_version=2.1.81.535; cc_entrypoint=cli; cch=00000;";
+    "x-anthropic-billing-header: cc_version=2.1.302.1; cc_entrypoint=cli; cch=00000;";
 
 /// Prepend the billing-header system block to the request body so Sonnet/
 /// Opus requests are recognized as Claude Code traffic. Idempotent: if the
