@@ -749,8 +749,25 @@ pub async fn messages_sync(
                             category,
                             resp_body.get("model"),
                         );
-                        let fallback_model = if is_planner { PLANNER_REFUSAL_FALLBACK_MODEL } else { REFUSAL_FALLBACK_MODEL };
-                        if model_in_body.as_deref() != Some(fallback_model) {
+                        // Chained, not single-step: real incident 2026-10-24 —
+                        // a planner round whose only call got refused on
+                        // Opus 5.5, retried on Sonnet 5.5, ALSO got refused
+                        // (same growing context, same classifier trip) —
+                        // produced zero intents for three consecutive
+                        // heartbeats straight (planner has no idle-round
+                        // nudge-retry the way workers do, so an empty round
+                        // just silently "completes"). Opus 4.8 is the most
+                        // permissive model proven today, so it's the last
+                        // rung for every role, not just worker/compactor's.
+                        let fallback_chain: &[&str] = if is_planner {
+                            &[PLANNER_REFUSAL_FALLBACK_MODEL, REFUSAL_FALLBACK_MODEL]
+                        } else {
+                            &[REFUSAL_FALLBACK_MODEL]
+                        };
+                        for &fallback_model in fallback_chain {
+                            if model_in_body.as_deref() == Some(fallback_model) {
+                                continue; // already the model that just got refused
+                            }
                             match retry_on_fallback_model(&state.client, &url, &token.access_token, extra_betas, &body, fallback_model).await {
                                 Ok(fallback_body) => {
                                     let fb_stop = fallback_body.get("stop_reason").and_then(|v| v.as_str());
@@ -761,13 +778,14 @@ pub async fn messages_sync(
                                     if fb_stop != Some("refusal") {
                                         return Ok((fallback_body, 200));
                                     }
-                                    // Fallback also declined — fall through and return
-                                    // the original refusal; ARTEX's idle-round retry
-                                    // is the last resort.
+                                    // This rung also declined — try the next one, if any.
                                 }
                                 Err(e) => tracing::warn!("[refusal-retry] session={} request failed: {}", session_id, e),
                             }
                         }
+                        // Every rung declined (or errored) — fall through and
+                        // return the original refusal; ARTEX's idle-round
+                        // retry (worker/compactor only) is the last resort.
                     }
                 }
 
