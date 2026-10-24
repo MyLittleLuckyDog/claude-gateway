@@ -195,6 +195,26 @@ impl ProxyState {
         ) {
             rl.overage_disabled_reason = Some(v);
         }
+
+        // Fable/Mythos carry a SEPARATE 7-day sub-allocation alongside the
+        // generic one — confirmed live 2026-10-24: a Fable response has both
+        // `anthropic-ratelimit-unified-7d-*` (the generic, blended figure —
+        // 92% utilized, shared with Sonnet/Opus/Haiku) AND
+        // `anthropic-ratelimit-unified-7d_oi-*` (0% utilized, present ONLY
+        // on Fable responses — Sonnet/Opus/Haiku never send it). The generic
+        // field doesn't reflect Fable's own real headroom at all; prefer the
+        // `7d_oi` variant when present so Fable's cached status (and thus
+        // pre_flight_check for the Fable family) is based on Fable's actual
+        // constraint, not the unrelated general pool's.
+        if let Some(v) = header_f64(headers, "anthropic-ratelimit-unified-7d_oi-utilization") {
+            rl.utilization_7d = Some(v);
+        }
+        if let Some(v) = header_f64(headers, "anthropic-ratelimit-unified-7d_oi-reset") {
+            rl.resets_at = Some(v);
+        }
+        if let Some(v) = header_str(headers, "anthropic-ratelimit-unified-7d_oi-status") {
+            rl.status = Some(v);
+        }
     }
 
     /// Check if we should block a request for `family` before sending
@@ -954,6 +974,32 @@ impl ProxyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fable_7d_oi_headers_override_the_generic_7d_figure() {
+        // Regression: 2026-10-24 — confirmed live that a Fable response
+        // carries both the generic (blended, shared-with-everyone) 7d figure
+        // AND a `7d_oi` figure that's Fable's own real sub-allocation
+        // (Sonnet/Opus/Haiku responses never send `7d_oi`). The `7d_oi`
+        // status/utilization/reset must win so Fable's cached state reflects
+        // Fable's own constraint, not the unrelated general pool's.
+        let mut headers = HeaderMap::new();
+        headers.insert("anthropic-ratelimit-unified-status", HeaderValue::from_static("allowed_warning"));
+        headers.insert("anthropic-ratelimit-unified-7d-utilization", HeaderValue::from_static("0.92"));
+        headers.insert("anthropic-ratelimit-unified-reset", HeaderValue::from_static("1000"));
+        headers.insert("anthropic-ratelimit-unified-7d_oi-status", HeaderValue::from_static("allowed"));
+        headers.insert("anthropic-ratelimit-unified-7d_oi-utilization", HeaderValue::from_static("0.0"));
+        headers.insert("anthropic-ratelimit-unified-7d_oi-reset", HeaderValue::from_static("2000"));
+
+        let state = ProxyState::new(1);
+        state.update_rate_limits(&headers, models::ModelFamily::Fable).await;
+
+        let map = state.rate_limit.read().await;
+        let rl = map.get(&models::ModelFamily::Fable).unwrap();
+        assert_eq!(rl.status, Some("allowed".to_string()));
+        assert_eq!(rl.utilization_7d, Some(0.0));
+        assert_eq!(rl.resets_at, Some(2000.0));
+    }
 
     #[test]
     fn haiku_5_5_is_not_treated_as_reduced_haiku() {
