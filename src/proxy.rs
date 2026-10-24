@@ -31,6 +31,12 @@ const BASE_DELAY_MS: u64 = 500;
 /// Max backoff delay (ms)
 const MAX_DELAY_MS: u64 = 32_000;
 
+/// Model a refused request is manually retried on (verified 2026-10-24 via a
+/// plain curl call — ordinary request, no `fallbacks` param — to actually
+/// accept this model before wiring it in). Anthropic's own fallback routing
+/// for Fable/Opus-5.5 cyber refusals targets this same older model.
+const REFUSAL_FALLBACK_MODEL: &str = "claude-opus-4-8";
+
 // ── Rate Limit State ───────────────────────────────────────────────
 
 /// Rate limit state extracted from API response headers.
@@ -338,6 +344,42 @@ fn build_headers(
     Ok(headers)
 }
 
+/// Manually retries a refused request on REFUSAL_FALLBACK_MODEL, as a plain,
+/// independent request — same body, only `model` changed, no `fallbacks`
+/// param. Single attempt, no inner retry loop: this is a last-chance path for
+/// an already-refused call, not the main request path, so it stays simple.
+async fn retry_on_fallback_model(
+    client: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+    extra_betas: Option<&[String]>,
+    original_body: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let mut body = original_body.clone();
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert(
+            "model".to_string(),
+            serde_json::Value::String(REFUSAL_FALLBACK_MODEL.to_string()),
+        );
+    }
+    let headers = build_headers(access_token, extra_betas, Some(REFUSAL_FALLBACK_MODEL))?;
+    let resp = client
+        .post(url)
+        .headers(headers)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("{e}"))?;
+    let status = resp.status();
+    if status != reqwest::StatusCode::OK {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("status {status}: {text}"));
+    }
+    resp.json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("parse: {e}"))
+}
+
 /// Best-effort OS classification for the `x-stainless-os` header.
 fn stainless_os() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -596,24 +638,40 @@ pub async fn messages_sync(
                     // Root-caused 2026-10-23: output_tokens:0 responses are Anthropic
                     // safety-classifier refusals (stop_reason:"refusal"), not a bug —
                     // norma has no refusal handling, so without a fallback it silently
-                    // stalls until its own idle-round retry nudges it. `fallbacks:
-                    // "default"` (added above) now retries those server-side. Keep a
-                    // light signal, per Anthropic's own guidance, instead of a raw body
-                    // dump: a refusal is an HTTP 200, so error-rate monitoring never
-                    // sees it, and the gap between "refusal" and "served by fallback"
-                    // counts is the thing worth watching.
-                    // No server-side fallback is sent (see REVERTED note above), so a
-                    // refusal always falls through to ARTEX's own idle-round retry.
-                    // Kept as a light signal: a refusal is an HTTP 200, so error-rate
-                    // monitoring never sees it on its own.
+                    // stalls until its own idle-round retry nudges it minutes later.
+                    // The server-side `fallbacks` param is NOT the fix (see REVERTED
+                    // note above — it 400s outright on this account for
+                    // claude-sonnet-5). Instead, manually retry once on a different
+                    // model as an entirely separate, ordinary request — no shared
+                    // param, so a normal call's request shape never changes and
+                    // can't regress the way `fallbacks` did.
                     let stop_reason = resp_body.get("stop_reason").and_then(|v| v.as_str());
                     if stop_reason == Some("refusal") {
+                        let category = resp_body.get("stop_details").and_then(|d| d.get("category")).cloned();
                         tracing::warn!(
                             "[refusal] session={} category={:?} model={:?}",
                             session_id,
-                            resp_body.get("stop_details").and_then(|d| d.get("category")),
+                            category,
                             resp_body.get("model"),
                         );
+                        if model_in_body != Some(REFUSAL_FALLBACK_MODEL) {
+                            match retry_on_fallback_model(&state.client, &url, &token.access_token, extra_betas, &body).await {
+                                Ok(fallback_body) => {
+                                    let fb_stop = fallback_body.get("stop_reason").and_then(|v| v.as_str());
+                                    tracing::warn!(
+                                        "[refusal-retry] session={} category={:?} fallback_model={} fallback_stop_reason={:?}",
+                                        session_id, category, REFUSAL_FALLBACK_MODEL, fb_stop,
+                                    );
+                                    if fb_stop != Some("refusal") {
+                                        return Ok((fallback_body, 200));
+                                    }
+                                    // Fallback also declined — fall through and return
+                                    // the original refusal; ARTEX's idle-round retry
+                                    // is the last resort.
+                                }
+                                Err(e) => tracing::warn!("[refusal-retry] session={} request failed: {}", session_id, e),
+                            }
+                        }
                     }
                 }
 
