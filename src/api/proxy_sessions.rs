@@ -195,6 +195,10 @@ async fn send_message(
         Some(Err(msg)) => return error_response(400, "context_limit", &msg),
         Some(Ok(tuple)) => tuple,
     };
+    // Resolved before `body` moves into messages_sync below, so the
+    // post-call warning lookup checks the same family this request actually
+    // used (see proxy::messages_sync — each family has its own quota pool).
+    let family = crate::models::family_of(body.get("model").and_then(|v| v.as_str()).unwrap_or(""));
 
     // Phase 2: Call API (lock released)
     match proxy::messages_sync(
@@ -238,8 +242,8 @@ async fn send_message(
                     obj.insert("context_near_limit".to_string(), json!(near_limit));
 
                     if let Some(ps) = state.proxy.as_ref() {
-                        let rl = ps.rate_limit.read().await;
-                        if let Some(warning) = rl.warning_message() {
+                        let map = ps.rate_limit.read().await;
+                        if let Some(warning) = map.get(&family).and_then(|rl| rl.warning_message()) {
                             obj.insert("rate_limit_warning".to_string(), json!(warning));
                         }
                     }

@@ -135,7 +135,13 @@ pub struct ProxyState {
     pub total_requests: AtomicU64,
     pub total_input_tokens: AtomicU64,
     pub total_output_tokens: AtomicU64,
-    pub rate_limit: tokio::sync::RwLock<RateLimitStatus>,
+    /// Keyed by model family (Haiku/Sonnet/Opus/Fable/Unknown) — each has its
+    /// own quota pool on the real API (confirmed live 2026-10-24: Fable 5.1
+    /// at 0% utilization was rejected by Sonnet's ~90%-utilized cached
+    /// status back when this was one shared RateLimitStatus for every
+    /// model). Never let one family's cached state gate a different family's
+    /// request.
+    pub rate_limit: tokio::sync::RwLock<std::collections::HashMap<models::ModelFamily, RateLimitStatus>>,
 }
 
 impl ProxyState {
@@ -151,13 +157,16 @@ impl ProxyState {
             total_requests: AtomicU64::new(0),
             total_input_tokens: AtomicU64::new(0),
             total_output_tokens: AtomicU64::new(0),
-            rate_limit: tokio::sync::RwLock::new(RateLimitStatus::default()),
+            rate_limit: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
-    /// Extract all rate limit info from response headers and update state.
-    pub async fn update_rate_limits(&self, headers: &reqwest::header::HeaderMap) {
-        let mut rl = self.rate_limit.write().await;
+    /// Extract all rate limit info from response headers and update the
+    /// given family's cached status. `family` must be the family of the
+    /// model that produced these headers — see `models::family_of`.
+    pub async fn update_rate_limits(&self, headers: &reqwest::header::HeaderMap, family: models::ModelFamily) {
+        let mut map = self.rate_limit.write().await;
+        let rl = map.entry(family).or_default();
 
         if let Some(v) = header_str(headers, "anthropic-ratelimit-unified-status") {
             rl.status = Some(v);
@@ -188,12 +197,17 @@ impl ProxyState {
         }
     }
 
-    /// Check if we should block the request before sending (pre-flight).
-    /// Returns an error message if rate-limited.
-    /// Auto-clears rejected state if the reset time has passed.
-    pub async fn pre_flight_check(&self) -> Option<String> {
+    /// Check if we should block a request for `family` before sending
+    /// (pre-flight). Returns an error message if that family is rate-limited.
+    /// Auto-clears rejected state if the reset time has passed. A family with
+    /// no cached status yet (nothing seen for it) is never rejected.
+    pub async fn pre_flight_check(&self, family: models::ModelFamily) -> Option<String> {
         {
-            let rl = self.rate_limit.read().await;
+            let map = self.rate_limit.read().await;
+            let rl = match map.get(&family) {
+                Some(rl) => rl,
+                None => return None,
+            };
             if !rl.is_rejected() {
                 return None;
             }
@@ -205,12 +219,16 @@ impl ProxyState {
                     .map(|d| d.as_secs_f64())
                     .unwrap_or(0.0);
                 if now >= resets_at {
-                    drop(rl);
-                    // Clear rejection — next request will get fresh status
-                    let mut rl_mut = self.rate_limit.write().await;
-                    rl_mut.status = Some("allowed".to_string());
-                    tracing::info!("Rate limit reset time passed, allowing requests");
-                    return None;
+                    let msg = None;
+                    drop(map);
+                    // Clear rejection — next request for this family will get
+                    // fresh status.
+                    let mut map_mut = self.rate_limit.write().await;
+                    if let Some(rl_mut) = map_mut.get_mut(&family) {
+                        rl_mut.status = Some("allowed".to_string());
+                    }
+                    tracing::info!("Rate limit reset time passed for {:?}, allowing requests", family);
+                    return msg;
                 }
             }
 
@@ -487,9 +505,10 @@ pub async fn check_quota_at_startup(state: &Arc<ProxyState>) {
     {
         Ok(resp) => {
             let status = resp.status().as_u16();
-            state.update_rate_limits(resp.headers()).await;
+            state.update_rate_limits(resp.headers(), models::ModelFamily::Haiku).await;
 
-            let rl = state.rate_limit.read().await;
+            let map = state.rate_limit.read().await;
+            let rl = map.get(&models::ModelFamily::Haiku).cloned().unwrap_or_default();
             tracing::info!(
                 "Quota pre-check complete: status={}, 5h={:.0}%, 7d={:.0}%, type={:?}",
                 rl.status.as_deref().unwrap_or("unknown"),
@@ -529,14 +548,18 @@ pub async fn messages_sync(
     // Inject metadata.user_id for rate-limit attribution.
     crate::client_identity::inject_metadata(&mut body, session_id);
 
+    // Owned (not &str into `body`) so it outlives the mutable borrows below
+    // (billing-block injection) — still used for the family/haiku checks
+    // here and for headers/logging further down.
+    let model_in_body = body.get("model").and_then(|v| v.as_str()).map(str::to_string);
+    // Resolved once, up front: both pre-flight checks and the eventual
+    // update_rate_limits() call must all key off the SAME family, so a
+    // Fable call is never gated by Sonnet's cached status or vice versa.
+    let family = models::family_of(model_in_body.as_deref().unwrap_or(""));
+
     // Non-Haiku models require the billing-header system block or the server
     // rejects with a generic 429 "Error". Haiku accepts requests without it.
-    if body
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(|m| !is_haiku_model(m))
-        .unwrap_or(false)
-    {
+    if model_in_body.as_deref().map(|m| !is_haiku_model(m)).unwrap_or(false) {
         crate::client_identity::inject_billing_system_block(&mut body);
     }
 
@@ -551,9 +574,9 @@ pub async fn messages_sync(
     // 400. Refusals fall through to ARTEX's own idle-round retry instead, as
     // before this experiment.
 
-    // Pre-flight: check cached rate limit
-    if let Some(msg) = state.pre_flight_check().await {
-        let resets_at = state.rate_limit.read().await.resets_at;
+    // Pre-flight: check cached rate limit (this family only)
+    if let Some(msg) = state.pre_flight_check(family).await {
+        let resets_at = state.rate_limit.read().await.get(&family).and_then(|rl| rl.resets_at);
         return Err(ProxyError::RateLimited {
             message: Some(msg),
             resets_at,
@@ -572,8 +595,8 @@ pub async fn messages_sync(
 
     // Re-check after acquiring semaphore: a concurrent request may have just
     // been rejected and updated the cached state while we were waiting.
-    if let Some(msg) = state.pre_flight_check().await {
-        let resets_at = state.rate_limit.read().await.resets_at;
+    if let Some(msg) = state.pre_flight_check(family).await {
+        let resets_at = state.rate_limit.read().await.get(&family).and_then(|rl| rl.resets_at);
         return Err(ProxyError::RateLimited {
             message: Some(msg),
             resets_at,
@@ -582,7 +605,6 @@ pub async fn messages_sync(
 
     state.total_requests.fetch_add(1, Ordering::Relaxed);
 
-    let model_in_body = body.get("model").and_then(|v| v.as_str());
     // The CLI uses `/v1/messages?beta=true` (the Node SDK's
     // `client.beta.messages.create()` endpoint). Without `?beta=true` the
     // request is routed to the legacy Messages handler that rejects
@@ -613,7 +635,7 @@ pub async fn messages_sync(
     // Retry loop for 529 (overloaded) only
     let mut last_status = 0u16;
     for attempt in 1..=(MAX_OVERLOAD_RETRIES + 1) {
-        let headers = build_headers(&token.access_token, extra_betas, model_in_body)
+        let headers = build_headers(&token.access_token, extra_betas, model_in_body.as_deref())
             .map_err(ProxyError::Internal)?;
         let resp = state
             .client
@@ -625,7 +647,7 @@ pub async fn messages_sync(
             .map_err(|e| ProxyError::Transport(format!("{e}")))?;
 
         last_status = resp.status().as_u16();
-        state.update_rate_limits(resp.headers()).await;
+        state.update_rate_limits(resp.headers(), family).await;
 
         match last_status {
             200 => {
@@ -667,7 +689,7 @@ pub async fn messages_sync(
                             category,
                             resp_body.get("model"),
                         );
-                        if model_in_body != Some(REFUSAL_FALLBACK_MODEL) {
+                        if model_in_body.as_deref() != Some(REFUSAL_FALLBACK_MODEL) {
                             match retry_on_fallback_model(&state.client, &url, &token.access_token, extra_betas, &body).await {
                                 Ok(fallback_body) => {
                                     let fb_stop = fallback_body.get("stop_reason").and_then(|v| v.as_str());
@@ -710,13 +732,13 @@ pub async fn messages_sync(
             429 => {
                 // NO retry for 429 — subscriber rate limits are time-based.
                 {
-                    let mut rl = state.rate_limit.write().await;
-                    rl.status = Some("rejected".to_string());
+                    let mut map = state.rate_limit.write().await;
+                    map.entry(family).or_default().status = Some("rejected".to_string());
                 }
 
-                let rl = state.rate_limit.read().await;
-                let msg = rl.rejection_message();
-                drop(rl);
+                let map = state.rate_limit.read().await;
+                let msg = map.get(&family).cloned().unwrap_or_default().rejection_message();
+                drop(map);
 
                 // Dump headers + raw body for debugging
                 let header_dump: Vec<String> = resp
@@ -795,21 +817,22 @@ pub async fn messages_stream(
     // Inject metadata.user_id for rate-limit attribution.
     crate::client_identity::inject_metadata(&mut body, session_id);
 
+    // Owned — see messages_sync for why (outlives the mutable borrow below).
+    let model_in_body = body.get("model").and_then(|v| v.as_str()).map(str::to_string);
+    // See messages_sync: resolved once so every rate-limit check/update below
+    // keys off the same family.
+    let family = models::family_of(model_in_body.as_deref().unwrap_or(""));
+
     // Non-Haiku billing-header system block (see messages_sync).
-    if body
-        .get("model")
-        .and_then(|v| v.as_str())
-        .map(|m| !is_haiku_model(m))
-        .unwrap_or(false)
-    {
+    if model_in_body.as_deref().map(|m| !is_haiku_model(m)).unwrap_or(false) {
         crate::client_identity::inject_billing_system_block(&mut body);
     }
 
     // See messages_sync: `fallbacks` reverted — 400s outright on this model/
     // account combo and broke every call, not just refused ones.
 
-    // Pre-flight: check cached rate limit
-    if let Some(msg) = state.pre_flight_check().await {
+    // Pre-flight: check cached rate limit (this family only)
+    if let Some(msg) = state.pre_flight_check(family).await {
         return Err(ProxyError::RateLimited {
             message: Some(msg),
             resets_at: None,
@@ -831,7 +854,7 @@ pub async fn messages_stream(
         .map_err(|_| ProxyError::Internal("Semaphore closed".to_string()))?;
 
     // Re-check after acquiring semaphore
-    if let Some(msg) = state.pre_flight_check().await {
+    if let Some(msg) = state.pre_flight_check(family).await {
         return Err(ProxyError::RateLimited {
             message: Some(msg),
             resets_at: None,
@@ -840,11 +863,10 @@ pub async fn messages_stream(
 
     state.total_requests.fetch_add(1, Ordering::Relaxed);
 
-    let model_in_body = body.get("model").and_then(|v| v.as_str());
     let url = format!("{ANTHROPIC_API_BASE}/v1/messages?beta=true");
     let mut attempted_recovery = false;
     loop {
-        let headers = build_headers(&token.access_token, extra_betas, model_in_body)
+        let headers = build_headers(&token.access_token, extra_betas, model_in_body.as_deref())
             .map_err(ProxyError::Internal)?;
 
         let resp = state
@@ -857,7 +879,7 @@ pub async fn messages_stream(
             .map_err(|e| ProxyError::Transport(format!("{e}")))?;
 
         let status = resp.status().as_u16();
-        state.update_rate_limits(resp.headers()).await;
+        state.update_rate_limits(resp.headers(), family).await;
 
         if status == 401 && !attempted_recovery {
             attempted_recovery = true;
@@ -876,8 +898,8 @@ pub async fn messages_stream(
 
         if status == 429 {
             // Mirror CLI extractQuotaStatusFromError(): force rejected on 429
-            let mut rl = state.rate_limit.write().await;
-            rl.status = Some("rejected".to_string());
+            let mut map = state.rate_limit.write().await;
+            map.entry(family).or_default().status = Some("rejected".to_string());
         }
 
         return Ok((resp, status));

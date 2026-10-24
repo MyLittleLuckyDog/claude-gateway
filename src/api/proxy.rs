@@ -38,6 +38,7 @@ use serde_json::json;
 use super::{error_response, proxy_error_response};
 use crate::api::AppState;
 use crate::proxy;
+use crate::{openai_oauth, openai_proxy, transform};
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -165,6 +166,15 @@ async fn messages_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // Resolve model alias before routing
+    let body = resolve_model_alias(&state, body);
+
+    // Check if this is an OpenAI model — route to ChatCompletion channel
+    let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    if transform::is_openai_model(model) {
+        return handle_openai_messages(&state, body).await;
+    }
+
     let proxy_state = match state.proxy.as_ref() {
         Some(ps) => ps,
         None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
@@ -194,12 +204,149 @@ async fn messages_handler(
     }
 }
 
+/// Route an Anthropic-format `/v1/messages` request to the OpenAI ChatCompletion channel.
+async fn handle_openai_messages(state: &AppState, body: serde_json::Value) -> Response {
+    if let Some(err) = validate_request(&body) {
+        return err;
+    }
+
+    let openai_body = transform::anthropic_to_openai_chat(&body);
+
+    let result: Result<(serde_json::Value, u16), crate::error::GatewayError> =
+        if let Some(proxy_state) = state.openai.as_ref() {
+            match openai_proxy::chat_completions(proxy_state, openai_body).await {
+                Ok((resp, status)) => {
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(json) => Ok((json, status)),
+                        Err(e) => Err(crate::error::GatewayError::Internal(
+                            format!("OpenAI chat/completions JSON decode failed: {e}")
+                        )),
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        } else if let Some(oauth) = state.openai_oauth.as_ref() {
+            match openai_oauth::chat_completions(oauth, openai_body).await {
+                Ok((resp, status)) => {
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(json) => Ok((json, status)),
+                        Err(e) => Err(crate::error::GatewayError::Internal(
+                            format!("OAuth chat/completions JSON decode failed: {e}")
+                        )),
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            return error_response(
+                501,
+                "openai_proxy_disabled",
+                "OpenAI proxy is not enabled (set OPENAI_API_KEY or provide auth.json)",
+            );
+        };
+
+    match result {
+        Ok((openai_resp, upstream_status)) => {
+            let status = StatusCode::from_u16(upstream_status)
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            if upstream_status != 200 {
+                // Pass upstream error through as-is
+                return (status, Json(openai_resp)).into_response();
+            }
+            let anthropic_resp = transform::openai_chat_to_anthropic(&openai_resp);
+            (status, Json(anthropic_resp)).into_response()
+        }
+        Err(e) => {
+            let status = StatusCode::from_u16(e.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(crate::error::ErrorResponse::from(&e))).into_response()
+        }
+    }
+}
+
+/// Route an Anthropic-format `/v1/messages/stream` request to the OpenAI ChatCompletion streaming channel.
+/// Image blocks are converted via `anthropic_to_openai_chat`. The raw OpenAI SSE stream is passed through.
+async fn handle_openai_messages_stream(state: &AppState, body: serde_json::Value) -> Response {
+    if let Some(err) = validate_request(&body) {
+        return err;
+    }
+
+    let mut openai_body = transform::anthropic_to_openai_chat(&body);
+    if let Some(obj) = openai_body.as_object_mut() {
+        obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+    }
+
+    let raw_result: Result<(reqwest::Response, u16), crate::error::GatewayError> =
+        if let Some(proxy_state) = state.openai.as_ref() {
+            openai_proxy::chat_completions(proxy_state, openai_body).await
+        } else if let Some(oauth) = state.openai_oauth.as_ref() {
+            openai_oauth::chat_completions(oauth, openai_body).await
+        } else {
+            return error_response(
+                501,
+                "openai_proxy_disabled",
+                "OpenAI proxy is not enabled (set OPENAI_API_KEY or provide auth.json)",
+            );
+        };
+
+    match raw_result {
+        Ok((resp, upstream_status)) => {
+            if upstream_status != 200 {
+                let body = resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap_or_else(|_| json!({"error": {"type": "unknown", "message": "Unknown upstream error"}}));
+                let status = StatusCode::from_u16(upstream_status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                return (status, Json(body)).into_response();
+            }
+
+            let byte_stream = resp.bytes_stream();
+            let body = axum::body::Body::from_stream(byte_stream);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "text/event-stream")
+                .header("cache-control", "no-cache")
+                .header("connection", "keep-alive")
+                .body(body)
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Err(e) => {
+            let status = StatusCode::from_u16(e.http_status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(crate::error::ErrorResponse::from(&e))).into_response()
+        }
+    }
+}
+
+fn resolve_model_alias(state: &AppState, mut body: serde_json::Value) -> serde_json::Value {
+    if let Some(aliases) = state.config.model_aliases.as_ref() {
+        if let Some(model) = body.get("model").and_then(|v| v.as_str()).map(String::from) {
+            if let Some(resolved) = aliases.get(&model) {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.insert("model".to_string(), serde_json::Value::String(resolved.clone()));
+                }
+            }
+        }
+    }
+    body
+}
+
 /// POST /v1/messages/stream — SSE streaming Messages API proxy
 async fn messages_stream_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // Resolve model alias before routing
+    let body = resolve_model_alias(&state, body);
+
+    // Check if this is an OpenAI model — route to ChatCompletion streaming channel
+    let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    if transform::is_openai_model(model) {
+        return handle_openai_messages_stream(&state, body).await;
+    }
+
     let proxy_state = match state.proxy.as_ref() {
         Some(ps) => ps,
         None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
@@ -254,18 +401,30 @@ async fn rate_limit_handler(State(state): State<AppState>) -> Response {
         None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
     };
 
-    let rl = proxy_state.rate_limit.read().await;
-    Json(json!({
-        "status": rl.status,
-        "utilization_5h": rl.utilization_5h,
-        "utilization_7d": rl.utilization_7d,
-        "resets_at": rl.resets_at,
-        "fallback_available": rl.fallback_available,
-        "rate_limit_type": rl.rate_limit_type,
-        "overage_status": rl.overage_status,
-        "overage_disabled_reason": rl.overage_disabled_reason,
-    }))
-    .into_response()
+    // Keyed by model family (Haiku/Sonnet/Opus/Fable each have their own
+    // quota pool on the real API — confirmed live 2026-10-24) rather than
+    // one shared status, so e.g. Fable's real 0%-utilized state is visible
+    // even while Sonnet traffic has its own family pegged near its limit.
+    let map = proxy_state.rate_limit.read().await;
+    let by_family: serde_json::Map<String, serde_json::Value> = map
+        .iter()
+        .map(|(family, rl)| {
+            (
+                format!("{family:?}"),
+                json!({
+                    "status": rl.status,
+                    "utilization_5h": rl.utilization_5h,
+                    "utilization_7d": rl.utilization_7d,
+                    "resets_at": rl.resets_at,
+                    "fallback_available": rl.fallback_available,
+                    "rate_limit_type": rl.rate_limit_type,
+                    "overage_status": rl.overage_status,
+                    "overage_disabled_reason": rl.overage_disabled_reason,
+                }),
+            )
+        })
+        .collect();
+    Json(json!({ "by_family": by_family })).into_response()
 }
 
 /// GET /v1/proxy_stats — proxy usage statistics

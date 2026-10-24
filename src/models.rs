@@ -21,12 +21,29 @@ pub struct ModelDef {
     pub family: ModelFamily,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModelFamily {
     Haiku,
     Sonnet,
     Opus,
     Fable,
+    /// Any model string resolve_model() doesn't recognize. Its own bucket
+    /// rather than falling back to some other family's — a rate-limit cache
+    /// keyed by family must never let one family's cached status gate a
+    /// request for a different, unrelated family (see `family_of`).
+    Unknown,
+}
+
+/// Resolve a model string straight to its rate-limit family, for keying a
+/// per-family rate-limit cache. Each family carries its own separate quota
+/// pool on the real API — confirmed live 2026-10-24, when Fable 5.1
+/// succeeded at 0% utilization immediately after Sonnet's shared cache (pre-
+/// this-fix, a single global RateLimitStatus) had it cached as rejected at
+/// ~90% 7-day utilization from unrelated Sonnet traffic.
+pub fn family_of(model: &str) -> ModelFamily {
+    resolve_model(model)
+        .map(|m| m.family)
+        .unwrap_or(ModelFamily::Unknown)
 }
 
 // ── Model Catalog ──────────────────────────────────────────────────
@@ -341,6 +358,19 @@ mod tests {
         assert_eq!(resolve_model("opus").unwrap().id, "claude-opus-5");
         assert_eq!(resolve_model("fable").unwrap().id, "claude-fable-5");
         assert_eq!(resolve_model("claude-opus").unwrap().id, "claude-opus-5");
+    }
+
+    #[test]
+    fn test_family_of_separates_known_families_and_defaults_unknown() {
+        // Regression for the 2026-10-24 shared-cache bug: each family must
+        // resolve distinctly so a rate-limit cache keyed by this can never
+        // let one family's cached status gate a different family's request.
+        assert_eq!(family_of("claude-sonnet-5"), ModelFamily::Sonnet);
+        assert_eq!(family_of("claude-sonnet-5-5"), ModelFamily::Sonnet);
+        assert_eq!(family_of("claude-opus-5-5"), ModelFamily::Opus);
+        assert_eq!(family_of("claude-haiku-5-5"), ModelFamily::Haiku);
+        assert_eq!(family_of("claude-fable-5-1"), ModelFamily::Fable);
+        assert_eq!(family_of("not-a-real-model"), ModelFamily::Unknown);
     }
 
     #[test]
