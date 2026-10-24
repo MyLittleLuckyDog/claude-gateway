@@ -241,11 +241,6 @@ const NON_HAIKU_BETAS: &[&str] = &[
     "prompt-caching-scope-2026-01-05",
     "advanced-tool-use-2025-11-20",
     "effort-2025-11-24",
-    // Lets `fallbacks: "default"` on the request body retry a safety-classifier
-    // refusal (stop_reason: "refusal") on Anthropic's recommended fallback model,
-    // inside the same call. Harmless when nothing is refused. See
-    // https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback
-    "server-side-fallback-2026-07-01",
 ];
 
 /// True if the given model ID is in the Haiku family. The CLI decides by
@@ -490,14 +485,16 @@ pub async fn messages_sync(
         crate::client_identity::inject_billing_system_block(&mut body);
     }
 
-    // Retry a safety-classifier refusal on Anthropic's recommended fallback
-    // model inside this same call, instead of returning an empty
-    // stop_reason:"refusal" completion that just sits there (norma has no
-    // refusal handling, so without this it silently stalls until its own
-    // idle-round retry nudges it to try again later).
-    if let Some(obj) = body.as_object_mut() {
-        obj.entry("fallbacks").or_insert(serde_json::json!("default"));
-    }
+    // REVERTED 2026-10-24: `fallbacks` (both "default" and a named
+    // claude-opus-4-8 list) is a dead end on this account for claude-sonnet-5
+    // — "default" returns recommended_model:null (nothing to route to, just
+    // points at the Cyber Verification Program) and the named-model form
+    // 400s outright ("'claude-sonnet-5' does not support the `fallbacks`
+    // parameter"), which broke every single call — not just refused ones —
+    // for ~10 hours before this was caught. Do not re-add without first
+    // confirming with one manual curl call that the exact value sent doesn't
+    // 400. Refusals fall through to ARTEX's own idle-round retry instead, as
+    // before this experiment.
 
     // Pre-flight: check cached rate limit
     if let Some(msg) = state.pre_flight_check().await {
@@ -605,18 +602,15 @@ pub async fn messages_sync(
                     // dump: a refusal is an HTTP 200, so error-rate monitoring never
                     // sees it, and the gap between "refusal" and "served by fallback"
                     // counts is the thing worth watching.
-                    let served_by_fallback = usage
-                        .get("iterations")
-                        .and_then(|v| v.as_array())
-                        .map(|a| a.iter().any(|it| it.get("type").and_then(|t| t.as_str()) == Some("fallback_message")))
-                        .unwrap_or(false);
+                    // No server-side fallback is sent (see REVERTED note above), so a
+                    // refusal always falls through to ARTEX's own idle-round retry.
+                    // Kept as a light signal: a refusal is an HTTP 200, so error-rate
+                    // monitoring never sees it on its own.
                     let stop_reason = resp_body.get("stop_reason").and_then(|v| v.as_str());
-                    if stop_reason == Some("refusal") || served_by_fallback {
+                    if stop_reason == Some("refusal") {
                         tracing::warn!(
-                            "[refusal] session={} stop_reason={:?} served_by_fallback={} category={:?} model={:?}",
+                            "[refusal] session={} category={:?} model={:?}",
                             session_id,
-                            stop_reason,
-                            served_by_fallback,
                             resp_body.get("stop_details").and_then(|d| d.get("category")),
                             resp_body.get("model"),
                         );
@@ -740,11 +734,8 @@ pub async fn messages_stream(
         crate::client_identity::inject_billing_system_block(&mut body);
     }
 
-    // See messages_sync: retry a safety-classifier refusal on Anthropic's
-    // recommended fallback model inside this same call.
-    if let Some(obj) = body.as_object_mut() {
-        obj.entry("fallbacks").or_insert(serde_json::json!("default"));
-    }
+    // See messages_sync: `fallbacks` reverted — 400s outright on this model/
+    // account combo and broke every call, not just refused ones.
 
     // Pre-flight: check cached rate limit
     if let Some(msg) = state.pre_flight_check().await {
