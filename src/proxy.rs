@@ -31,11 +31,38 @@ const BASE_DELAY_MS: u64 = 500;
 /// Max backoff delay (ms)
 const MAX_DELAY_MS: u64 = 32_000;
 
-/// Model a refused request is manually retried on (verified 2026-10-24 via a
-/// plain curl call — ordinary request, no `fallbacks` param — to actually
-/// accept this model before wiring it in). Anthropic's own fallback routing
-/// for Fable/Opus-5.5 cyber refusals targets this same older model.
+/// Model a refused worker/compactor request is manually retried on (verified
+/// 2026-10-24 via a plain curl call — ordinary request, no `fallbacks` param
+/// — to actually accept this model before wiring it in). Anthropic's own
+/// fallback routing for Fable/Opus-5.5 cyber refusals targets this same
+/// older model.
 const REFUSAL_FALLBACK_MODEL: &str = "claude-opus-4-8";
+
+/// Role-based model override (2026-10-24, user-directed): the planner's
+/// content is abstract direction-setting (see plannerDefaultTmpl in ARTEX's
+/// own source — it's explicitly forbidden from doing the hands-on
+/// exploitation/payload work that makes workers classifier-bait), so it's
+/// rarely refused and benefits more from a stronger reasoning model than the
+/// high-volume worker calls do. ARTEX shares one model across every role via
+/// a single llm_profile, so this is the only place that can split them.
+/// Verified live: both models accept a plain request with no `fallbacks`
+/// param, same as REFUSAL_FALLBACK_MODEL was.
+const PLANNER_MODEL: &str = "claude-opus-5-5";
+/// Fallback for a refused PLANNER request specifically — Sonnet 5.5, not
+/// REFUSAL_FALLBACK_MODEL (Opus 4.8): the planner's own primary is already a
+/// top-tier model, so stepping down to Sonnet 5.5 (still current-generation)
+/// is the intended ladder, not the much older Opus 4.8 the worker/compactor
+/// path uses.
+const PLANNER_REFUSAL_FALLBACK_MODEL: &str = "claude-sonnet-5-5";
+
+/// ARTEX's session_id convention for the roles this override cares about:
+/// `exp<N>-planner` (plannerSystem/Plan in planner.go) vs `exp<N>-worker-i<N>`
+/// (WorkerSessionID in worker.go) and `exp<N>-compactor`. Matched by suffix,
+/// not substring, so a hypothetical future "-planner-something" role isn't
+/// swept in by accident.
+fn is_planner_session(session_id: &str) -> bool {
+    session_id.ends_with("-planner")
+}
 
 // ── Rate Limit State ───────────────────────────────────────────────
 
@@ -395,7 +422,7 @@ fn build_headers(
     Ok(headers)
 }
 
-/// Manually retries a refused request on REFUSAL_FALLBACK_MODEL, as a plain,
+/// Manually retries a refused request on `fallback_model`, as a plain,
 /// independent request — same body, only `model` changed, no `fallbacks`
 /// param. Single attempt, no inner retry loop: this is a last-chance path for
 /// an already-refused call, not the main request path, so it stays simple.
@@ -405,15 +432,16 @@ async fn retry_on_fallback_model(
     access_token: &str,
     extra_betas: Option<&[String]>,
     original_body: &serde_json::Value,
+    fallback_model: &str,
 ) -> Result<serde_json::Value, String> {
     let mut body = original_body.clone();
     if let Some(obj) = body.as_object_mut() {
         obj.insert(
             "model".to_string(),
-            serde_json::Value::String(REFUSAL_FALLBACK_MODEL.to_string()),
+            serde_json::Value::String(fallback_model.to_string()),
         );
     }
-    let headers = build_headers(access_token, extra_betas, Some(REFUSAL_FALLBACK_MODEL))?;
+    let headers = build_headers(access_token, extra_betas, Some(fallback_model))?;
     let resp = client
         .post(url)
         .headers(headers)
@@ -568,6 +596,18 @@ pub async fn messages_sync(
     // Inject metadata.user_id for rate-limit attribution.
     crate::client_identity::inject_metadata(&mut body, session_id);
 
+    // Role-based model override — see PLANNER_MODEL. Done before
+    // model_in_body is read below so every downstream check (betas, billing
+    // block, family-keyed rate limiting, the eventual outgoing request) sees
+    // the overridden model, not whatever ARTEX's shared llm_profile asked
+    // for.
+    let is_planner = is_planner_session(session_id);
+    if is_planner {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("model".to_string(), serde_json::Value::String(PLANNER_MODEL.to_string()));
+        }
+    }
+
     // Owned (not &str into `body`) so it outlives the mutable borrows below
     // (billing-block injection) — still used for the family/haiku checks
     // here and for headers/logging further down.
@@ -709,13 +749,14 @@ pub async fn messages_sync(
                             category,
                             resp_body.get("model"),
                         );
-                        if model_in_body.as_deref() != Some(REFUSAL_FALLBACK_MODEL) {
-                            match retry_on_fallback_model(&state.client, &url, &token.access_token, extra_betas, &body).await {
+                        let fallback_model = if is_planner { PLANNER_REFUSAL_FALLBACK_MODEL } else { REFUSAL_FALLBACK_MODEL };
+                        if model_in_body.as_deref() != Some(fallback_model) {
+                            match retry_on_fallback_model(&state.client, &url, &token.access_token, extra_betas, &body, fallback_model).await {
                                 Ok(fallback_body) => {
                                     let fb_stop = fallback_body.get("stop_reason").and_then(|v| v.as_str());
                                     tracing::warn!(
                                         "[refusal-retry] session={} category={:?} fallback_model={} fallback_stop_reason={:?}",
-                                        session_id, category, REFUSAL_FALLBACK_MODEL, fb_stop,
+                                        session_id, category, fallback_model, fb_stop,
                                     );
                                     if fb_stop != Some("refusal") {
                                         return Ok((fallback_body, 200));
@@ -836,6 +877,13 @@ pub async fn messages_stream(
 ) -> Result<(reqwest::Response, u16), ProxyError> {
     // Inject metadata.user_id for rate-limit attribution.
     crate::client_identity::inject_metadata(&mut body, session_id);
+
+    // See messages_sync: role-based model override.
+    if is_planner_session(session_id) {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("model".to_string(), serde_json::Value::String(PLANNER_MODEL.to_string()));
+        }
+    }
 
     // Owned — see messages_sync for why (outlives the mutable borrow below).
     let model_in_body = body.get("model").and_then(|v| v.as_str()).map(str::to_string);
@@ -999,6 +1047,20 @@ mod tests {
         assert_eq!(rl.status, Some("allowed".to_string()));
         assert_eq!(rl.utilization_7d, Some(0.0));
         assert_eq!(rl.resets_at, Some(2000.0));
+    }
+
+    #[test]
+    fn is_planner_session_matches_by_suffix_only() {
+        // Matches ARTEX's actual session_id convention: plannerSystem/Plan
+        // use fmt.Sprintf("exp%d-planner", ...) in planner.go; workers use
+        // WorkerSessionID's "exp%d-worker-i%d" in worker.go. Suffix match
+        // (not substring) so a hypothetical future "-planner-something" role
+        // isn't accidentally swept into the planner override.
+        assert!(is_planner_session("exp3-planner"));
+        assert!(is_planner_session("exp42-planner"));
+        assert!(!is_planner_session("exp3-worker-i470"));
+        assert!(!is_planner_session("exp3-compactor"));
+        assert!(!is_planner_session("exp3-planner-something"));
     }
 
     #[test]
