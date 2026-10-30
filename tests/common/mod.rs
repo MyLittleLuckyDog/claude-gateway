@@ -80,6 +80,13 @@ pub struct Upstream {
     pub request_headers: Mutex<Vec<HeaderMap>>,
     /// Path and query of every `GET` the stub served.
     pub get_requests: Mutex<Vec<String>>,
+    /// When set, `count_tokens` counts the way a server would -- one token per
+    /// text character, 1,000 per image, 7 of fixed overhead per message --
+    /// instead of answering a flat 42. Stands in for upstream's tokenizer in
+    /// tests that need counts to follow content.
+    pub count_by_content: std::sync::atomic::AtomicBool,
+    /// When set, `count_tokens` answers 400.
+    pub count_fails: std::sync::atomic::AtomicBool,
     /// Scripted responses, consumed front to back; empty → a normal reply.
     pub script: Mutex<VecDeque<Scripted>>,
 }
@@ -196,19 +203,53 @@ async fn upstream_handler(
     (status, headers, Json(scripted.body)).into_response()
 }
 
+/// The stub's tokenizer for `count_by_content`: see [`Upstream::count_by_content`].
+fn content_tokens(request: &Value) -> u64 {
+    let block_tokens = |block: &Value| match block.get("type").and_then(Value::as_str) {
+        Some("text") => block["text"]
+            .as_str()
+            .map_or(0, |t| t.chars().count() as u64),
+        Some("image") => 1_000,
+        _ => 10,
+    };
+    request["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|m| {
+            7 + match &m["content"] {
+                Value::String(s) => s.chars().count() as u64,
+                Value::Array(blocks) => blocks.iter().map(block_tokens).sum(),
+                _ => 0,
+            }
+        })
+        .sum()
+}
+
 /// `count_tokens`: records the request like `/v1/messages` does and answers
-/// with a fixed count.
+/// with a fixed count, or a content-based one (see [`Upstream::count_by_content`]).
 async fn count_tokens_handler(
     State(up): State<Arc<Upstream>>,
     request_headers: HeaderMap,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> Response {
+    use std::sync::atomic::Ordering::Relaxed;
+    let tokens = if up.count_by_content.load(Relaxed) {
+        content_tokens(&body)
+    } else {
+        42
+    };
     up.requests.lock().expect("lock").push(body);
     up.request_headers
         .lock()
         .expect("lock")
         .push(request_headers);
-    Json(json!({"input_tokens": 42}))
+    if up.count_fails.load(Relaxed) {
+        let err = json!({"type": "error", "error": {"type": "invalid_request_error",
+                                                    "message": "cannot count this"}});
+        return (StatusCode::BAD_REQUEST, Json(err)).into_response();
+    }
+    Json(json!({"input_tokens": tokens})).into_response()
 }
 
 fn model_json(id: &str) -> Value {

@@ -119,6 +119,61 @@ async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -
     }
 }
 
+// ── Context relief ─────────────────────────────────────────────────
+
+/// Run the session's opt-in microcompact, with every token figure counted by
+/// upstream rather than estimated.
+///
+/// 1. Under the session lock, judge the trigger on the server's own usage
+///    numbers and pick the old tool results to clear (no sizes involved).
+/// 2. With the lock released, count their content and the placeholders that
+///    would replace it with `count_tokens`; the difference is exactly what
+///    clearing frees, and the fixed per-message overhead cancels out.
+/// 3. Only if that reaches `MICROCOMPACT_MIN_TOKENS_FREED`, clear them.
+///
+/// If upstream cannot count -- an error, or content that is not valid on its
+/// own -- nothing is cleared. A guess would be worse than skipping a turn.
+async fn relieve_context(
+    store: &std::sync::Arc<crate::proxy_session::ProxySessionStore>,
+    proxy_state: &std::sync::Arc<crate::proxy::ProxyState>,
+    id: &str,
+) -> Option<crate::proxy_session::MicrocompactOutcome> {
+    let plan = store
+        .with_session(id, |session| session.plan_microcompact())
+        .await??;
+
+    let count = |body: serde_json::Value| async move {
+        match proxy::count_tokens(proxy_state, &body, None, id).await {
+            Ok((reply, 200)) => reply.get("input_tokens").and_then(|v| v.as_u64()),
+            Ok((reply, status)) => {
+                tracing::warn!(
+                    "[microcompact] session={id}: count_tokens answered {status}: {reply}"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!("[microcompact] session={id}: count_tokens failed: {e}");
+                None
+            }
+        }
+    };
+    let (before, after) = tokio::join!(
+        count(plan.count_request_before()),
+        count(plan.count_request_after())
+    );
+    let freed = before?.saturating_sub(after?);
+
+    if freed < crate::proxy_session::MICROCOMPACT_MIN_TOKENS_FREED {
+        tracing::debug!(
+            "[microcompact] session={id}: clearing would free {freed} tokens, not worth a cache break"
+        );
+        return None;
+    }
+    store
+        .with_session(id, |session| session.apply_microcompact(&plan, freed))
+        .await?
+}
+
 // ── Send Message ───────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -155,16 +210,16 @@ async fn send_message(
         req.content
     };
 
+    // Before the preflight check in phase 1, so a session at the edge of its
+    // window can be relieved instead of refused.
+    let microcompact = relieve_context(store, proxy_state, &id).await;
+
     // Phase 1: Add message and build request while holding the session lock.
     // Returns (body, betas, session_id, msg_id) — msg_id is used for safe
     // rollback if the API call fails (immune to concurrent index shifts).
     #[allow(clippy::question_mark)]
     let prepared = store
         .with_session(&id, |session| {
-            // Before the preflight check, so a session at the edge of its
-            // window can be relieved instead of refused.
-            let microcompact = session.maybe_microcompact();
-
             if let Err(msg) = session.preflight_check() {
                 return Err(msg);
             }
@@ -183,11 +238,11 @@ async fn send_message(
             let body = session.build_request(req.max_tokens);
             let betas = session.options.betas.clone();
             let upstream_sid = session.id.clone();
-            Ok((body, betas, upstream_sid, msg_id, microcompact))
+            Ok((body, betas, upstream_sid, msg_id))
         })
         .await;
 
-    let (body, extra_betas, upstream_session_id, msg_id, microcompact) = match prepared {
+    let (body, extra_betas, upstream_session_id, msg_id) = match prepared {
         None => {
             return error_response(404, "session_not_found", &format!("Session {id} not found"))
         }
@@ -305,13 +360,14 @@ async fn send_message_stream(
         req.content
     };
 
+    // Before the preflight check in phase 1, so a session at the edge of its
+    // window can be relieved instead of refused. Logged by the session itself;
+    // the stream carries no place for the outcome.
+    let _microcompact = relieve_context(store, proxy_state, &id).await;
+
     // Phase 1: Add message and build request under lock
     let prepared = store
         .with_session(&id, |session| {
-            // Before the preflight check, so a session at the edge of its
-            // window can be relieved instead of refused.
-            let microcompact = session.maybe_microcompact();
-
             if let Err(msg) = session.preflight_check() {
                 return Err(msg);
             }
@@ -330,11 +386,11 @@ async fn send_message_stream(
             let body = session.build_request(req.max_tokens);
             let betas = session.options.betas.clone();
             let upstream_sid = session.id.clone();
-            Ok((body, betas, upstream_sid, msg_id, microcompact))
+            Ok((body, betas, upstream_sid, msg_id))
         })
         .await;
 
-    let (body, extra_betas, upstream_session_id, msg_id, _microcompact) = match prepared {
+    let (body, extra_betas, upstream_session_id, msg_id) = match prepared {
         None => {
             return error_response(404, "session_not_found", &format!("Session {id} not found"))
         }

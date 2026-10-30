@@ -342,3 +342,66 @@ async fn overflowing_max_tokens_is_lowered_and_the_request_succeeds() {
         );
     }
 }
+
+/// Does upstream accept the two `count_tokens` requests microcompact relies on
+/// (the old tool-result content as plain user blocks, and the placeholders that
+/// replace it), and do their counts subtract to what was freed? Free to run.
+#[tokio::test]
+#[ignore = "calls the real Anthropic API with the developer's credentials"]
+async fn microcompact_count_requests_are_accepted_upstream() {
+    use claude_agent::proxy_session::{MicrocompactOptions, ProxySession, SessionOptions};
+
+    let state = Arc::new(ProxyState::new(1));
+    let mut session = ProxySession::new(
+        "live-probe".to_string(),
+        SessionOptions {
+            model: Some("claude-sonnet-5-5".to_string()),
+            microcompact: Some(MicrocompactOptions {
+                trigger_tokens: 1,
+                compactable_tools: None,
+            }),
+            ..Default::default()
+        },
+        3600,
+    );
+    // 1x1 PNG.
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    for i in 0..9 {
+        let id = format!("toolu_{i}");
+        session
+            .messages
+            .push(json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": id, "name": "Read", "input": {"path": "/x"}}]}));
+        let content = if i == 1 {
+            json!([{"type": "text", "text": "a picture"},
+                   {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": png}}])
+        } else {
+            json!("The quick brown fox jumps over the lazy dog. ".repeat(250))
+        };
+        session.add_tool_result(vec![
+            json!({"type": "tool_result", "tool_use_id": id, "content": content}),
+        ]);
+    }
+    session.last_input_tokens = 150_000;
+
+    let plan = session.plan_microcompact().expect("a plan");
+    let mut counts = Vec::new();
+    for (label, body) in [
+        ("before", plan.count_request_before()),
+        ("after", plan.count_request_after()),
+    ] {
+        let (reply, status) = proxy::count_tokens(&state, &body, None, "live-probe")
+            .await
+            .expect("count_tokens");
+        eprintln!("[probe] {label}: HTTP {status} {reply}");
+        assert_eq!(status, 200, "{label}: {reply}");
+        counts.push(reply["input_tokens"].as_u64().expect("input_tokens"));
+    }
+    eprintln!(
+        "[probe] freed = {} - {} = {}",
+        counts[0],
+        counts[1],
+        counts[0].saturating_sub(counts[1])
+    );
+    assert!(counts[0] > counts[1]);
+}
