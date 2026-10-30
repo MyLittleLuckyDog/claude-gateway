@@ -158,15 +158,6 @@ pub const OPUS_4_5: ModelDef = ModelDef {
     family: ModelFamily::Opus,
 };
 
-pub const OPUS_4: ModelDef = ModelDef {
-    id: "claude-opus-4-0",
-    alias: "opus4",
-    default_max_tokens: 8_000,
-    max_output_tokens: 32_000,
-    context_window: 200_000,
-    family: ModelFamily::Opus,
-};
-
 pub const SONNET_5: ModelDef = ModelDef {
     id: "claude-sonnet-5",
     alias: "sonnet",
@@ -188,15 +179,6 @@ pub const SONNET_4_6: ModelDef = ModelDef {
 pub const SONNET_4_5: ModelDef = ModelDef {
     id: "claude-sonnet-4-5",
     alias: "sonnet4.5",
-    default_max_tokens: 8_000,
-    max_output_tokens: 64_000,
-    context_window: 200_000,
-    family: ModelFamily::Sonnet,
-};
-
-pub const SONNET_4: ModelDef = ModelDef {
-    id: "claude-sonnet-4-0",
-    alias: "sonnet4",
     default_max_tokens: 8_000,
     max_output_tokens: 64_000,
     context_window: 200_000,
@@ -227,11 +209,9 @@ pub const ALL_MODELS: &[&ModelDef] = &[
     &OPUS_4_7,
     &OPUS_4_6,
     &OPUS_4_5,
-    &OPUS_4,
     &SONNET_5,
     &SONNET_4_6,
     &SONNET_4_5,
-    &SONNET_4,
     &HAIKU_4_5,
 ];
 
@@ -304,13 +284,10 @@ static MODEL_LOOKUP: LazyLock<HashMap<String, &'static ModelDef>> = LazyLock::ne
     map.insert("claude-sonnet".to_string(), &SONNET_5);
     map.insert("haiku4.5".to_string(), &HAIKU_4_5);
     map.insert("claude-haiku".to_string(), &HAIKU_4_5);
-    // Dated IDs that predate the un-suffixed aliases.
-    // claude-opus-4-1 is deliberately absent: it is a distinct model, so it
-    // passes through untouched rather than being rewritten to Opus 4.0.
+    // Dated IDs that predate the un-suffixed aliases. Opus 4 / Sonnet 4
+    // (-4-20250514) are gone: upstream no longer serves them.
     map.insert("claude-haiku-4-5-20251001".to_string(), &HAIKU_4_5);
-    map.insert("claude-opus-4-20250514".to_string(), &OPUS_4);
     map.insert("claude-opus-4-5-20251101".to_string(), &OPUS_4_5);
-    map.insert("claude-sonnet-4-20250514".to_string(), &SONNET_4);
     map.insert("claude-sonnet-4-5-20250929".to_string(), &SONNET_4_5);
     map
 });
@@ -409,13 +386,34 @@ mod tests {
     #[test]
     fn test_resolve_full_id() {
         assert_eq!(
-            resolve_model("claude-sonnet-4-20250514").unwrap().id,
-            "claude-sonnet-4-0"
-        );
-        assert_eq!(
             resolve_model("claude-haiku-4-5-20251001").unwrap().id,
             "claude-haiku-4-5"
         );
+        assert_eq!(
+            resolve_model("claude-sonnet-4-5-20250929").unwrap().id,
+            "claude-sonnet-4-5"
+        );
+    }
+
+    /// Opus 4 and Sonnet 4 are no longer served: upstream answers
+    /// `not_found_error` for `claude-opus-4-0`, `claude-sonnet-4-0` and the
+    /// dated `-4-20250514` ids (checked 2026-10-30 with count_tokens and
+    /// `GET /v1/models/{id}`). They are therefore not in the catalog, so a
+    /// request naming one is passed through untouched and flagged by the
+    /// `[model-catalog-miss]` warning instead of being rewritten to another
+    /// retired id.
+    #[test]
+    fn retired_models_are_not_in_the_catalog() {
+        for id in [
+            "opus4",
+            "sonnet4",
+            "claude-opus-4-0",
+            "claude-sonnet-4-0",
+            "claude-opus-4-20250514",
+            "claude-sonnet-4-20250514",
+        ] {
+            assert!(resolve_model(id).is_none(), "{id} should be unknown");
+        }
     }
 
     /// A dated suffix must resolve to the entry it extends, not to an older

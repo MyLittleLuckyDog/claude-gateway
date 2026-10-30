@@ -179,17 +179,15 @@ CLI subprocess 오버헤드 없이 빠르고, Haiku/Sonnet/Opus 자유 선택 �
 | `opus4.8` | `claude-opus-4-8` | 1M | 128K |
 | `opus4.7` | `claude-opus-4-7` | 1M | 128K |
 | `opus4.6` | `claude-opus-4-6` | 1M | 128K |
-| `opus4.5` | `claude-opus-4-5` | 200K | 32K |
-| `opus4` | `claude-opus-4-0` | 200K | 32K |
+| `opus4.5` | `claude-opus-4-5` | 200K | 64K |
 | `sonnet`, `sonnet5`, `claude-sonnet` | `claude-sonnet-5` | 1M | 128K |
 | `sonnet4.6` | `claude-sonnet-4-6` | 1M | 128K |
 | `sonnet4.5` | `claude-sonnet-4-5` | 200K | 64K |
-| `sonnet4` | `claude-sonnet-4-0` | 200K | 64K |
 | `haiku`, `haiku4.5`, `claude-haiku` | `claude-haiku-4-5` | 200K | 64K |
 
 정규 ID를 직접 써도 되고, 접두사 매치(`claude-sonnet-5-...`)도 통합니다.
 날짜 접미사가 붙은 옛 ID(`claude-haiku-4-5-20251001` 등)도 같은 모델로 해석됩니다.
-카탈로그에 없는 모델은 보정 없이 그대로 상류에 전달됩니다.
+카탈로그에 없는 모델은 보정 없이 그대로 상류에 전달됩니다. (Opus 4 / Sonnet 4 계열은 상류가 더 이상 제공하지 않아 카탈로그에서 뺐습니다.)
 
 `POST /v1/messages`는 `model`이 필수입니다. 기본 모델 보정은 `/v1/sessions`
 세션 경로에서만 적용되며, 기본값은 `claude-sonnet-5`입니다.
