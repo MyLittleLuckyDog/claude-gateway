@@ -21,4 +21,5 @@ pub mod proxy_session;
 pub mod query;
 pub mod session;
 pub mod sse;
+pub mod transform;
 pub mod transport;

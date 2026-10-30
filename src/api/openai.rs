@@ -19,6 +19,10 @@ pub fn routes() -> Router<AppState> {
             "/openai/v1/responses/stream",
             post(responses_stream_handler),
         )
+        .route(
+            "/openai/v1/chat/completions",
+            post(chat_completions_handler),
+        )
         .route("/openai/v1/models", get(models_handler))
         .route("/openai/v1/proxy_stats", get(stats_handler))
 }
@@ -169,6 +173,58 @@ async fn responses_stream_handler(
                     .header("connection", "keep-alive")
                     .body(body)
                     .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+            Err(e) => {
+                let status = StatusCode::from_u16(e.http_status())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                return (status, Json(crate::error::ErrorResponse::from(&e))).into_response();
+            }
+        }
+    }
+
+    error_response(
+        501,
+        "openai_proxy_disabled",
+        "OpenAI proxy is not enabled (set OPENAI_API_KEY or provide auth.json)",
+    )
+}
+
+async fn chat_completions_handler(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    if let Some(proxy_state) = state.openai.as_ref() {
+        match openai_proxy::chat_completions(proxy_state, body).await {
+            Ok((resp, upstream_status)) => {
+                let status = StatusCode::from_u16(upstream_status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("application/json")
+                    .to_string();
+                let bytes = resp.bytes().await.unwrap_or_default();
+                return Response::builder()
+                    .status(status)
+                    .header("content-type", content_type)
+                    .body(axum::body::Body::from(bytes))
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+            Err(e) => {
+                let status = StatusCode::from_u16(e.http_status())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                return (status, Json(crate::error::ErrorResponse::from(&e))).into_response();
+            }
+        }
+    }
+
+    if let Some(oauth) = state.openai_oauth.as_ref() {
+        match openai_oauth::chat_completions_sync(oauth, body).await {
+            Ok((resp_body, upstream_status)) => {
+                let status = StatusCode::from_u16(upstream_status)
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+                return (status, Json(resp_body)).into_response();
             }
             Err(e) => {
                 let status = StatusCode::from_u16(e.http_status())

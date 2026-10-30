@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -10,6 +12,10 @@ pub struct AppConfig {
     pub proxy: ProxyConfig,
     #[serde(default)]
     pub request_options: RequestOptionsConfig,
+    /// Optional model alias table: alias → canonical model id.
+    /// Can also be set via env: GATEWAY_MODEL_ALIAS_gpt4o=gpt-4o
+    #[serde(default)]
+    pub model_aliases: Option<HashMap<String, String>>,
 }
 
 /// How much of the session option surface a request may set.
@@ -196,6 +202,7 @@ impl Default for AppConfig {
             cli: default_cli_config(),
             proxy: default_proxy_config(),
             request_options: RequestOptionsConfig::default(),
+            model_aliases: None,
         }
     }
 }

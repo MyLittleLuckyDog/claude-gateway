@@ -144,6 +144,19 @@ fn preprocess_request(
 
         let model_str = obj.get("model").and_then(|v| v.as_str()).map(String::from);
         if let Some(model_val) = model_str {
+            // `canonical_model_id` passes an unrecognized string through
+            // unchanged rather than guessing a substitute (never force a
+            // model switch the caller didn't ask for) — but a silent
+            // passthrough means a typo'd or retired model id in the
+            // caller's own config reaches Anthropic unnoticed and comes
+            // back as an opaque 400. Surface it here instead.
+            if crate::models::resolve_model(&model_val).is_none() {
+                tracing::warn!(
+                    "[model-catalog-miss] caller requested unrecognized model \"{}\" — \
+                     passing through unchanged, not substituting a different model",
+                    model_val,
+                );
+            }
             let canonical = crate::models::canonical_model_id(&model_val).to_string();
             let needs_max_tokens = !obj.contains_key("max_tokens");
             let default_mt = crate::models::default_max_tokens(&canonical);
@@ -215,28 +228,16 @@ async fn handle_openai_messages(state: &AppState, body: serde_json::Value) -> Re
     let result: Result<(serde_json::Value, u16), crate::error::GatewayError> =
         if let Some(proxy_state) = state.openai.as_ref() {
             match openai_proxy::chat_completions(proxy_state, openai_body).await {
-                Ok((resp, status)) => {
-                    match resp.json::<serde_json::Value>().await {
-                        Ok(json) => Ok((json, status)),
-                        Err(e) => Err(crate::error::GatewayError::Internal(
-                            format!("OpenAI chat/completions JSON decode failed: {e}")
-                        )),
-                    }
-                }
+                Ok((resp, status)) => match resp.json::<serde_json::Value>().await {
+                    Ok(json) => Ok((json, status)),
+                    Err(e) => Err(crate::error::GatewayError::Internal(format!(
+                        "OpenAI chat/completions JSON decode failed: {e}"
+                    ))),
+                },
                 Err(e) => Err(e),
             }
         } else if let Some(oauth) = state.openai_oauth.as_ref() {
-            match openai_oauth::chat_completions(oauth, openai_body).await {
-                Ok((resp, status)) => {
-                    match resp.json::<serde_json::Value>().await {
-                        Ok(json) => Ok((json, status)),
-                        Err(e) => Err(crate::error::GatewayError::Internal(
-                            format!("OAuth chat/completions JSON decode failed: {e}")
-                        )),
-                    }
-                }
-                Err(e) => Err(e),
-            }
+            openai_oauth::chat_completions_sync(oauth, openai_body).await
         } else {
             return error_response(
                 501,
@@ -247,8 +248,8 @@ async fn handle_openai_messages(state: &AppState, body: serde_json::Value) -> Re
 
     match result {
         Ok((openai_resp, upstream_status)) => {
-            let status = StatusCode::from_u16(upstream_status)
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status =
+                StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             if upstream_status != 200 {
                 // Pass upstream error through as-is
                 return (status, Json(openai_resp)).into_response();
@@ -257,8 +258,8 @@ async fn handle_openai_messages(state: &AppState, body: serde_json::Value) -> Re
             (status, Json(anthropic_resp)).into_response()
         }
         Err(e) => {
-            let status = StatusCode::from_u16(e.http_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status =
+                StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (status, Json(crate::error::ErrorResponse::from(&e))).into_response()
         }
     }
@@ -280,7 +281,7 @@ async fn handle_openai_messages_stream(state: &AppState, body: serde_json::Value
         if let Some(proxy_state) = state.openai.as_ref() {
             openai_proxy::chat_completions(proxy_state, openai_body).await
         } else if let Some(oauth) = state.openai_oauth.as_ref() {
-            openai_oauth::chat_completions(oauth, openai_body).await
+            openai_oauth::chat_completions_stream(oauth, openai_body).await
         } else {
             return error_response(
                 501,
@@ -292,10 +293,9 @@ async fn handle_openai_messages_stream(state: &AppState, body: serde_json::Value
     match raw_result {
         Ok((resp, upstream_status)) => {
             if upstream_status != 200 {
-                let body = resp
-                    .json::<serde_json::Value>()
-                    .await
-                    .unwrap_or_else(|_| json!({"error": {"type": "unknown", "message": "Unknown upstream error"}}));
+                let body = resp.json::<serde_json::Value>().await.unwrap_or_else(
+                    |_| json!({"error": {"type": "unknown", "message": "Unknown upstream error"}}),
+                );
                 let status = StatusCode::from_u16(upstream_status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return (status, Json(body)).into_response();
@@ -312,8 +312,8 @@ async fn handle_openai_messages_stream(state: &AppState, body: serde_json::Value
                 .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(e) => {
-            let status = StatusCode::from_u16(e.http_status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status =
+                StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (status, Json(crate::error::ErrorResponse::from(&e))).into_response()
         }
     }
@@ -324,7 +324,10 @@ fn resolve_model_alias(state: &AppState, mut body: serde_json::Value) -> serde_j
         if let Some(model) = body.get("model").and_then(|v| v.as_str()).map(String::from) {
             if let Some(resolved) = aliases.get(&model) {
                 if let Some(obj) = body.as_object_mut() {
-                    obj.insert("model".to_string(), serde_json::Value::String(resolved.clone()));
+                    obj.insert(
+                        "model".to_string(),
+                        serde_json::Value::String(resolved.clone()),
+                    );
                 }
             }
         }

@@ -38,30 +38,39 @@ const MAX_DELAY_MS: u64 = 32_000;
 /// older model.
 const REFUSAL_FALLBACK_MODEL: &str = "claude-opus-4-8";
 
-/// Role-based model override (2026-10-24, user-directed): the planner's
-/// content is abstract direction-setting (see plannerDefaultTmpl in ARTEX's
-/// own source — it's explicitly forbidden from doing the hands-on
-/// exploitation/payload work that makes workers classifier-bait), so it's
-/// rarely refused and benefits more from a stronger reasoning model than the
-/// high-volume worker calls do. ARTEX shares one model across every role via
-/// a single llm_profile, so this is the only place that can split them.
-/// Verified live: both models accept a plain request with no `fallbacks`
-/// param, same as REFUSAL_FALLBACK_MODEL was.
-const PLANNER_MODEL: &str = "claude-opus-5-5";
-/// Fallback for a refused PLANNER request specifically — Sonnet 5.5, not
-/// REFUSAL_FALLBACK_MODEL (Opus 4.8): the planner's own primary is already a
-/// top-tier model, so stepping down to Sonnet 5.5 (still current-generation)
-/// is the intended ladder, not the much older Opus 4.8 the worker/compactor
-/// path uses.
-const PLANNER_REFUSAL_FALLBACK_MODEL: &str = "claude-sonnet-5-5";
+// REMOVED 2026-10-25 (user-directed revert): this file used to force every
+// `exp*-planner` session onto a hardcoded `claude-opus-5-5`, overriding
+// whatever model ARTEX's own llm_profile actually asked for. The gateway's
+// job is to pass the caller's model choice through, not to silently
+// override it — ARTEX's own default (`llm_profiles.is_default`) is the
+// right place to pick a model, and it already points at
+// `claude-sonnet-5-5`. The override also made the planner's cyber-refusal
+// problem worse: opus-5-5 and its same-family fallback opus-4-8 were both
+// getting refused every heartbeat, burning a full cache-write cycle
+// (~43k tokens) for zero output.
 
-/// ARTEX's session_id convention for the roles this override cares about:
-/// `exp<N>-planner` (plannerSystem/Plan in planner.go) vs `exp<N>-worker-i<N>`
-/// (WorkerSessionID in worker.go) and `exp<N>-compactor`. Matched by suffix,
-/// not substring, so a hypothetical future "-planner-something" role isn't
-/// swept in by accident.
-fn is_planner_session(session_id: &str) -> bool {
-    session_id.ends_with("-planner")
+/// Fallback target for a refused Sonnet-5.5 request — Claude Code's own
+/// documented behavior (code.claude.com/docs/en/model-config, read
+/// 2026-10-25): a cyber-flagged Sonnet 5.5 request re-runs on Sonnet 5,
+/// *same family*, not a jump to Opus. Mirroring the official ladder here
+/// instead of the cross-family chain this file used before 2026-10-25.
+const SONNET_REFUSAL_FALLBACK_MODEL: &str = "claude-sonnet-5";
+
+/// Same-family cyber-refusal fallback, per Claude Code's documented model
+/// fallback behavior: Opus 5(.5) -> Opus 4.8, Sonnet 5.5 -> Sonnet 5. Returns
+/// None when `primary` is already the bottom rung (or has no documented
+/// fallback, e.g. Haiku) — matching "the session stays on the fallback model
+/// until explicitly changed", i.e. there is nothing further to try, not a
+/// cross-family hop. (2026-10-25: replaced the old PLANNER_REFUSAL_FALLBACK_MODEL
+/// cross-family chain — Opus primary falling back through Sonnet 5.5 before
+/// Opus 4.8 — which didn't match the official per-family ladder and cost an
+/// extra wasted call on every refusal.)
+fn same_family_refusal_fallback(primary: &str) -> Option<&'static str> {
+    match primary {
+        "claude-opus-5-5" | "claude-opus-5" => Some(REFUSAL_FALLBACK_MODEL),
+        "claude-sonnet-5-5" => Some(SONNET_REFUSAL_FALLBACK_MODEL),
+        _ => None,
+    }
 }
 
 // ── Rate Limit State ───────────────────────────────────────────────
@@ -168,7 +177,15 @@ pub struct ProxyState {
     /// status back when this was one shared RateLimitStatus for every
     /// model). Never let one family's cached state gate a different family's
     /// request.
-    pub rate_limit: tokio::sync::RwLock<std::collections::HashMap<models::ModelFamily, RateLimitStatus>>,
+    pub rate_limit:
+        tokio::sync::RwLock<std::collections::HashMap<models::ModelFamily, RateLimitStatus>>,
+    /// Session-sticky cyber-refusal downgrade, per Claude Code's documented
+    /// behavior ("the session stays on the fallback model until you switch
+    /// back with /model" — code.claude.com/docs/en/model-config). Keyed by
+    /// session_id, value is the fallback model to use for every subsequent
+    /// request in that session, skipping the primary model entirely instead
+    /// of re-paying for a refused primary-model attempt every heartbeat.
+    pub refusal_downgrades: tokio::sync::RwLock<std::collections::HashMap<String, String>>,
 }
 
 impl ProxyState {
@@ -185,13 +202,18 @@ impl ProxyState {
             total_input_tokens: AtomicU64::new(0),
             total_output_tokens: AtomicU64::new(0),
             rate_limit: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            refusal_downgrades: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
     /// Extract all rate limit info from response headers and update the
     /// given family's cached status. `family` must be the family of the
     /// model that produced these headers — see `models::family_of`.
-    pub async fn update_rate_limits(&self, headers: &reqwest::header::HeaderMap, family: models::ModelFamily) {
+    pub async fn update_rate_limits(
+        &self,
+        headers: &reqwest::header::HeaderMap,
+        family: models::ModelFamily,
+    ) {
         let mut map = self.rate_limit.write().await;
         let rl = map.entry(family).or_default();
 
@@ -274,7 +296,10 @@ impl ProxyState {
                     if let Some(rl_mut) = map_mut.get_mut(&family) {
                         rl_mut.status = Some("allowed".to_string());
                     }
-                    tracing::info!("Rate limit reset time passed for {:?}, allowing requests", family);
+                    tracing::info!(
+                        "Rate limit reset time passed for {:?}, allowing requests",
+                        family
+                    );
                     return msg;
                 }
             }
@@ -553,10 +578,15 @@ pub async fn check_quota_at_startup(state: &Arc<ProxyState>) {
     {
         Ok(resp) => {
             let status = resp.status().as_u16();
-            state.update_rate_limits(resp.headers(), models::ModelFamily::Haiku).await;
+            state
+                .update_rate_limits(resp.headers(), models::ModelFamily::Haiku)
+                .await;
 
             let map = state.rate_limit.read().await;
-            let rl = map.get(&models::ModelFamily::Haiku).cloned().unwrap_or_default();
+            let rl = map
+                .get(&models::ModelFamily::Haiku)
+                .cloned()
+                .unwrap_or_default();
             tracing::info!(
                 "Quota pre-check complete: status={}, 5h={:.0}%, 7d={:.0}%, type={:?}",
                 rl.status.as_deref().unwrap_or("unknown"),
@@ -596,22 +626,29 @@ pub async fn messages_sync(
     // Inject metadata.user_id for rate-limit attribution.
     crate::client_identity::inject_metadata(&mut body, session_id);
 
-    // Role-based model override — see PLANNER_MODEL. Done before
-    // model_in_body is read below so every downstream check (betas, billing
-    // block, family-keyed rate limiting, the eventual outgoing request) sees
-    // the overridden model, not whatever ARTEX's shared llm_profile asked
-    // for.
-    let is_planner = is_planner_session(session_id);
-    if is_planner {
+    // Session-sticky cyber-refusal downgrade (see ProxyState::refusal_downgrades)
+    // — the only model override this gateway performs. It only ever kicks in
+    // after a refusal+fallback has already happened for this session; the
+    // model ARTEX's caller sends is otherwise passed through unmodified.
+    let downgraded_model = state
+        .refusal_downgrades
+        .read()
+        .await
+        .get(session_id)
+        .cloned();
+    if let Some(dm) = &downgraded_model {
         if let Some(obj) = body.as_object_mut() {
-            obj.insert("model".to_string(), serde_json::Value::String(PLANNER_MODEL.to_string()));
+            obj.insert("model".to_string(), serde_json::Value::String(dm.clone()));
         }
     }
 
     // Owned (not &str into `body`) so it outlives the mutable borrows below
     // (billing-block injection) — still used for the family/haiku checks
     // here and for headers/logging further down.
-    let model_in_body = body.get("model").and_then(|v| v.as_str()).map(str::to_string);
+    let model_in_body = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     // Resolved once, up front: both pre-flight checks and the eventual
     // update_rate_limits() call must all key off the SAME family, so a
     // Fable call is never gated by Sonnet's cached status or vice versa.
@@ -619,7 +656,11 @@ pub async fn messages_sync(
 
     // Non-Haiku models require the billing-header system block or the server
     // rejects with a generic 429 "Error". Haiku accepts requests without it.
-    if model_in_body.as_deref().map(|m| !is_haiku_model(m)).unwrap_or(false) {
+    if model_in_body
+        .as_deref()
+        .map(|m| !is_haiku_model(m))
+        .unwrap_or(false)
+    {
         crate::client_identity::inject_billing_system_block(&mut body);
     }
 
@@ -636,7 +677,12 @@ pub async fn messages_sync(
 
     // Pre-flight: check cached rate limit (this family only)
     if let Some(msg) = state.pre_flight_check(family).await {
-        let resets_at = state.rate_limit.read().await.get(&family).and_then(|rl| rl.resets_at);
+        let resets_at = state
+            .rate_limit
+            .read()
+            .await
+            .get(&family)
+            .and_then(|rl| rl.resets_at);
         return Err(ProxyError::RateLimited {
             message: Some(msg),
             resets_at,
@@ -656,7 +702,12 @@ pub async fn messages_sync(
     // Re-check after acquiring semaphore: a concurrent request may have just
     // been rejected and updated the cached state while we were waiting.
     if let Some(msg) = state.pre_flight_check(family).await {
-        let resets_at = state.rate_limit.read().await.get(&family).and_then(|rl| rl.resets_at);
+        let resets_at = state
+            .rate_limit
+            .read()
+            .await
+            .get(&family)
+            .and_then(|rl| rl.resets_at);
         return Err(ProxyError::RateLimited {
             message: Some(msg),
             resets_at,
@@ -742,50 +793,73 @@ pub async fn messages_sync(
                     // can't regress the way `fallbacks` did.
                     let stop_reason = resp_body.get("stop_reason").and_then(|v| v.as_str());
                     if stop_reason == Some("refusal") {
-                        let category = resp_body.get("stop_details").and_then(|d| d.get("category")).cloned();
+                        let category = resp_body
+                            .get("stop_details")
+                            .and_then(|d| d.get("category"))
+                            .cloned();
                         tracing::warn!(
                             "[refusal] session={} category={:?} model={:?}",
                             session_id,
                             category,
                             resp_body.get("model"),
                         );
-                        // Chained, not single-step: real incident 2026-10-24 —
-                        // a planner round whose only call got refused on
-                        // Opus 5.5, retried on Sonnet 5.5, ALSO got refused
-                        // (same growing context, same classifier trip) —
-                        // produced zero intents for three consecutive
-                        // heartbeats straight (planner has no idle-round
-                        // nudge-retry the way workers do, so an empty round
-                        // just silently "completes"). Opus 4.8 is the most
-                        // permissive model proven today, so it's the last
-                        // rung for every role, not just worker/compactor's.
-                        let fallback_chain: &[&str] = if is_planner {
-                            &[PLANNER_REFUSAL_FALLBACK_MODEL, REFUSAL_FALLBACK_MODEL]
-                        } else {
-                            &[REFUSAL_FALLBACK_MODEL]
-                        };
-                        for &fallback_model in fallback_chain {
-                            if model_in_body.as_deref() == Some(fallback_model) {
-                                continue; // already the model that just got refused
-                            }
-                            match retry_on_fallback_model(&state.client, &url, &token.access_token, extra_betas, &body, fallback_model).await {
+                        // Single same-family rung, matching Claude Code's own
+                        // documented fallback ladder (code.claude.com/docs/en/
+                        // model-config, read 2026-10-25): Opus 5(.5) -> Opus
+                        // 4.8, Sonnet 5.5 -> Sonnet 5 — no cross-family hop,
+                        // and nothing further once already on the bottom rung.
+                        // Whatever happens, the outcome is recorded in
+                        // refusal_downgrades so every later request on this
+                        // session_id skips straight to the fallback model
+                        // instead of re-paying for a primary-model attempt
+                        // that's already known to be refused on this
+                        // session's content (replaces the 2026-10-24 chain
+                        // that re-tried the primary from scratch every
+                        // heartbeat and burned a 3-call-per-round budget for
+                        // zero output during the Oct 24 stall).
+                        if let Some(fallback_model) =
+                            same_family_refusal_fallback(model_in_body.as_deref().unwrap_or(""))
+                        {
+                            match retry_on_fallback_model(
+                                &state.client,
+                                &url,
+                                &token.access_token,
+                                extra_betas,
+                                &body,
+                                fallback_model,
+                            )
+                            .await
+                            {
                                 Ok(fallback_body) => {
-                                    let fb_stop = fallback_body.get("stop_reason").and_then(|v| v.as_str());
+                                    let fb_stop =
+                                        fallback_body.get("stop_reason").and_then(|v| v.as_str());
                                     tracing::warn!(
                                         "[refusal-retry] session={} category={:?} fallback_model={} fallback_stop_reason={:?}",
                                         session_id, category, fallback_model, fb_stop,
                                     );
+                                    state
+                                        .refusal_downgrades
+                                        .write()
+                                        .await
+                                        .insert(session_id.to_string(), fallback_model.to_string());
                                     if fb_stop != Some("refusal") {
                                         return Ok((fallback_body, 200));
                                     }
-                                    // This rung also declined — try the next one, if any.
+                                    // Bottom rung also declined — fall through and
+                                    // return the original refusal. The session stays
+                                    // recorded as downgraded regardless, so we don't
+                                    // re-pay for the primary model next heartbeat.
                                 }
-                                Err(e) => tracing::warn!("[refusal-retry] session={} request failed: {}", session_id, e),
+                                Err(e) => tracing::warn!(
+                                    "[refusal-retry] session={} request failed: {}",
+                                    session_id,
+                                    e
+                                ),
                             }
                         }
-                        // Every rung declined (or errored) — fall through and
-                        // return the original refusal; ARTEX's idle-round
-                        // retry (worker/compactor only) is the last resort.
+                        // No documented fallback for this model (already the
+                        // bottom rung, or a family with no documented ladder)
+                        // — nothing further to try; return the original refusal.
                     }
                 }
 
@@ -816,7 +890,11 @@ pub async fn messages_sync(
                 }
 
                 let map = state.rate_limit.read().await;
-                let msg = map.get(&family).cloned().unwrap_or_default().rejection_message();
+                let msg = map
+                    .get(&family)
+                    .cloned()
+                    .unwrap_or_default()
+                    .rejection_message();
                 drop(map);
 
                 // Dump headers + raw body for debugging
@@ -896,21 +974,35 @@ pub async fn messages_stream(
     // Inject metadata.user_id for rate-limit attribution.
     crate::client_identity::inject_metadata(&mut body, session_id);
 
-    // See messages_sync: role-based model override.
-    if is_planner_session(session_id) {
+    // See messages_sync: session-sticky cyber-refusal downgrade — the only
+    // model override this gateway performs.
+    if let Some(dm) = state
+        .refusal_downgrades
+        .read()
+        .await
+        .get(session_id)
+        .cloned()
+    {
         if let Some(obj) = body.as_object_mut() {
-            obj.insert("model".to_string(), serde_json::Value::String(PLANNER_MODEL.to_string()));
+            obj.insert("model".to_string(), serde_json::Value::String(dm));
         }
     }
 
     // Owned — see messages_sync for why (outlives the mutable borrow below).
-    let model_in_body = body.get("model").and_then(|v| v.as_str()).map(str::to_string);
+    let model_in_body = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     // See messages_sync: resolved once so every rate-limit check/update below
     // keys off the same family.
     let family = models::family_of(model_in_body.as_deref().unwrap_or(""));
 
     // Non-Haiku billing-header system block (see messages_sync).
-    if model_in_body.as_deref().map(|m| !is_haiku_model(m)).unwrap_or(false) {
+    if model_in_body
+        .as_deref()
+        .map(|m| !is_haiku_model(m))
+        .unwrap_or(false)
+    {
         crate::client_identity::inject_billing_system_block(&mut body);
     }
 
@@ -1041,6 +1133,36 @@ impl ProxyError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn same_family_refusal_fallback_stays_within_family() {
+        assert_eq!(
+            same_family_refusal_fallback("claude-opus-5-5"),
+            Some(REFUSAL_FALLBACK_MODEL)
+        );
+        assert_eq!(
+            same_family_refusal_fallback("claude-opus-5"),
+            Some(REFUSAL_FALLBACK_MODEL)
+        );
+        assert_eq!(
+            same_family_refusal_fallback("claude-sonnet-5-5"),
+            Some(SONNET_REFUSAL_FALLBACK_MODEL)
+        );
+    }
+
+    #[test]
+    fn same_family_refusal_fallback_has_no_further_rung_at_the_bottom() {
+        // Already the documented bottom rung for each family — no cross-family
+        // hop, matching "the session stays on the fallback model" (there is
+        // nothing further to try, not a jump to a different family).
+        assert_eq!(same_family_refusal_fallback(REFUSAL_FALLBACK_MODEL), None);
+        assert_eq!(
+            same_family_refusal_fallback(SONNET_REFUSAL_FALLBACK_MODEL),
+            None
+        );
+        assert_eq!(same_family_refusal_fallback("claude-haiku-5-5"), None);
+        assert_eq!(same_family_refusal_fallback(""), None);
+    }
+
     #[tokio::test]
     async fn fable_7d_oi_headers_override_the_generic_7d_figure() {
         // Regression: 2026-10-24 — confirmed live that a Fable response
@@ -1050,35 +1172,41 @@ mod tests {
         // status/utilization/reset must win so Fable's cached state reflects
         // Fable's own constraint, not the unrelated general pool's.
         let mut headers = HeaderMap::new();
-        headers.insert("anthropic-ratelimit-unified-status", HeaderValue::from_static("allowed_warning"));
-        headers.insert("anthropic-ratelimit-unified-7d-utilization", HeaderValue::from_static("0.92"));
-        headers.insert("anthropic-ratelimit-unified-reset", HeaderValue::from_static("1000"));
-        headers.insert("anthropic-ratelimit-unified-7d_oi-status", HeaderValue::from_static("allowed"));
-        headers.insert("anthropic-ratelimit-unified-7d_oi-utilization", HeaderValue::from_static("0.0"));
-        headers.insert("anthropic-ratelimit-unified-7d_oi-reset", HeaderValue::from_static("2000"));
+        headers.insert(
+            "anthropic-ratelimit-unified-status",
+            HeaderValue::from_static("allowed_warning"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            HeaderValue::from_static("0.92"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-reset",
+            HeaderValue::from_static("1000"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-status",
+            HeaderValue::from_static("allowed"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-utilization",
+            HeaderValue::from_static("0.0"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d_oi-reset",
+            HeaderValue::from_static("2000"),
+        );
 
         let state = ProxyState::new(1);
-        state.update_rate_limits(&headers, models::ModelFamily::Fable).await;
+        state
+            .update_rate_limits(&headers, models::ModelFamily::Fable)
+            .await;
 
         let map = state.rate_limit.read().await;
         let rl = map.get(&models::ModelFamily::Fable).unwrap();
         assert_eq!(rl.status, Some("allowed".to_string()));
         assert_eq!(rl.utilization_7d, Some(0.0));
         assert_eq!(rl.resets_at, Some(2000.0));
-    }
-
-    #[test]
-    fn is_planner_session_matches_by_suffix_only() {
-        // Matches ARTEX's actual session_id convention: plannerSystem/Plan
-        // use fmt.Sprintf("exp%d-planner", ...) in planner.go; workers use
-        // WorkerSessionID's "exp%d-worker-i%d" in worker.go. Suffix match
-        // (not substring) so a hypothetical future "-planner-something" role
-        // isn't accidentally swept into the planner override.
-        assert!(is_planner_session("exp3-planner"));
-        assert!(is_planner_session("exp42-planner"));
-        assert!(!is_planner_session("exp3-worker-i470"));
-        assert!(!is_planner_session("exp3-compactor"));
-        assert!(!is_planner_session("exp3-planner-something"));
     }
 
     #[test]

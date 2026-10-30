@@ -387,10 +387,22 @@ mod tests {
         // prefix scan, where "claude-sonnet-5-5".starts_with("claude-sonnet-5")
         // silently resolved it (and canonical_model_id/the request body with
         // it) down to plain Sonnet 5 — same bug for Opus 5.5 / Opus 5.
-        assert_eq!(resolve_model("claude-sonnet-5-5").unwrap().id, "claude-sonnet-5-5");
-        assert_eq!(resolve_model("claude-opus-5-5").unwrap().id, "claude-opus-5-5");
-        assert_eq!(resolve_model("claude-haiku-5-5").unwrap().id, "claude-haiku-5-5");
-        assert_eq!(resolve_model("claude-fable-5-1").unwrap().id, "claude-fable-5-1");
+        assert_eq!(
+            resolve_model("claude-sonnet-5-5").unwrap().id,
+            "claude-sonnet-5-5"
+        );
+        assert_eq!(
+            resolve_model("claude-opus-5-5").unwrap().id,
+            "claude-opus-5-5"
+        );
+        assert_eq!(
+            resolve_model("claude-haiku-5-5").unwrap().id,
+            "claude-haiku-5-5"
+        );
+        assert_eq!(
+            resolve_model("claude-fable-5-1").unwrap().id,
+            "claude-fable-5-1"
+        );
     }
 
     #[test]

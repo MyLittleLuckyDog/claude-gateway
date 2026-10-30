@@ -243,7 +243,8 @@ async fn send_message(
 
                     if let Some(ps) = state.proxy.as_ref() {
                         let map = ps.rate_limit.read().await;
-                        if let Some(warning) = map.get(&family).and_then(|rl| rl.warning_message()) {
+                        if let Some(warning) = map.get(&family).and_then(|rl| rl.warning_message())
+                        {
                             obj.insert("rate_limit_warning".to_string(), json!(warning));
                         }
                     }

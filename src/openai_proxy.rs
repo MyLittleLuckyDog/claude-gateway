@@ -96,3 +96,28 @@ pub async fn responses_stream(
     let status = resp.status().as_u16();
     Ok((resp, status))
 }
+
+pub async fn chat_completions(
+    state: &OpenAiProxyState,
+    body: serde_json::Value,
+) -> Result<(reqwest::Response, u16), GatewayError> {
+    state.total_requests.fetch_add(1, Ordering::Relaxed);
+    let headers = auth_headers(&state.api_key)?;
+    let url = format!(
+        "{}/v1/chat/completions",
+        state.base_url.trim_end_matches('/')
+    );
+
+    let resp = state
+        .client
+        .post(url)
+        .headers(headers)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            GatewayError::CliConnection(format!("OpenAI chat/completions request failed: {}", e))
+        })?;
+    let status = resp.status().as_u16();
+    Ok((resp, status))
+}
