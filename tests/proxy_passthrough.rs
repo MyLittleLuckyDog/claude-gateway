@@ -8,7 +8,7 @@ mod common;
 
 use claude_agent::proxy;
 use claude_agent::proxy_session::{ProxySession, SessionOptions};
-use common::{start, user_turns};
+use common::{refusal_reply, start, user_turns};
 use serde_json::{json, Value};
 
 // ── Measurements ───────────────────────────────────────────────────
@@ -82,6 +82,46 @@ async fn repeated_identical_requests_do_not_grow() {
         assert_eq!(r, &reqs[0], "upstream body drifted between identical calls");
         assert_eq!(r["system"].as_array().map(Vec::len), Some(2));
     }
+}
+
+/// The model the caller asked for is the model that is sent, on every call,
+/// even right after the upstream refused an earlier request in the same
+/// session. A silent model switch also invalidates the provider-side prompt
+/// cache, which shows up as input tokens ballooning.
+#[tokio::test]
+async fn model_is_never_substituted_after_a_refusal() {
+    let (state, up) = start().await;
+    up.push(refusal_reply("claude-opus-5-5"));
+
+    let mut first_stop_reason = Value::Null;
+    for i in 0..3 {
+        let body = json!({
+            "model": "claude-opus-5-5",
+            "max_tokens": 64,
+            "messages": user_turns(3),
+        });
+        let (resp, _) = proxy::messages_sync(&state, body, None, "sess-refusal")
+            .await
+            .expect("messages_sync");
+        if i == 0 {
+            first_stop_reason = resp["stop_reason"].clone();
+        }
+    }
+
+    let models: Vec<String> = up
+        .requests
+        .lock()
+        .expect("lock")
+        .iter()
+        .map(|r| r["model"].as_str().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(
+        models,
+        vec!["claude-opus-5-5"; 3],
+        "upstream saw a model other than the one requested"
+    );
+    // The refusal is handed back to the caller as-is, not papered over.
+    assert_eq!(first_stop_reason, "refusal");
 }
 
 /// Session mode re-sends the whole server-side history every turn, so its

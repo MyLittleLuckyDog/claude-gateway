@@ -31,48 +31,6 @@ const BASE_DELAY_MS: u64 = 500;
 /// Max backoff delay (ms)
 const MAX_DELAY_MS: u64 = 32_000;
 
-/// Model a refused worker/compactor request is manually retried on (verified
-/// 2026-10-24 via a plain curl call — ordinary request, no `fallbacks` param
-/// — to actually accept this model before wiring it in). Anthropic's own
-/// fallback routing for Fable/Opus-5.5 cyber refusals targets this same
-/// older model.
-const REFUSAL_FALLBACK_MODEL: &str = "claude-opus-4-8";
-
-// REMOVED 2026-10-25 (user-directed revert): this file used to force every
-// `exp*-planner` session onto a hardcoded `claude-opus-5-5`, overriding
-// whatever model ARTEX's own llm_profile actually asked for. The gateway's
-// job is to pass the caller's model choice through, not to silently
-// override it — ARTEX's own default (`llm_profiles.is_default`) is the
-// right place to pick a model, and it already points at
-// `claude-sonnet-5-5`. The override also made the planner's cyber-refusal
-// problem worse: opus-5-5 and its same-family fallback opus-4-8 were both
-// getting refused every heartbeat, burning a full cache-write cycle
-// (~43k tokens) for zero output.
-
-/// Fallback target for a refused Sonnet-5.5 request — Claude Code's own
-/// documented behavior (code.claude.com/docs/en/model-config, read
-/// 2026-10-25): a cyber-flagged Sonnet 5.5 request re-runs on Sonnet 5,
-/// *same family*, not a jump to Opus. Mirroring the official ladder here
-/// instead of the cross-family chain this file used before 2026-10-25.
-const SONNET_REFUSAL_FALLBACK_MODEL: &str = "claude-sonnet-5";
-
-/// Same-family cyber-refusal fallback, per Claude Code's documented model
-/// fallback behavior: Opus 5(.5) -> Opus 4.8, Sonnet 5.5 -> Sonnet 5. Returns
-/// None when `primary` is already the bottom rung (or has no documented
-/// fallback, e.g. Haiku) — matching "the session stays on the fallback model
-/// until explicitly changed", i.e. there is nothing further to try, not a
-/// cross-family hop. (2026-10-25: replaced the old PLANNER_REFUSAL_FALLBACK_MODEL
-/// cross-family chain — Opus primary falling back through Sonnet 5.5 before
-/// Opus 4.8 — which didn't match the official per-family ladder and cost an
-/// extra wasted call on every refusal.)
-fn same_family_refusal_fallback(primary: &str) -> Option<&'static str> {
-    match primary {
-        "claude-opus-5-5" | "claude-opus-5" => Some(REFUSAL_FALLBACK_MODEL),
-        "claude-sonnet-5-5" => Some(SONNET_REFUSAL_FALLBACK_MODEL),
-        _ => None,
-    }
-}
-
 // ── Rate Limit State ───────────────────────────────────────────────
 
 /// Rate limit state extracted from API response headers.
@@ -183,13 +141,6 @@ pub struct ProxyState {
     /// request.
     pub rate_limit:
         tokio::sync::RwLock<std::collections::HashMap<models::ModelFamily, RateLimitStatus>>,
-    /// Session-sticky cyber-refusal downgrade, per Claude Code's documented
-    /// behavior ("the session stays on the fallback model until you switch
-    /// back with /model" — code.claude.com/docs/en/model-config). Keyed by
-    /// session_id, value is the fallback model to use for every subsequent
-    /// request in that session, skipping the primary model entirely instead
-    /// of re-paying for a refused primary-model attempt every heartbeat.
-    pub refusal_downgrades: tokio::sync::RwLock<std::collections::HashMap<String, String>>,
 }
 
 impl ProxyState {
@@ -211,7 +162,6 @@ impl ProxyState {
             total_input_tokens: AtomicU64::new(0),
             total_output_tokens: AtomicU64::new(0),
             rate_limit: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-            refusal_downgrades: tokio::sync::RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -456,43 +406,6 @@ fn build_headers(
     Ok(headers)
 }
 
-/// Manually retries a refused request on `fallback_model`, as a plain,
-/// independent request — same body, only `model` changed, no `fallbacks`
-/// param. Single attempt, no inner retry loop: this is a last-chance path for
-/// an already-refused call, not the main request path, so it stays simple.
-async fn retry_on_fallback_model(
-    client: &reqwest::Client,
-    url: &str,
-    access_token: &str,
-    extra_betas: Option<&[String]>,
-    original_body: &serde_json::Value,
-    fallback_model: &str,
-) -> Result<serde_json::Value, String> {
-    let mut body = original_body.clone();
-    if let Some(obj) = body.as_object_mut() {
-        obj.insert(
-            "model".to_string(),
-            serde_json::Value::String(fallback_model.to_string()),
-        );
-    }
-    let headers = build_headers(access_token, extra_betas, Some(fallback_model))?;
-    let resp = client
-        .post(url)
-        .headers(headers)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("{e}"))?;
-    let status = resp.status();
-    if status != reqwest::StatusCode::OK {
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("status {status}: {text}"));
-    }
-    resp.json::<serde_json::Value>()
-        .await
-        .map_err(|e| format!("parse: {e}"))
-}
-
 /// Best-effort OS classification for the `x-stainless-os` header.
 fn stainless_os() -> &'static str {
     if cfg!(target_os = "macos") {
@@ -635,22 +548,6 @@ pub async fn messages_sync(
     // Inject metadata.user_id for rate-limit attribution.
     crate::client_identity::inject_metadata(&mut body, session_id);
 
-    // Session-sticky cyber-refusal downgrade (see ProxyState::refusal_downgrades)
-    // — the only model override this gateway performs. It only ever kicks in
-    // after a refusal+fallback has already happened for this session; the
-    // model ARTEX's caller sends is otherwise passed through unmodified.
-    let downgraded_model = state
-        .refusal_downgrades
-        .read()
-        .await
-        .get(session_id)
-        .cloned();
-    if let Some(dm) = &downgraded_model {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("model".to_string(), serde_json::Value::String(dm.clone()));
-        }
-    }
-
     // Owned (not &str into `body`) so it outlives the mutable borrows below
     // (billing-block injection) — still used for the family/haiku checks
     // here and for headers/logging further down.
@@ -790,85 +687,19 @@ pub async fn messages_sync(
                         "[measure] response usage: {}",
                         serde_json::to_string(usage).unwrap_or_default(),
                     );
-                    // Root-caused 2026-10-23: output_tokens:0 responses are Anthropic
-                    // safety-classifier refusals (stop_reason:"refusal"), not a bug —
-                    // norma has no refusal handling, so without a fallback it silently
-                    // stalls until its own idle-round retry nudges it minutes later.
-                    // The server-side `fallbacks` param is NOT the fix (see REVERTED
-                    // note above — it 400s outright on this account for
-                    // claude-sonnet-5). Instead, manually retry once on a different
-                    // model as an entirely separate, ordinary request — no shared
-                    // param, so a normal call's request shape never changes and
-                    // can't regress the way `fallbacks` did.
-                    let stop_reason = resp_body.get("stop_reason").and_then(|v| v.as_str());
-                    if stop_reason == Some("refusal") {
-                        let category = resp_body
-                            .get("stop_details")
-                            .and_then(|d| d.get("category"))
-                            .cloned();
+                    // output_tokens:0 with stop_reason:"refusal" is Anthropic's
+                    // safety classifier declining the request. Log it for
+                    // visibility, but hand the response back unchanged: the
+                    // gateway never swaps in a different model.
+                    if resp_body.get("stop_reason").and_then(|v| v.as_str()) == Some("refusal") {
                         tracing::warn!(
                             "[refusal] session={} category={:?} model={:?}",
                             session_id,
-                            category,
+                            resp_body
+                                .get("stop_details")
+                                .and_then(|d| d.get("category")),
                             resp_body.get("model"),
                         );
-                        // Single same-family rung, matching Claude Code's own
-                        // documented fallback ladder (code.claude.com/docs/en/
-                        // model-config, read 2026-10-25): Opus 5(.5) -> Opus
-                        // 4.8, Sonnet 5.5 -> Sonnet 5 — no cross-family hop,
-                        // and nothing further once already on the bottom rung.
-                        // Whatever happens, the outcome is recorded in
-                        // refusal_downgrades so every later request on this
-                        // session_id skips straight to the fallback model
-                        // instead of re-paying for a primary-model attempt
-                        // that's already known to be refused on this
-                        // session's content (replaces the 2026-10-24 chain
-                        // that re-tried the primary from scratch every
-                        // heartbeat and burned a 3-call-per-round budget for
-                        // zero output during the Oct 24 stall).
-                        if let Some(fallback_model) =
-                            same_family_refusal_fallback(model_in_body.as_deref().unwrap_or(""))
-                        {
-                            match retry_on_fallback_model(
-                                &state.client,
-                                &url,
-                                &token.access_token,
-                                extra_betas,
-                                &body,
-                                fallback_model,
-                            )
-                            .await
-                            {
-                                Ok(fallback_body) => {
-                                    let fb_stop =
-                                        fallback_body.get("stop_reason").and_then(|v| v.as_str());
-                                    tracing::warn!(
-                                        "[refusal-retry] session={} category={:?} fallback_model={} fallback_stop_reason={:?}",
-                                        session_id, category, fallback_model, fb_stop,
-                                    );
-                                    state
-                                        .refusal_downgrades
-                                        .write()
-                                        .await
-                                        .insert(session_id.to_string(), fallback_model.to_string());
-                                    if fb_stop != Some("refusal") {
-                                        return Ok((fallback_body, 200));
-                                    }
-                                    // Bottom rung also declined — fall through and
-                                    // return the original refusal. The session stays
-                                    // recorded as downgraded regardless, so we don't
-                                    // re-pay for the primary model next heartbeat.
-                                }
-                                Err(e) => tracing::warn!(
-                                    "[refusal-retry] session={} request failed: {}",
-                                    session_id,
-                                    e
-                                ),
-                            }
-                        }
-                        // No documented fallback for this model (already the
-                        // bottom rung, or a family with no documented ladder)
-                        // — nothing further to try; return the original refusal.
                     }
                 }
 
@@ -982,20 +813,6 @@ pub async fn messages_stream(
 ) -> Result<(reqwest::Response, u16), ProxyError> {
     // Inject metadata.user_id for rate-limit attribution.
     crate::client_identity::inject_metadata(&mut body, session_id);
-
-    // See messages_sync: session-sticky cyber-refusal downgrade — the only
-    // model override this gateway performs.
-    if let Some(dm) = state
-        .refusal_downgrades
-        .read()
-        .await
-        .get(session_id)
-        .cloned()
-    {
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("model".to_string(), serde_json::Value::String(dm));
-        }
-    }
 
     // Owned — see messages_sync for why (outlives the mutable borrow below).
     let model_in_body = body
@@ -1141,36 +958,6 @@ impl ProxyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn same_family_refusal_fallback_stays_within_family() {
-        assert_eq!(
-            same_family_refusal_fallback("claude-opus-5-5"),
-            Some(REFUSAL_FALLBACK_MODEL)
-        );
-        assert_eq!(
-            same_family_refusal_fallback("claude-opus-5"),
-            Some(REFUSAL_FALLBACK_MODEL)
-        );
-        assert_eq!(
-            same_family_refusal_fallback("claude-sonnet-5-5"),
-            Some(SONNET_REFUSAL_FALLBACK_MODEL)
-        );
-    }
-
-    #[test]
-    fn same_family_refusal_fallback_has_no_further_rung_at_the_bottom() {
-        // Already the documented bottom rung for each family — no cross-family
-        // hop, matching "the session stays on the fallback model" (there is
-        // nothing further to try, not a jump to a different family).
-        assert_eq!(same_family_refusal_fallback(REFUSAL_FALLBACK_MODEL), None);
-        assert_eq!(
-            same_family_refusal_fallback(SONNET_REFUSAL_FALLBACK_MODEL),
-            None
-        );
-        assert_eq!(same_family_refusal_fallback("claude-haiku-5-5"), None);
-        assert_eq!(same_family_refusal_fallback(""), None);
-    }
 
     #[tokio::test]
     async fn fable_7d_oi_headers_override_the_generic_7d_figure() {
