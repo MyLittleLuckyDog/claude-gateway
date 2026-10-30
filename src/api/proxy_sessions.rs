@@ -542,6 +542,7 @@ async fn update_session_from_accumulator(
     };
 
     let input_tokens = acc.input_tokens;
+    let cache_input_tokens = acc.cache_input_tokens;
     let output_tokens = acc.output_tokens;
     let content_blocks = acc.into_content_blocks();
 
@@ -554,7 +555,9 @@ async fn update_session_from_accumulator(
                 }));
                 session.total_input_tokens += input_tokens;
                 session.total_output_tokens += output_tokens;
-                session.last_input_tokens = input_tokens;
+                // Cache tokens are part of the context the model saw — see
+                // ProxySession::record_assistant_response.
+                session.last_input_tokens = input_tokens + cache_input_tokens;
                 session.last_output_tokens = output_tokens;
                 session.last_activity = crate::proxy_session::epoch_secs();
             })

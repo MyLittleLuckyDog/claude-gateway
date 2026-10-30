@@ -208,8 +208,16 @@ impl ProxySession {
                 .unwrap_or(0);
             self.total_input_tokens += input;
             self.total_output_tokens += output;
+            // `input_tokens` excludes prompt-cache tokens: with caching on, it
+            // is only the uncached tail. The context the model actually saw
+            // is the sum, so count all three or the size estimate (and with it
+            // the preflight check) collapses as soon as the cache works.
+            let cached = ["cache_creation_input_tokens", "cache_read_input_tokens"]
+                .iter()
+                .map(|k| usage.get(*k).and_then(|v| v.as_u64()).unwrap_or(0))
+                .sum::<u64>();
             // Overwrite — last turn's counts approximate current context
-            self.last_input_tokens = input;
+            self.last_input_tokens = input + cached;
             self.last_output_tokens = output;
         }
 
@@ -389,4 +397,57 @@ pub fn epoch_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn session() -> ProxySession {
+        ProxySession::new("s".to_string(), SessionOptions::default(), 3600)
+    }
+
+    #[test]
+    fn context_estimate_counts_prompt_cache_tokens() {
+        let mut s = session();
+        s.record_assistant_response(&json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {
+                "input_tokens": 20,
+                "cache_creation_input_tokens": 1_000,
+                "cache_read_input_tokens": 150_000,
+                "output_tokens": 50,
+            },
+        }));
+        assert_eq!(s.last_input_tokens, 151_020);
+        assert_eq!(s.estimated_context_tokens(), 151_070);
+        // The cumulative counter stays the plain input count.
+        assert_eq!(s.total_input_tokens, 20);
+    }
+
+    #[test]
+    fn preflight_blocks_when_cached_context_would_overflow() {
+        let mut s = session();
+        let window = models::context_window(&s.model) as u64;
+        s.record_assistant_response(&json!({
+            "content": [],
+            "usage": {
+                "input_tokens": 5,
+                "cache_read_input_tokens": window,
+                "output_tokens": 0,
+            },
+        }));
+        assert!(s.preflight_check(1_000).is_err());
+    }
+
+    #[test]
+    fn context_estimate_without_cache_fields_is_unchanged() {
+        let mut s = session();
+        s.record_assistant_response(&json!({
+            "content": [],
+            "usage": {"input_tokens": 100, "output_tokens": 10},
+        }));
+        assert_eq!(s.estimated_context_tokens(), 110);
+    }
 }

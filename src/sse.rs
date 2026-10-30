@@ -262,6 +262,9 @@ pub struct StreamAccumulator {
     complete: bool,
     /// Token usage from message_start
     pub input_tokens: u64,
+    /// Prompt tokens served from or written to the cache, from message_start.
+    /// `input_tokens` excludes these, so the real context size is the sum.
+    pub cache_input_tokens: u64,
     /// Token usage from message_delta (final output count)
     pub output_tokens: u64,
     /// Stop reason
@@ -290,6 +293,7 @@ impl StreamAccumulator {
             blocks: HashMap::new(),
             complete: false,
             input_tokens: 0,
+            cache_input_tokens: 0,
             output_tokens: 0,
             stop_reason: None,
         }
@@ -301,6 +305,8 @@ impl StreamAccumulator {
             StreamEvent::MessageStart { message } => {
                 if let Some(usage) = &message.usage {
                     self.input_tokens = usage.input_tokens;
+                    self.cache_input_tokens =
+                        usage.cache_creation_input_tokens + usage.cache_read_input_tokens;
                     self.output_tokens = usage.output_tokens;
                 }
                 // message_start may include initial content blocks
@@ -823,5 +829,25 @@ mod tests {
         let events = parser.finish();
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], StreamEvent::MessageStop {}));
+    }
+
+    #[test]
+    fn message_start_cache_tokens_are_tracked_separately_from_input() {
+        let mut acc = StreamAccumulator::new();
+        acc.process_event(&StreamEvent::MessageStart {
+            message: MessageStartData {
+                id: Some("msg_1".to_string()),
+                model: Some("claude-sonnet-5-5".to_string()),
+                usage: Some(UsageData {
+                    input_tokens: 12,
+                    output_tokens: 0,
+                    cache_creation_input_tokens: 300,
+                    cache_read_input_tokens: 45_000,
+                }),
+                content: None,
+            },
+        });
+        assert_eq!(acc.input_tokens, 12);
+        assert_eq!(acc.cache_input_tokens, 45_300);
     }
 }
