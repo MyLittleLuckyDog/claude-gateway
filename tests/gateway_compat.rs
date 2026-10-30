@@ -530,3 +530,108 @@ async fn models_answer_404_when_the_proxy_is_disabled() {
         .expect("request");
     assert_eq!(resp.status(), 404);
 }
+
+fn overflow_400(input: u64, max_tokens: u64, limit: u64) -> common::Scripted {
+    common::Scripted {
+        status: 400,
+        headers: Vec::new(),
+        body: json!({"type": "error", "error": {
+            "type": "invalid_request_error",
+            "message": format!(
+                "input length and `max_tokens` exceed context limit: {input} + {max_tokens} > {limit}, \
+                 decrease input length or `max_tokens` and try again"
+            ),
+        }}),
+    }
+}
+
+fn upstream_max_tokens(up: &common::Upstream) -> Vec<u64> {
+    up.requests
+        .lock()
+        .expect("lock")
+        .iter()
+        .map(|r| r["max_tokens"].as_u64().unwrap_or(0))
+        .collect()
+}
+
+/// Token counts cannot be known locally, but the server states them when a
+/// request does not fit: `input + max_tokens > limit`. Claude Code reads those
+/// numbers and retries with `max_tokens = limit - input - 1000`; so does the
+/// gateway, instead of handing the caller a 400 it could not have avoided.
+#[tokio::test]
+async fn max_tokens_that_does_not_fit_is_lowered_from_the_servers_numbers() {
+    let (base, _proxy, up) = start_with_gateway().await;
+    up.push(overflow_400(990_000, 64_000, 1_000_000));
+    let mut body = messages_body();
+    body["max_tokens"] = json!(64_000);
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(resp.status(), 200);
+    // 1_000_000 - 990_000 - 1_000
+    assert_eq!(upstream_max_tokens(&up), [64_000, 9_000]);
+}
+
+#[tokio::test]
+async fn the_streaming_path_lowers_max_tokens_the_same_way() {
+    let (base, _proxy, up) = start_with_gateway().await;
+    up.push(overflow_400(990_000, 64_000, 1_000_000));
+    let mut body = messages_body();
+    body["max_tokens"] = json!(64_000);
+    body["stream"] = json!(true);
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&body)
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header(&resp, "content-type").as_deref(),
+        Some("text/event-stream")
+    );
+    let text = resp.text().await.expect("body");
+    assert!(text.contains("event: message_stop"), "{text:?}");
+    assert_eq!(upstream_max_tokens(&up), [64_000, 9_000]);
+}
+
+/// Less than 3,000 tokens left for the answer (the CLI's FLOOR_OUTPUT_TOKENS),
+/// or a request that is already at or below the adjusted value, is not retried:
+/// the caller gets upstream's own 400.
+#[tokio::test]
+async fn overflow_errors_that_cannot_be_fixed_by_lowering_max_tokens_pass_through() {
+    for (label, input, max_tokens, limit) in [
+        (
+            "only 500 tokens would be left",
+            998_500_u64,
+            64_000_u64,
+            1_000_000_u64,
+        ),
+        // 5005 - 10 - 1000 = 3995, but the request already asks for just 3000.
+        ("no progress possible", 10, 3_000, 5_005),
+    ] {
+        let (base, _proxy, up) = start_with_gateway().await;
+        up.push(overflow_400(input, max_tokens, limit));
+        let mut body = messages_body();
+        body["max_tokens"] = json!(max_tokens);
+
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .json(&body)
+            .send()
+            .await
+            .expect("request");
+
+        assert_eq!(resp.status(), 400, "{label}");
+        let text = resp.text().await.expect("body");
+        assert!(text.contains("exceed context limit"), "{label}: {text}");
+        assert_eq!(up.request_count(), 1, "{label}: must not retry");
+    }
+}

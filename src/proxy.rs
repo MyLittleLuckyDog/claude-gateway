@@ -759,7 +759,7 @@ async fn send_json(
 /// `session_id` must be provided by the caller: use a fresh UUID per request
 /// for the stateless direct proxy, or a stable per-session UUID for
 /// multi-turn proxy sessions. See `client_identity` module docs for why.
-pub async fn messages_sync(
+async fn messages_sync_once(
     state: &Arc<ProxyState>,
     mut body: serde_json::Value,
     extra_betas: Option<&[String]>,
@@ -1009,7 +1009,7 @@ pub async fn messages_sync(
 /// Pre-flight check + 401 handling. No retry for streaming (too complex).
 ///
 /// See `messages_sync` for the `session_id` contract.
-pub async fn messages_stream(
+async fn messages_stream_once(
     state: &Arc<ProxyState>,
     mut body: serde_json::Value,
     extra_betas: Option<&[String]>,
@@ -1109,6 +1109,163 @@ pub async fn messages_stream(
         }
 
         return Ok((resp, status));
+    }
+}
+
+// ── Context overflow: let the server say what fits ────────────────
+
+/// The least a reply may be given. Below this, lowering `max_tokens` cannot help
+/// (Claude Code's `FLOOR_OUTPUT_TOKENS`).
+const FLOOR_OUTPUT_TOKENS: u64 = 3_000;
+
+/// Tokens kept free beyond what the server counted, to absorb the slack between
+/// its count and the limit it enforces (the margin Claude Code leaves).
+const OVERFLOW_HEADROOM_TOKENS: u64 = 1_000;
+
+/// Most adjustments of one request. Each one has to lower `max_tokens`, so the
+/// loop ends anyway; this is a backstop.
+const MAX_OVERFLOW_ADJUSTMENTS: u32 = 3;
+
+/// The numbers in upstream's `400 input length and `max_tokens` exceed context
+/// limit: <input> + <max_tokens> > <limit>` error.
+#[derive(Debug, PartialEq, Eq)]
+struct ContextOverflow {
+    input_tokens: u64,
+    limit: u64,
+}
+
+impl ContextOverflow {
+    /// The `max_tokens` that fits: what is left of the window after the input
+    /// the server counted and the headroom, if that leaves a usable reply.
+    fn adjusted_max_tokens(&self) -> Option<u64> {
+        let available = self
+            .limit
+            .saturating_sub(self.input_tokens)
+            .saturating_sub(OVERFLOW_HEADROOM_TOKENS);
+        (available >= FLOOR_OUTPUT_TOKENS).then_some(available)
+    }
+}
+
+/// Read a run of ASCII digits off the front of `text`.
+fn take_number(text: &str) -> Option<(u64, &str)> {
+    let end = text.bytes().take_while(u8::is_ascii_digit).count();
+    let (digits, rest) = text.split_at(end);
+    digits.parse().ok().map(|n| (n, rest))
+}
+
+/// Parse the overflow error message. Claude Code matches
+/// `/input length and `max_tokens` exceed context limit: (\d+) \+ (\d+) > (\d+)/`.
+fn parse_context_overflow(message: &str) -> Option<ContextOverflow> {
+    const MARKER: &str = "input length and `max_tokens` exceed context limit: ";
+    let (_, rest) = message.split_once(MARKER)?;
+    let (input_tokens, rest) = take_number(rest)?;
+    let rest = rest.trim_start().strip_prefix('+')?.trim_start();
+    let (_max_tokens, rest) = take_number(rest)?;
+    let rest = rest.trim_start().strip_prefix('>')?.trim_start();
+    let (limit, _) = take_number(rest)?;
+    Some(ContextOverflow {
+        input_tokens,
+        limit,
+    })
+}
+
+/// The `max_tokens` to retry `request` with after upstream answered `error`,
+/// when the error is a context overflow that lowering `max_tokens` can fix. A
+/// retry that would not lower it is refused, so the caller gets upstream's 400.
+fn overflow_retry_max_tokens(
+    error: &serde_json::Value,
+    request: &serde_json::Value,
+) -> Option<u64> {
+    let message = error.get("error")?.get("message")?.as_str()?;
+    let adjusted = parse_context_overflow(message)?.adjusted_max_tokens()?;
+    match request
+        .get("max_tokens")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(current) if adjusted >= current => None,
+        _ => Some(adjusted),
+    }
+}
+
+/// Synchronous Messages API call.
+///
+/// Whether a request fits cannot be known without upstream's tokenizer, so
+/// this does what Claude Code does: send it, and when upstream answers that
+/// `input + max_tokens` exceeds the window, take the input count from the
+/// error and retry with `max_tokens = limit - input - 1000`.
+/// See `messages_sync_once` for the rest of the behavior and the `session_id`
+/// contract.
+pub async fn messages_sync(
+    state: &Arc<ProxyState>,
+    body: serde_json::Value,
+    extra_betas: Option<&[String]>,
+    session_id: &str,
+) -> Result<(serde_json::Value, u16), ProxyError> {
+    let mut body = body;
+    let mut adjustments = 0;
+    loop {
+        let (resp, status) =
+            messages_sync_once(state, body.clone(), extra_betas, session_id).await?;
+        if status == 400 && adjustments < MAX_OVERFLOW_ADJUSTMENTS {
+            if let Some(max_tokens) = overflow_retry_max_tokens(&resp, &body) {
+                adjustments += 1;
+                tracing::warn!(
+                    "[max_tokens] session={session_id} does not fit the context window; \
+                     retrying with max_tokens={max_tokens} (from upstream's own counts)"
+                );
+                body["max_tokens"] = serde_json::json!(max_tokens);
+                continue;
+            }
+        }
+        return Ok((resp, status));
+    }
+}
+
+/// Streaming Messages API call; lowers `max_tokens` on a context overflow like
+/// [`messages_sync`]. The overflow is reported before any streaming starts, as
+/// an ordinary 400, so the retry happens before the first byte is relayed.
+pub async fn messages_stream(
+    state: &Arc<ProxyState>,
+    body: serde_json::Value,
+    extra_betas: Option<&[String]>,
+    session_id: &str,
+) -> Result<(reqwest::Response, u16), ProxyError> {
+    let mut body = body;
+    let mut adjustments = 0;
+    loop {
+        let (resp, status) =
+            messages_stream_once(state, body.clone(), extra_betas, session_id).await?;
+        if status != 400 {
+            return Ok((resp, status));
+        }
+
+        // A 400 is a small JSON error. Read it to see whether lowering
+        // max_tokens fixes it; if not, hand back an equivalent response.
+        let headers = resp.headers().clone();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ProxyError::Transport(format!("Failed to read error response: {e}")))?;
+        if adjustments < MAX_OVERFLOW_ADJUSTMENTS {
+            let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            if let Some(max_tokens) = overflow_retry_max_tokens(&error, &body) {
+                adjustments += 1;
+                tracing::warn!(
+                    "[max_tokens] session={session_id} does not fit the context window; \
+                     retrying with max_tokens={max_tokens} (from upstream's own counts)"
+                );
+                body["max_tokens"] = serde_json::json!(max_tokens);
+                continue;
+            }
+        }
+        let mut rebuilt = axum::http::Response::builder().status(status);
+        if let Some(h) = rebuilt.headers_mut() {
+            *h = headers;
+        }
+        let rebuilt = rebuilt
+            .body(bytes)
+            .map_err(|e| ProxyError::Internal(format!("Failed to rebuild error response: {e}")))?;
+        return Ok((reqwest::Response::from(rebuilt), status));
     }
 }
 
@@ -1254,5 +1411,73 @@ mod tests {
         for bad in ["", "soon", "-5", "inf", "NaN", "12 minutes"] {
             assert_eq!(parse_retry_after_value(bad, now), None, "{bad:?}");
         }
+    }
+
+    // ── context overflow ───────────────────────────────────────────
+
+    #[test]
+    fn overflow_message_yields_the_servers_input_count() {
+        let msg = "input length and `max_tokens` exceed context limit: 990000 + 64000 > 1000000, \
+                   decrease input length or `max_tokens` and try again";
+        let overflow = parse_context_overflow(msg).expect("parses");
+        assert_eq!(
+            overflow,
+            ContextOverflow {
+                input_tokens: 990_000,
+                limit: 1_000_000
+            }
+        );
+        assert_eq!(overflow.adjusted_max_tokens(), Some(9_000));
+    }
+
+    #[test]
+    fn overflow_parser_ignores_other_errors() {
+        for msg in [
+            "",
+            "prompt is too long: 215000 tokens > 200000 maximum",
+            "input length and `max_tokens` exceed context limit: abc + 1 > 2",
+            "input length and `max_tokens` exceed context limit: 1 + 2",
+            "max_tokens: 200000 > 64000, which is the maximum allowed",
+        ] {
+            assert_eq!(parse_context_overflow(msg), None, "{msg:?}");
+        }
+    }
+
+    #[test]
+    fn adjusted_max_tokens_needs_room_for_a_real_reply() {
+        let at = |input, limit| ContextOverflow {
+            input_tokens: input,
+            limit,
+        };
+        // Exactly the 3,000-token floor is enough; one token less is not.
+        assert_eq!(at(196_000, 200_000).adjusted_max_tokens(), Some(3_000));
+        assert_eq!(at(196_001, 200_000).adjusted_max_tokens(), None);
+        // Input beyond the limit leaves nothing (and must not underflow).
+        assert_eq!(at(300_000, 200_000).adjusted_max_tokens(), None);
+    }
+
+    #[test]
+    fn a_retry_must_lower_max_tokens() {
+        let error = |input: u64, max: u64, limit: u64| {
+            serde_json::json!({"error": {"message": format!(
+                "input length and `max_tokens` exceed context limit: {input} + {max} > {limit}"
+            )}})
+        };
+        let request = |max: u64| serde_json::json!({"max_tokens": max});
+        // 200_000 - 150_000 - 1_000 = 49_000
+        assert_eq!(
+            overflow_retry_max_tokens(&error(150_000, 64_000, 200_000), &request(64_000)),
+            Some(49_000)
+        );
+        // Already at or below what would fit: nothing to gain.
+        assert_eq!(
+            overflow_retry_max_tokens(&error(150_000, 49_000, 200_000), &request(49_000)),
+            None
+        );
+        // A request that names no max_tokens can still be given one.
+        assert_eq!(
+            overflow_retry_max_tokens(&error(150_000, 64_000, 200_000), &serde_json::json!({})),
+            Some(49_000)
+        );
     }
 }

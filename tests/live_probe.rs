@@ -276,3 +276,69 @@ async fn model_catalog_matches_upstream_limits() {
     }
     eprintln!("[probe] mismatches: {mismatches:?}");
 }
+
+/// Which models reject a request whose `input + max_tokens` exceeds the window,
+/// and does the retry with the lowered `max_tokens` then go through? Models with
+/// a 200k window are used so that about 150k tokens of input plus `max_tokens`
+/// 64000 cannot fit. The input size is tuned with `count_tokens` (free); every
+/// request that is accepted is billed for that input.
+///
+/// "upstream attempts" is `ProxyState::total_requests`, which counts each
+/// upstream attempt of `messages_sync`: 1 means upstream took the request as it
+/// was, 2 means it was rejected for not fitting and the lowered retry succeeded.
+#[tokio::test]
+#[ignore = "calls the real Anthropic API; bills ~150k input tokens per accepted request"]
+async fn overflowing_max_tokens_is_lowered_and_the_request_succeeds() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+
+    for model in ["claude-sonnet-4-5", "claude-opus-4-5"] {
+        let state = Arc::new(ProxyState::new(1));
+        let build = |repeats: usize| -> Value {
+            let filler: String = (0..repeats)
+                .map(|i| {
+                    format!("Entry {i}: the quick brown fox number {i} jumps over lazy dog {i}. ")
+                })
+                .collect();
+            json!({
+                "model": model,
+                "max_tokens": 64_000,
+                "messages": [{"role": "user", "content": format!("{filler}\n\nReply with the single word: ok")}],
+            })
+        };
+
+        // Tune the input to ~150k tokens by counting, not guessing.
+        let mut repeats = 6_600usize;
+        let mut tokens = 0u64;
+        for _ in 0..4 {
+            let (counted, status) =
+                proxy::count_tokens(&state, &build(repeats), None, "live-probe")
+                    .await
+                    .expect("count_tokens");
+            assert_eq!(status, 200, "{counted}");
+            tokens = counted["input_tokens"].as_u64().expect("input_tokens");
+            if (140_000..=170_000).contains(&tokens) {
+                break;
+            }
+            repeats = (repeats as f64 * 150_000.0 / tokens as f64) as usize;
+        }
+        assert!(
+            (140_000..=170_000).contains(&tokens),
+            "could not tune the input: {tokens}"
+        );
+
+        let (resp, status) = proxy::messages_sync(&state, build(repeats), None, "live-probe")
+            .await
+            .expect("messages_sync");
+        let attempts = state
+            .total_requests
+            .load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "[probe] {model}: counted {tokens} input tokens + max_tokens 64000 -> status={status} \
+             upstream attempts={attempts} stop_reason={} error={}",
+            resp["stop_reason"], resp["error"]["message"]
+        );
+    }
+}
