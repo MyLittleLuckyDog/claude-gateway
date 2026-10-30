@@ -105,8 +105,10 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Initialize direct API proxy
-    let proxy = if config.proxy.enabled {
+    // Initialize direct API proxy. When it cannot start, the reason is kept so
+    // that the 501 every proxy route then answers can say why, not just "not
+    // enabled".
+    let (proxy, proxy_unavailable) = if config.proxy.enabled {
         match claude_agent::auth::get_oauth_token() {
             Ok(token) => {
                 tracing::info!(
@@ -114,24 +116,30 @@ async fn main() -> anyhow::Result<()> {
                     token.subscription_type,
                     token.rate_limit_tier
                 );
-                Some(Arc::new(claude_agent::proxy::ProxyState::new(
-                    config.proxy.max_concurrent,
-                )))
+                (
+                    Some(Arc::new(claude_agent::proxy::ProxyState::new(
+                        config.proxy.max_concurrent,
+                    ))),
+                    None,
+                )
             }
             Err(e) => {
                 tracing::warn!("Direct API proxy disabled: {}", e);
-                None
+                (
+                    None,
+                    Some(format!(
+                        "no usable Claude OAuth credentials at startup ({e}); fix them and restart the gateway"
+                    )),
+                )
             }
         }
     } else {
         tracing::info!("Direct API proxy disabled by config");
-        None
+        (
+            None,
+            Some("it is turned off in the configuration (proxy.enabled = false)".to_string()),
+        )
     };
-
-    // Run quota pre-check if proxy is enabled
-    if let Some(ref ps) = proxy {
-        claude_agent::proxy::check_quota_at_startup(ps).await;
-    }
 
     let proxy_sessions = proxy.as_ref().map(|_| {
         Arc::new(claude_agent::proxy_session::ProxySessionStore::new(
@@ -188,6 +196,7 @@ async fn main() -> anyhow::Result<()> {
         start_time: std::time::Instant::now(),
         stats: Arc::new(tokio::sync::Mutex::new(Stats::default())),
         proxy,
+        proxy_unavailable,
         proxy_sessions,
         local_mlx,
         openai,

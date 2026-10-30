@@ -37,6 +37,9 @@ pub struct AppState {
     pub start_time: std::time::Instant,
     pub stats: Arc<tokio::sync::Mutex<Stats>>,
     pub proxy: Option<Arc<ProxyState>>,
+    /// Why the direct API proxy is off, when `proxy` is `None`. Shown in the
+    /// 501 the proxy routes answer with.
+    pub proxy_unavailable: Option<String>,
     pub proxy_sessions: Option<Arc<ProxySessionStore>>,
     pub local_mlx: Option<Arc<LocalMlxProxyState>>,
     pub openai: Option<Arc<OpenAiProxyState>>,
@@ -86,6 +89,20 @@ pub fn with_page_info(mut body: serde_json::Value, page: serde_json::Value) -> s
         target.extend(fields);
     }
     body
+}
+
+/// The 501 every direct-proxy route answers when the proxy is not running, with
+/// the reason it is not.
+pub fn proxy_disabled_response(state: &AppState) -> Response {
+    let reason = state
+        .proxy_unavailable
+        .as_deref()
+        .unwrap_or("it was not started");
+    error_response(
+        501,
+        "proxy_disabled",
+        &format!("Direct API proxy is not enabled: {reason}"),
+    )
 }
 
 /// Mark a 429 for the caller: when to come back (`Retry-After`, whole seconds,

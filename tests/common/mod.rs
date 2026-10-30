@@ -349,6 +349,9 @@ async fn serve_gateway(proxy: Option<Arc<ProxyState>>) -> String {
         proxy_sessions: proxy
             .is_some()
             .then(|| Arc::new(ProxySessionStore::new(8, 3600))),
+        proxy_unavailable: proxy
+            .is_none()
+            .then(|| "the test started the gateway without credentials".to_string()),
         proxy,
         local_mlx: None,
         openai: None,

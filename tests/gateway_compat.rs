@@ -703,3 +703,36 @@ async fn an_empty_upstream_error_body_is_reported_as_such() {
         "{body}"
     );
 }
+
+/// Every direct-proxy route answers 501 when the proxy is not running. The
+/// message used to be the same fixed sentence whatever the cause; it now says
+/// why (no credentials at startup, or switched off in the configuration).
+#[tokio::test]
+async fn proxy_disabled_names_the_reason() {
+    let base = common::start_gateway_without_proxy().await;
+    let client = reqwest::Client::new();
+
+    for (method, path) in [
+        ("POST", "/v1/messages"),
+        ("POST", "/v1/messages/stream"),
+        ("GET", "/v1/rate_limit"),
+        ("GET", "/v1/proxy_stats"),
+        ("POST", "/v1/sessions"),
+        ("GET", "/v1/sessions"),
+    ] {
+        let url = format!("{base}{path}");
+        let req = match method {
+            "POST" => client.post(url).json(&messages_body()),
+            _ => client.get(url),
+        };
+        let resp = req.send().await.expect("request");
+        assert_eq!(resp.status(), 501, "{method} {path}");
+        let body: Value = resp.json().await.expect("json body");
+        assert_eq!(body["error"]["type"], "proxy_disabled", "{path}: {body}");
+        let message = body["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("the test started the gateway without credentials"),
+            "{path}: {message}"
+        );
+    }
+}

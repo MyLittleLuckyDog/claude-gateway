@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use super::error_response;
+use super::{error_response, proxy_disabled_response};
 use crate::api::AppState;
 use crate::proxy;
 use crate::proxy_session::SessionOptions;
@@ -47,7 +47,7 @@ async fn create_session(
 ) -> Response {
     let store = match state.proxy_sessions.as_ref() {
         Some(s) => s,
-        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
+        None => return proxy_disabled_response(&state),
     };
 
     match store.create(req.options).await {
@@ -69,7 +69,7 @@ async fn create_session(
 async fn list_sessions(State(state): State<AppState>) -> Response {
     let store = match state.proxy_sessions.as_ref() {
         Some(s) => s,
-        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
+        None => return proxy_disabled_response(&state),
     };
 
     let sessions = store.list().await;
@@ -81,7 +81,7 @@ async fn list_sessions(State(state): State<AppState>) -> Response {
 async fn get_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let store = match state.proxy_sessions.as_ref() {
         Some(s) => s,
-        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
+        None => return proxy_disabled_response(&state),
     };
 
     match store.get_snapshot(&id).await {
@@ -109,7 +109,7 @@ async fn get_session(State(state): State<AppState>, Path(id): Path<String>) -> R
 async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let store = match state.proxy_sessions.as_ref() {
         Some(s) => s,
-        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
+        None => return proxy_disabled_response(&state),
     };
 
     if store.delete(&id).await {
@@ -195,12 +195,12 @@ async fn send_message(
 ) -> Response {
     let store = match state.proxy_sessions.as_ref() {
         Some(s) => s,
-        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
+        None => return proxy_disabled_response(&state),
     };
 
     let proxy_state = match state.proxy.as_ref() {
         Some(p) => p,
-        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
+        None => return proxy_disabled_response(&state),
     };
 
     // Normalize content: string → content block
@@ -347,11 +347,11 @@ async fn send_message_stream(
 ) -> Response {
     let store = match state.proxy_sessions.as_ref() {
         Some(s) => s,
-        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
+        None => return proxy_disabled_response(&state),
     };
     let proxy_state = match state.proxy.as_ref() {
         Some(p) => p,
-        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
+        None => return proxy_disabled_response(&state),
     };
 
     let content = if req.content.is_string() {

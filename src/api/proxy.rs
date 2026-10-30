@@ -79,7 +79,10 @@ fn merge_betas(from_body: Option<Vec<String>>, from_header: Vec<String>) -> Opti
 
 use serde_json::json;
 
-use super::{error_response, no_retry, proxy_error_response, with_rate_limit_headers};
+use super::{
+    error_response, no_retry, proxy_disabled_response, proxy_error_response,
+    with_rate_limit_headers,
+};
 use crate::api::AppState;
 use crate::proxy;
 use crate::{openai_oauth, openai_proxy, transform};
@@ -244,7 +247,7 @@ async fn messages_handler(
 
     let proxy_state = match state.proxy.as_ref() {
         Some(ps) => ps,
-        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
+        None => return proxy_disabled_response(&state),
     };
 
     let (forward_body, body_betas) = match preprocess_request(&body) {
@@ -528,7 +531,7 @@ async fn messages_stream_handler(
 
     let proxy_state = match state.proxy.as_ref() {
         Some(ps) => ps,
-        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
+        None => return proxy_disabled_response(&state),
     };
 
     let (forward_body, body_betas) = match preprocess_request(&body) {
@@ -584,7 +587,7 @@ async fn messages_stream_handler(
 async fn rate_limit_handler(State(state): State<AppState>) -> Response {
     let proxy_state = match state.proxy.as_ref() {
         Some(ps) => ps,
-        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
+        None => return proxy_disabled_response(&state),
     };
 
     // Keyed by model family (Haiku/Sonnet/Opus/Fable each have their own
@@ -617,7 +620,7 @@ async fn rate_limit_handler(State(state): State<AppState>) -> Response {
 async fn proxy_stats_handler(State(state): State<AppState>) -> Response {
     let proxy_state = match state.proxy.as_ref() {
         Some(ps) => ps,
-        None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
+        None => return proxy_disabled_response(&state),
     };
 
     Json(json!({
