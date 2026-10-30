@@ -1,5 +1,6 @@
 # Rust
 /target
+/bin/
 Cargo.lock.bak
 
 # Logs & temp
