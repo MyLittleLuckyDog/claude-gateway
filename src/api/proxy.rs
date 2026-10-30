@@ -179,6 +179,13 @@ async fn messages_handler(
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
+    // The Anthropic SDKs and Claude Code always send `stream: true` to this
+    // very path and expect SSE back; `/v1/messages/stream` is only this
+    // gateway's own spelling of the same thing.
+    if body.get("stream").and_then(serde_json::Value::as_bool) == Some(true) {
+        return messages_stream_handler(State(state), headers, Json(body)).await;
+    }
+
     // Resolve model alias before routing
     let body = resolve_model_alias(&state, body);
 
