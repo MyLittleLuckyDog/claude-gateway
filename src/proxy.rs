@@ -563,7 +563,23 @@ fn rand_f64() -> f64 {
 /// Parse retry-after header from response
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let val = headers.get("retry-after")?.to_str().ok()?;
-    val.parse::<u64>().ok().map(|s| s * 1000) // seconds → ms
+    parse_retry_after_value(val, chrono::Utc::now())
+}
+
+/// Milliseconds a `Retry-After` value asks us to wait. Like Claude Code, accepts
+/// both forms HTTP allows: seconds (fractions included) and an HTTP date, which
+/// counts down from `now` and is never negative. Anything else is `None`.
+fn parse_retry_after_value(val: &str, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    let val = val.trim();
+    if let Ok(secs) = val.parse::<f64>() {
+        return (secs.is_finite() && secs >= 0.0).then(|| (secs * 1000.0).round() as u64);
+    }
+    let when = chrono::DateTime::parse_from_rfc2822(val).ok()?;
+    let ms = when
+        .with_timezone(&chrono::Utc)
+        .signed_duration_since(now)
+        .num_milliseconds();
+    Some(ms.max(0) as u64)
 }
 
 // ── Quota Pre-check ────────────────────────────────────────────────
@@ -1098,5 +1114,44 @@ mod tests {
         assert!(!is_haiku_model("CLAUDE-HAIKU-5-5"));
         assert!(is_haiku_model("claude-haiku-4-5"));
         assert!(is_haiku_model("claude-haiku-4-5-20251001"));
+    }
+
+    // ── Retry-After parsing ────────────────────────────────────────
+
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .expect("test timestamp")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn retry_after_accepts_whole_and_fractional_seconds() {
+        let now = at("2026-10-21T07:27:00Z");
+        assert_eq!(parse_retry_after_value("120", now), Some(120_000));
+        assert_eq!(parse_retry_after_value(" 1.5 ", now), Some(1_500));
+        assert_eq!(parse_retry_after_value("0", now), Some(0));
+    }
+
+    #[test]
+    fn retry_after_accepts_an_http_date() {
+        let now = at("2026-10-21T07:27:00Z");
+        // 2026-10-21 is a Wednesday.
+        assert_eq!(
+            parse_retry_after_value("Wed, 21 Oct 2026 07:28:00 GMT", now),
+            Some(60_000)
+        );
+        // A date already past means "now", not a negative wait.
+        assert_eq!(
+            parse_retry_after_value("Wed, 21 Oct 2026 07:00:00 GMT", now),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn retry_after_rejects_what_is_not_a_wait() {
+        let now = at("2026-10-21T07:27:00Z");
+        for bad in ["", "soon", "-5", "inf", "NaN", "12 minutes"] {
+            assert_eq!(parse_retry_after_value(bad, now), None, "{bad:?}");
+        }
     }
 }
