@@ -161,16 +161,11 @@ async fn send_message(
     #[allow(clippy::question_mark)]
     let prepared = store
         .with_session(&id, |session| {
-            let max_tokens = req
-                .max_tokens
-                .or(session.options.max_tokens)
-                .unwrap_or_else(|| crate::models::default_max_tokens(&session.model));
-
             // Before the preflight check, so a session at the edge of its
             // window can be relieved instead of refused.
             let microcompact = session.maybe_microcompact();
 
-            if let Err(msg) = session.preflight_check(max_tokens) {
+            if let Err(msg) = session.preflight_check() {
                 return Err(msg);
             }
 
@@ -313,16 +308,11 @@ async fn send_message_stream(
     // Phase 1: Add message and build request under lock
     let prepared = store
         .with_session(&id, |session| {
-            let max_tokens = req
-                .max_tokens
-                .or(session.options.max_tokens)
-                .unwrap_or_else(|| crate::models::default_max_tokens(&session.model));
-
             // Before the preflight check, so a session at the edge of its
             // window can be relieved instead of refused.
             let microcompact = session.maybe_microcompact();
 
-            if let Err(msg) = session.preflight_check(max_tokens) {
+            if let Err(msg) = session.preflight_check() {
                 return Err(msg);
             }
 

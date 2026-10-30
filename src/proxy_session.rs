@@ -127,19 +127,30 @@ impl ProxySession {
         self.estimated_context_tokens() >= models::context_cleanup_threshold(&self.model) as u64
     }
 
-    /// Preflight check: will the next request likely exceed the context window?
-    pub fn preflight_check(&self, max_tokens: u32) -> Result<(), String> {
+    /// Preflight check: is the session already out of room?
+    ///
+    /// `estimated_context_tokens` is what the server counted for the previous
+    /// turn, answer included, so the next request holds at least that much. If
+    /// that already fills the window, the request cannot fit and is refused
+    /// here, without a round trip.
+    ///
+    /// `max_tokens` is deliberately not part of the sum. Upstream does not
+    /// reject a request whose `input + max_tokens` exceeds the window: it
+    /// generates until the window is full and reports
+    /// `stop_reason: model_context_window_exceeded` (checked live on
+    /// 2026-10-30 -- 148,816 input tokens + `max_tokens` 64,000 on the 200k
+    /// models Haiku 4.5, Sonnet 4.5 and Opus 4.5 were all accepted). Counting it
+    /// here refused requests the server would have served, on an estimate that
+    /// cannot know the size of the message being added. Where a model does
+    /// reject the sum, upstream says so with exact numbers and `messages_sync`
+    /// retries with a `max_tokens` that fits.
+    pub fn preflight_check(&self) -> Result<(), String> {
         let estimated = self.estimated_context_tokens();
-        if estimated == 0 {
-            // First turn — no prior data, allow it
-            return Ok(());
-        }
         let model_context = models::context_window(&self.model) as u64;
-        if estimated + max_tokens as u64 > model_context {
+        if estimated > 0 && estimated >= model_context {
             return Err(format!(
-                "Estimated context ({} tokens) + max_tokens ({}) exceeds \
-                 model context window ({}). Create a new session.",
-                estimated, max_tokens, model_context
+                "The session's context ({estimated} tokens at the last response) already \
+                 fills the model's context window ({model_context}). Create a new session."
             ));
         }
         Ok(())
@@ -739,7 +750,7 @@ mod tests {
                 "output_tokens": 0,
             },
         }));
-        assert!(s.preflight_check(1_000).is_err());
+        assert!(s.preflight_check().is_err());
     }
 
     fn options_with_cache() -> SessionOptions {
@@ -1096,16 +1107,44 @@ mod tests {
     }
 
     #[test]
-    fn a_session_at_the_edge_of_its_window_passes_preflight_after_microcompact() {
+    fn a_session_over_its_window_passes_preflight_after_microcompact() {
         let mut s = compacting_session(1);
         let window = models::context_window(&s.model) as u64;
-        s.last_input_tokens = window - 500;
-        assert!(s.preflight_check(1_000).is_err(), "refused before relief");
+        // The last response already filled the window.
+        s.last_input_tokens = window + 100;
+        assert!(s.preflight_check().is_err(), "refused before relief");
 
+        // Clearing ~30k estimated tokens of old tool results makes room.
         s.maybe_microcompact().expect("applies");
         assert!(
-            s.preflight_check(1_000).is_ok(),
+            s.preflight_check().is_ok(),
             "relieved by clearing old results"
         );
+    }
+
+    #[test]
+    fn preflight_does_not_count_max_tokens_against_the_window() {
+        // 148,816 input tokens on a 200k-window model: the server accepted this
+        // with max_tokens 64,000 (input + max_tokens = 212,816 > 200,000).
+        let mut s = ProxySession::new(
+            "s".into(),
+            SessionOptions {
+                model: Some("claude-haiku-4-5".to_string()),
+                ..Default::default()
+            },
+            3600,
+        );
+        assert_eq!(models::context_window(&s.model), 200_000);
+        s.last_input_tokens = 148_816;
+        s.last_output_tokens = 4;
+        assert!(s.preflight_check().is_ok());
+
+        // Only a context that already fills the window is refused.
+        s.last_input_tokens = 200_000;
+        s.last_output_tokens = 0;
+        assert!(s.preflight_check().is_err());
+        // A session with no usage data yet is never refused.
+        s.last_input_tokens = 0;
+        assert!(s.preflight_check().is_ok());
     }
 }
