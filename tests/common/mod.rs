@@ -13,7 +13,13 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use claude_agent::api::{build_router, AppState, Stats};
+use claude_agent::codex::store::CodexSessionStore;
+use claude_agent::codex_app::store::CodexAppSessionStore;
+use claude_agent::config::AppConfig;
 use claude_agent::proxy::ProxyState;
+use claude_agent::proxy_session::ProxySessionStore;
+use claude_agent::session::store::SessionStore;
 use serde_json::{json, Value};
 
 // ── Hermetic environment ───────────────────────────────────────────
@@ -70,6 +76,8 @@ impl From<Value> for Scripted {
 pub struct Upstream {
     /// Every request body received, in order.
     pub requests: Mutex<Vec<Value>>,
+    /// The headers of each request, in the same order as `requests`.
+    pub request_headers: Mutex<Vec<HeaderMap>>,
     /// Scripted responses, consumed front to back; empty → a normal reply.
     pub script: Mutex<VecDeque<Scripted>>,
 }
@@ -81,6 +89,17 @@ impl Upstream {
 
     pub fn request_count(&self) -> usize {
         self.requests.lock().expect("lock").len()
+    }
+
+    /// Value of `name` on the most recent upstream request, if any.
+    pub fn last_header(&self, name: &str) -> Option<String> {
+        self.request_headers
+            .lock()
+            .expect("lock")
+            .last()
+            .and_then(|h| h.get(name))
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
     }
 }
 
@@ -109,19 +128,60 @@ pub fn refusal_reply(model: &str) -> Value {
     })
 }
 
-async fn upstream_handler(State(up): State<Arc<Upstream>>, Json(body): Json<Value>) -> Response {
+/// A minimal streamed reply, shaped like the real Messages SSE feed.
+fn sse_reply(model: &str) -> Response {
+    let events = [
+        json!({"type": "message_start", "message": {
+            "id": "msg_stream", "type": "message", "role": "assistant", "model": model,
+            "content": [], "usage": {"input_tokens": 10, "output_tokens": 0}}}),
+        json!({"type": "content_block_start", "index": 0,
+               "content_block": {"type": "text", "text": ""}}),
+        json!({"type": "content_block_delta", "index": 0,
+               "delta": {"type": "text_delta", "text": "ok"}}),
+        json!({"type": "content_block_stop", "index": 0}),
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+               "usage": {"output_tokens": 2}}),
+        json!({"type": "message_stop"}),
+    ];
+    let body: String = events
+        .iter()
+        .map(|e| {
+            format!(
+                "event: {}\ndata: {}\n\n",
+                e["type"].as_str().unwrap_or(""),
+                e
+            )
+        })
+        .collect();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "content-type",
+        HeaderValue::from_static("text/event-stream"),
+    );
+    (StatusCode::OK, headers, body).into_response()
+}
+
+async fn upstream_handler(
+    State(up): State<Arc<Upstream>>,
+    request_headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     let model = body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let wants_stream = body.get("stream") == Some(&Value::Bool(true));
     up.requests.lock().expect("lock").push(body);
-    let scripted = up
-        .script
+    up.request_headers
         .lock()
         .expect("lock")
-        .pop_front()
-        .unwrap_or_else(|| ok_reply(&model, 10).into());
+        .push(request_headers);
+    let scripted = up.script.lock().expect("lock").pop_front();
+    if scripted.is_none() && wants_stream {
+        return sse_reply(&model);
+    }
+    let scripted = scripted.unwrap_or_else(|| ok_reply(&model, 10).into());
 
     let mut headers = HeaderMap::new();
     for (name, value) in scripted.headers {
@@ -163,4 +223,34 @@ pub fn user_turns(n: usize) -> Vec<Value> {
             }
         })
         .collect()
+}
+
+/// Like [`start`], but also serves the real gateway router (every route, CORS
+/// layer and error mapping included) in front of the stub and returns its
+/// base URL, so tests can speak HTTP to the gateway the way a client would.
+pub async fn start_with_gateway() -> (String, Arc<ProxyState>, Arc<Upstream>) {
+    let (proxy, up) = start().await;
+    let config = Arc::new(AppConfig::default());
+    let state = AppState {
+        config,
+        sessions: Arc::new(SessionStore::new(4)),
+        codex_sessions: Arc::new(CodexSessionStore::new(4)),
+        codex_app_sessions: Arc::new(CodexAppSessionStore::new(4)),
+        start_time: std::time::Instant::now(),
+        stats: Arc::new(tokio::sync::Mutex::new(Stats::default())),
+        proxy: Some(proxy.clone()),
+        proxy_sessions: Some(Arc::new(ProxySessionStore::new(8, 3600))),
+        local_mlx: None,
+        openai: None,
+        openai_oauth: None,
+    };
+    let app = build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway");
+    let addr = listener.local_addr().expect("gateway addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), proxy, up)
 }
