@@ -696,9 +696,37 @@ pub async fn check_quota_at_startup(state: &Arc<ProxyState>) {
             }
         }
         Err(e) => {
-            tracing::warn!("Quota pre-check failed: {}", e);
+            tracing::warn!("Quota pre-check failed: {}", describe_transport_error(&e));
         }
     }
+}
+
+// ── Transport errors ───────────────────────────────────────────────
+
+/// Say how a request to upstream failed. reqwest's own text for this is
+/// "error sending request for url (...)", the same for a refused connection, a
+/// timeout and a DNS failure; the difference is in the error's kind and in its
+/// chain of causes, which are spelled out here.
+fn describe_transport_error(e: &reqwest::Error) -> String {
+    use std::error::Error;
+    let kind = if e.is_timeout() {
+        "timed out"
+    } else if e.is_connect() {
+        "could not connect"
+    } else if e.is_body() || e.is_decode() {
+        "the response could not be read"
+    } else if e.is_request() {
+        "the request could not be sent"
+    } else {
+        "failed"
+    };
+    let mut text = format!("{kind}: {e}");
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        text.push_str(&format!(": {c}"));
+        cause = c.source();
+    }
+    text
 }
 
 // ── Upstream error bodies ──────────────────────────────────────────
@@ -812,7 +840,7 @@ async fn send_json(
     let resp = request
         .send()
         .await
-        .map_err(|e| ProxyError::Transport(format!("{e}")))?;
+        .map_err(|e| ProxyError::Transport(describe_transport_error(&e)))?;
     let status = resp.status().as_u16();
     let body = resp
         .json::<serde_json::Value>()
@@ -938,7 +966,7 @@ async fn messages_sync_once(
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProxyError::Transport(format!("{e}")))?;
+            .map_err(|e| ProxyError::Transport(describe_transport_error(&e)))?;
 
         last_status = resp.status().as_u16();
         state.update_rate_limits(resp.headers(), family).await;
@@ -1152,7 +1180,7 @@ async fn messages_stream_once(
             .json(&body)
             .send()
             .await
-            .map_err(|e| ProxyError::Transport(format!("{e}")))?;
+            .map_err(|e| ProxyError::Transport(describe_transport_error(&e)))?;
 
         let status = resp.status().as_u16();
         state.update_rate_limits(resp.headers(), family).await;

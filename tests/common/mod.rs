@@ -337,7 +337,7 @@ pub async fn start_gateway_without_proxy() -> String {
     serve_gateway(None).await
 }
 
-async fn serve_gateway(proxy: Option<Arc<ProxyState>>) -> String {
+pub async fn serve_gateway(proxy: Option<Arc<ProxyState>>) -> String {
     let config = Arc::new(AppConfig::default());
     let state = AppState {
         config,

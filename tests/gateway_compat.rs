@@ -785,3 +785,42 @@ async fn a_local_refusal_repeats_what_upstream_said() {
         assert_eq!(up.request_count(), 1, "{path}");
     }
 }
+
+/// When the gateway cannot reach upstream at all, the 502 has to say how it
+/// failed. "error sending request for url (...)" alone does not tell a refused
+/// connection from a timeout from a DNS failure.
+#[tokio::test]
+async fn an_unreachable_upstream_is_explained() {
+    common::init_env();
+    // Nothing listens on port 1 of localhost.
+    let proxy = std::sync::Arc::new(claude_agent::proxy::ProxyState::with_base_url(
+        1,
+        "http://127.0.0.1:1",
+    ));
+    let base = common::serve_gateway(Some(proxy)).await;
+    let client = reqwest::Client::new();
+
+    for (path, stream) in [("/v1/messages", false), ("/v1/messages/stream", true)] {
+        let mut body = messages_body();
+        if stream {
+            body["stream"] = json!(true);
+        }
+        let resp = client
+            .post(format!("{base}{path}"))
+            .json(&body)
+            .send()
+            .await
+            .expect("request");
+
+        assert_eq!(resp.status(), 502, "{path}");
+        let body: Value = resp.json().await.expect("json body");
+        let message = body["error"]["message"].as_str().unwrap_or("");
+        assert!(message.contains("could not connect"), "{path}: {message}");
+        assert!(message.contains("127.0.0.1:1"), "{path}: {message}");
+        // The underlying cause, not just the wrapper.
+        assert!(
+            message.to_lowercase().contains("refused"),
+            "{path}: {message}"
+        );
+    }
+}
