@@ -141,7 +141,31 @@ pub fn parse_frame(frame: &str) -> Option<StreamEvent> {
     match serde_json::from_str::<StreamEvent>(&payload) {
         Ok(event) => Some(event),
         Err(e) => {
-            tracing::warn!("Failed to parse SSE event: {e} — payload: {payload}");
+            // An event type this parser has never heard of is expected as the
+            // API grows; only a known type that fails to parse is a problem.
+            let kind = serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|v| {
+                    v.get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+            match kind.as_deref() {
+                Some(
+                    "message_start"
+                    | "content_block_start"
+                    | "content_block_delta"
+                    | "content_block_stop"
+                    | "message_delta"
+                    | "message_stop"
+                    | "ping"
+                    | "error",
+                )
+                | None => {
+                    tracing::warn!("Failed to parse SSE event: {e} — payload: {payload}");
+                }
+                Some(other) => tracing::debug!("ignoring SSE event of unknown type {other:?}"),
+            }
             None
         }
     }
@@ -199,9 +223,37 @@ pub struct MessageDeltaData {
     pub stop_sequence: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+/// A content block as it starts in the stream.
+///
+/// Text, tool use and thinking are typed because they are assembled
+/// incrementally. Every other block the API can send -- server tool use and
+/// its results, MCP blocks, compaction, and whatever is added next -- arrives
+/// as [`ContentBlock::Other`] and is kept exactly as sent. A type this parser
+/// has never heard of must not make the whole event, and with it the block,
+/// disappear.
+#[derive(Debug, Clone)]
 pub enum ContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
+    },
+    RedactedThinking {
+        data: serde_json::Value,
+    },
+    Other(serde_json::Value),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum KnownBlock {
     Text {
         #[serde(default)]
         text: String,
@@ -224,13 +276,85 @@ pub enum ContentBlock {
     },
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+impl From<KnownBlock> for ContentBlock {
+    fn from(block: KnownBlock) -> Self {
+        match block {
+            KnownBlock::Text { text } => Self::Text { text },
+            KnownBlock::ToolUse { id, name, input } => Self::ToolUse { id, name, input },
+            KnownBlock::Thinking {
+                thinking,
+                signature,
+            } => Self::Thinking {
+                thinking,
+                signature,
+            },
+            KnownBlock::RedactedThinking { data } => Self::RedactedThinking { data },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentBlock {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("text" | "tool_use" | "thinking" | "redacted_thinking") => {
+                serde_json::from_value::<KnownBlock>(value)
+                    .map(Into::into)
+                    .map_err(serde::de::Error::custom)
+            }
+            _ => Ok(Self::Other(value)),
+        }
+    }
+}
+
+/// A content block delta. Deltas for the typed blocks are assembled; any other
+/// (`citations_delta`, `compaction_delta`, future ones) is [`ContentDelta::Other`]
+/// and handled by the accumulator, or ignored when it has no use for it.
+#[derive(Debug, Clone)]
 pub enum ContentDelta {
     TextDelta { text: String },
     InputJsonDelta { partial_json: String },
     ThinkingDelta { thinking: String },
     SignatureDelta { signature: String },
+    Other(serde_json::Value),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum KnownDelta {
+    #[serde(rename = "text_delta")]
+    Text { text: String },
+    #[serde(rename = "input_json_delta")]
+    InputJson { partial_json: String },
+    #[serde(rename = "thinking_delta")]
+    Thinking { thinking: String },
+    #[serde(rename = "signature_delta")]
+    Signature { signature: String },
+}
+
+impl From<KnownDelta> for ContentDelta {
+    fn from(delta: KnownDelta) -> Self {
+        match delta {
+            KnownDelta::Text { text } => Self::TextDelta { text },
+            KnownDelta::InputJson { partial_json } => Self::InputJsonDelta { partial_json },
+            KnownDelta::Thinking { thinking } => Self::ThinkingDelta { thinking },
+            KnownDelta::Signature { signature } => Self::SignatureDelta { signature },
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentDelta {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("text_delta" | "input_json_delta" | "thinking_delta" | "signature_delta") => {
+                serde_json::from_value::<KnownDelta>(value)
+                    .map(Into::into)
+                    .map_err(serde::de::Error::custom)
+            }
+            _ => Ok(Self::Other(value)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -274,7 +398,17 @@ pub struct StreamAccumulator {
 /// Internal per-block accumulation state.
 #[derive(Debug)]
 enum AccBlock {
-    Text(String),
+    Text {
+        text: String,
+        citations: Vec<serde_json::Value>,
+    },
+    /// A block this parser has no type for, kept as sent. Tool-like blocks
+    /// (`server_tool_use`, `mcp_tool_use`) stream their `input` as JSON
+    /// fragments, collected here.
+    Raw {
+        value: serde_json::Value,
+        json_fragments: String,
+    },
     ToolUse {
         id: String,
         name: String,
@@ -384,7 +518,14 @@ impl StreamAccumulator {
 
     fn init_block(&mut self, index: u32, block: &ContentBlock) {
         let acc = match block {
-            ContentBlock::Text { text } => AccBlock::Text(text.clone()),
+            ContentBlock::Text { text } => AccBlock::Text {
+                text: text.clone(),
+                citations: Vec::new(),
+            },
+            ContentBlock::Other(value) => AccBlock::Raw {
+                value: value.clone(),
+                json_fragments: String::new(),
+            },
             ContentBlock::ToolUse { id, name, .. } => AccBlock::ToolUse {
                 id: id.clone(),
                 name: name.clone(),
@@ -402,20 +543,32 @@ impl StreamAccumulator {
         self.blocks.insert(index, acc);
     }
 
+    /// Fold one delta into its block, following the Anthropic SDK's own stream
+    /// accumulator: text and thinking are appended, `input_json_delta`
+    /// fragments are collected, a `citations_delta` adds to the text block's
+    /// `citations`, a `signature_delta` *sets* the signature, and a delta for
+    /// anything else (`compaction_delta`, future kinds) changes nothing.
     fn apply_delta(&mut self, index: u32, delta: &ContentDelta) {
         match delta {
             ContentDelta::TextDelta { text } => {
                 match self.blocks.get_mut(&index) {
-                    Some(AccBlock::Text(buf)) => buf.push_str(text),
+                    Some(AccBlock::Text { text: buf, .. }) => buf.push_str(text),
                     // If block wasn't started, create it
                     None => {
-                        self.blocks.insert(index, AccBlock::Text(text.clone()));
+                        self.blocks.insert(
+                            index,
+                            AccBlock::Text {
+                                text: text.clone(),
+                                citations: Vec::new(),
+                            },
+                        );
                     }
                     _ => {}
                 }
             }
             ContentDelta::InputJsonDelta { partial_json } => match self.blocks.get_mut(&index) {
-                Some(AccBlock::ToolUse { json_fragments, .. }) => {
+                Some(AccBlock::ToolUse { json_fragments, .. })
+                | Some(AccBlock::Raw { json_fragments, .. }) => {
                     json_fragments.push_str(partial_json);
                 }
                 _ => {
@@ -442,10 +595,19 @@ impl StreamAccumulator {
             ContentDelta::SignatureDelta { signature } => {
                 if let Some(AccBlock::Thinking { signature: sig, .. }) = self.blocks.get_mut(&index)
                 {
-                    match sig {
-                        Some(s) => s.push_str(signature),
-                        None => *sig = Some(signature.clone()),
+                    *sig = Some(signature.clone());
+                }
+            }
+            ContentDelta::Other(value) => {
+                let kind = value.get("type").and_then(serde_json::Value::as_str);
+                if kind == Some("citations_delta") {
+                    if let (Some(AccBlock::Text { citations, .. }), Some(citation)) =
+                        (self.blocks.get_mut(&index), value.get("citation"))
+                    {
+                        citations.push(citation.clone());
                     }
+                } else {
+                    tracing::debug!("ignoring {kind:?} delta for block {index}");
                 }
             }
         }
@@ -457,14 +619,31 @@ impl AccBlock {
     /// the Messages API conversation history.
     fn to_json(&self) -> Option<serde_json::Value> {
         match self {
-            AccBlock::Text(text) => {
+            AccBlock::Text { text, citations } => {
                 if text.is_empty() {
                     return None;
                 }
-                Some(serde_json::json!({
+                let mut block = serde_json::json!({
                     "type": "text",
                     "text": text,
-                }))
+                });
+                if !citations.is_empty() {
+                    block["citations"] = serde_json::Value::Array(citations.clone());
+                }
+                Some(block)
+            }
+            AccBlock::Raw {
+                value,
+                json_fragments,
+            } => {
+                let mut block = value.clone();
+                if !json_fragments.is_empty() {
+                    block["input"] = serde_json::from_str(json_fragments).unwrap_or_else(|e| {
+                        tracing::warn!("Failed to parse streamed block input JSON: {e}");
+                        serde_json::json!({"_raw": json_fragments})
+                    });
+                }
+                Some(block)
             }
             AccBlock::ToolUse {
                 id,
@@ -849,5 +1028,176 @@ mod tests {
         });
         assert_eq!(acc.input_tokens, 12);
         assert_eq!(acc.cache_input_tokens, 45_300);
+    }
+
+    // ── blocks and deltas this parser has no type for ──────────────
+
+    fn frame(event: &str, data: serde_json::Value) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
+    }
+
+    /// Run SSE frames through the parser and the accumulator.
+    fn accumulate(frames: &[String]) -> StreamAccumulator {
+        let mut acc = StreamAccumulator::new();
+        for f in frames {
+            if let Some(event) = parse_frame(f) {
+                acc.process_event(&event);
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn server_tool_blocks_and_citations_survive_streaming() {
+        use serde_json::json;
+        let citation = json!({"type": "web_search_result_location", "url": "https://example.com",
+                              "title": "Example", "cited_text": "x", "encrypted_index": "abc"});
+        let result_block = json!({"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1",
+            "content": [{"type": "web_search_result", "url": "https://example.com",
+                         "title": "Example", "encrypted_content": "zzz"}]});
+        let acc = accumulate(&[
+            frame(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "Let me search."}}),
+            ),
+            frame(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            frame(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "server_tool_use", "id": "srvtoolu_1",
+                                  "name": "web_search", "input": {}}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"query\": \"ru"}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "st\"}"}}),
+            ),
+            frame(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 1}),
+            ),
+            frame(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 2,
+                "content_block": result_block.clone()}),
+            ),
+            frame(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 2}),
+            ),
+            frame(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 3,
+                "content_block": {"type": "text", "text": ""}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 3,
+                "delta": {"type": "text_delta", "text": "Rust is a language."}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 3,
+                "delta": {"type": "citations_delta", "citation": citation.clone()}}),
+            ),
+            frame(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 3}),
+            ),
+        ]);
+
+        let blocks = acc.into_content_blocks().expect("content");
+        assert_eq!(blocks.len(), 4, "{blocks:?}");
+        assert_eq!(blocks[0], json!({"type": "text", "text": "Let me search."}));
+        assert_eq!(
+            blocks[1],
+            json!({"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search",
+                   "input": {"query": "rust"}})
+        );
+        // Anything the parser has no type for is kept exactly as sent.
+        assert_eq!(blocks[2], result_block);
+        assert_eq!(
+            blocks[3],
+            json!({"type": "text", "text": "Rust is a language.", "citations": [citation]})
+        );
+    }
+
+    #[test]
+    fn unknown_deltas_and_events_are_ignored_without_losing_the_block() {
+        use serde_json::json;
+        let acc = accumulate(&[
+            frame(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "compaction", "content": "earlier turns, summarized"}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "compaction_delta", "content": null}}),
+            ),
+            frame(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            // An event type that did not exist when this parser was written.
+            frame(
+                "brand_new_event",
+                json!({"type": "brand_new_event", "payload": 1}),
+            ),
+            frame(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "text", "text": "after"}}),
+            ),
+        ]);
+        let blocks = acc.into_content_blocks().expect("content");
+        assert_eq!(blocks[0]["type"], "compaction");
+        assert_eq!(blocks[0]["content"], "earlier turns, summarized");
+        assert_eq!(blocks[1], json!({"type": "text", "text": "after"}));
+    }
+
+    #[test]
+    fn a_signature_delta_replaces_the_signature() {
+        use serde_json::json;
+        // The SDK's own accumulator assigns the signature; it is never appended.
+        let acc = accumulate(&[
+            frame(
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "hm"}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "signature_delta", "signature": "SIG-1"}}),
+            ),
+            frame(
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "signature_delta", "signature": "SIG-2"}}),
+            ),
+        ]);
+        let blocks = acc.into_content_blocks().expect("content");
+        assert_eq!(blocks[0]["signature"], "SIG-2");
     }
 }
