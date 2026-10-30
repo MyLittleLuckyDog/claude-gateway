@@ -736,3 +736,52 @@ async fn proxy_disabled_names_the_reason() {
         );
     }
 }
+
+/// When the gateway refuses a request itself because upstream was rejecting, the
+/// message has to carry what upstream actually said. It used to be the fixed
+/// sentence "Rate limited: usage limit" whatever the cause, which made a
+/// long-context credit error look like a usage cap.
+#[tokio::test]
+async fn a_local_refusal_repeats_what_upstream_said() {
+    let said = "Usage credits are required for long context requests";
+    let client = reqwest::Client::new();
+
+    for (path, stream) in [("/v1/messages", false), ("/v1/messages/stream", true)] {
+        let (base, _proxy, up) = start_with_gateway().await;
+        up.push(bare_429()); // its message is `said`
+        let mut body = messages_body();
+        if stream {
+            body["stream"] = json!(true);
+        }
+
+        // The request upstream rejected: its own body is passed on as it is.
+        let first = client
+            .post(format!("{base}{path}"))
+            .json(&body)
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(first.status(), 429, "{path}");
+        let first: Value = first.json().await.expect("json body");
+        assert_eq!(first["error"]["message"], said, "{path}: {first}");
+
+        // The next one never reaches upstream; the gateway answers, and says
+        // both that it did and what it is repeating.
+        let second = client
+            .post(format!("{base}{path}"))
+            .json(&body)
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(second.status(), 429, "{path}");
+        let second: Value = second.json().await.expect("json body");
+        let message = second["error"]["message"].as_str().unwrap_or("");
+        assert!(message.contains(said), "{path}: {message}");
+        assert!(message.contains("not sent upstream"), "{path}: {message}");
+        assert!(
+            !message.contains("usage limit"),
+            "{path}: must not call it a usage limit when upstream did not: {message}"
+        );
+        assert_eq!(up.request_count(), 1, "{path}");
+    }
+}

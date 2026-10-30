@@ -63,6 +63,9 @@ pub struct RateLimitStatus {
     /// Lets `pre_flight_check` expire a rejection that arrived without any
     /// reset information instead of holding it forever.
     pub rejected_at: Option<f64>,
+    /// What upstream said (`error.message`) in the 429 behind the current
+    /// rejection, so a local refusal can repeat it instead of guessing a cause.
+    pub rejection_reason: Option<String>,
     /// Whether a fallback model is available
     pub fallback_available: Option<bool>,
     /// Which limit is the bottleneck: "five_hour" | "seven_day" | "seven_day_opus" | "seven_day_sonnet"
@@ -127,7 +130,8 @@ impl RateLimitStatus {
             Some("seven_day") => "weekly limit (7d)",
             Some("seven_day_opus") => "Opus weekly limit",
             Some("seven_day_sonnet") => "Sonnet weekly limit",
-            _ => "usage limit",
+            // Upstream named no limit; do not make one up.
+            _ => "rate limit (upstream did not name which)",
         };
 
         let reset_info = self
@@ -148,7 +152,13 @@ impl RateLimitStatus {
             })
             .unwrap_or_default();
 
-        format!("Rate limited: {limit_name}{reset_info}")
+        let upstream_said = self
+            .rejection_reason
+            .as_deref()
+            .map(|reason| format!(" — upstream said: \"{reason}\""))
+            .unwrap_or_default();
+
+        format!("Rate limited: {limit_name}{reset_info}{upstream_said}")
     }
 
     /// Warning message if approaching limit
@@ -278,7 +288,27 @@ impl ProxyState {
             rl.rejected_at.get_or_insert_with(now_secs);
         } else {
             rl.rejected_at = None;
+            rl.rejection_reason = None;
         }
+    }
+
+    /// Remember what upstream said in the 429 body, if it said anything, so the
+    /// refusals the gateway then makes itself can repeat it.
+    pub async fn note_rejection_reason(
+        &self,
+        family: models::ModelFamily,
+        body: &serde_json::Value,
+    ) {
+        let Some(reason) = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|m| !m.trim().is_empty())
+        else {
+            return;
+        };
+        let mut map = self.rate_limit.write().await;
+        map.entry(family).or_default().rejection_reason = Some(reason.to_string());
     }
 
     /// Record an upstream 429 for `family`.
@@ -371,6 +401,7 @@ impl ProxyState {
             if rl.is_rejected() {
                 rl.status = Some("allowed".to_string());
                 rl.rejected_at = None;
+                rl.rejection_reason = None;
                 tracing::info!(
                     "Cached rate-limit rejection for {:?} expired, allowing requests",
                     family
@@ -1001,6 +1032,7 @@ async fn messages_sync_once(
                     _ if raw_body.trim().is_empty() => error_envelope("rate_limit_error", msg),
                     _ => error_envelope("rate_limit_error", format!("{msg}: {raw_body}")),
                 };
+                state.note_rejection_reason(family, &resp_body).await;
                 return Ok((resp_body, 429));
             }
 
@@ -1272,18 +1304,26 @@ pub async fn messages_stream(
     loop {
         let (resp, status) =
             messages_stream_once(state, body.clone(), extra_betas, session_id).await?;
-        if status != 400 {
+        if status != 400 && status != 429 {
             return Ok((resp, status));
         }
 
-        // A 400 is a small JSON error. Read it to see whether lowering
-        // max_tokens fixes it; if not, hand back an equivalent response.
+        // A 400 or 429 is a small JSON error. Read it: a 400 may be a context
+        // overflow that lowering max_tokens fixes, a 429 carries the reason the
+        // gateway will repeat while it refuses requests itself. Either way, if
+        // the request is not retried, hand back an equivalent response.
         let headers = resp.headers().clone();
         let bytes = resp
             .bytes()
             .await
             .map_err(|e| ProxyError::Transport(format!("Failed to read error response: {e}")))?;
-        if adjustments < MAX_OVERFLOW_ADJUSTMENTS {
+        if status == 429 {
+            let family =
+                models::family_of(body.get("model").and_then(|v| v.as_str()).unwrap_or(""));
+            let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            state.note_rejection_reason(family, &error).await;
+        }
+        if status == 400 && adjustments < MAX_OVERFLOW_ADJUSTMENTS {
             let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
             if let Some(max_tokens) = overflow_retry_max_tokens(&error, &body) {
                 adjustments += 1;
