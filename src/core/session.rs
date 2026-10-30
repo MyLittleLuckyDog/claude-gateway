@@ -66,6 +66,15 @@ impl<S: ManagedSession> SessionStore<S> {
         }
     }
 
+    /// Take `op_lock`. The lock guards no data (`()`), so a panic in another
+    /// holder cannot leave anything inconsistent — recover from poisoning
+    /// instead of propagating the panic.
+    fn lock_ops(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.op_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Register `session`, rejecting it once the store is at capacity.
     ///
     /// The capacity check is on occupancy alone, so at capacity even a session
@@ -74,7 +83,7 @@ impl<S: ManagedSession> SessionStore<S> {
     /// unreachable in practice; it is kept as-is to preserve the behaviour of
     /// the three stores this replaced.
     pub fn insert(&self, session: Arc<S>) -> Result<(), GatewayError> {
-        let _guard = self.op_lock.lock().unwrap();
+        let _guard = self.lock_ops();
         if self.sessions.len() >= self.max_sessions {
             return Err(GatewayError::SessionLimitReached {
                 max: self.max_sessions,
@@ -96,7 +105,7 @@ impl<S: ManagedSession> SessionStore<S> {
         // a blocking std lock and holding it across one would park a worker
         // thread that a concurrent insert needs.
         let removed = {
-            let _guard = self.op_lock.lock().unwrap();
+            let _guard = self.lock_ops();
             self.sessions.remove(id)
         };
         match removed {
@@ -115,7 +124,7 @@ impl<S: ManagedSession> SessionStore<S> {
     /// hundred times as long to drain.
     pub async fn shutdown_all(&self) {
         let sessions: Vec<Arc<S>> = {
-            let _guard = self.op_lock.lock().unwrap();
+            let _guard = self.lock_ops();
             let all = self.sessions.iter().map(|r| r.value().clone()).collect();
             self.sessions.clear();
             all
