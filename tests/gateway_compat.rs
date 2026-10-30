@@ -281,12 +281,60 @@ async fn retry_after_follows_the_upstream_reset_time() {
     );
 }
 
-/// `POST /v1/messages/count_tokens` is part of the protocol. A backend that
-/// can't serve it answers `501 not_supported` with `x-should-retry: false`, and
-/// the client then counts tokens itself instead of asking again.
+/// `POST /v1/messages/count_tokens` is part of the protocol and is answered by
+/// upstream. Only the fields that endpoint accepts are sent (a Messages body's
+/// `max_tokens`, `temperature`, ... would be rejected there), and the caller's
+/// model alias and `anthropic-beta` header are honored like on `/v1/messages`.
 #[tokio::test]
-async fn count_tokens_answers_501_not_supported_without_retry() {
+async fn count_tokens_is_answered_by_upstream() {
     let (base, _proxy, up) = start_with_gateway().await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/messages/count_tokens"))
+        .header("anthropic-beta", "token-counting-2024-11-01")
+        .json(&json!({
+            "model": "sonnet",
+            "max_tokens": 64,
+            "temperature": 0,
+            "stream": false,
+            "system": "Be brief.",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["input_tokens"], 42);
+
+    let sent = up.requests.lock().expect("lock")[0].clone();
+    let mut fields: Vec<&str> = sent
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort_unstable();
+    assert_eq!(fields, ["messages", "model", "system"], "{sent}");
+    assert_ne!(sent["model"], "sonnet", "the alias must be resolved");
+    // No billing marker: the real request's usage does not count it either.
+    assert_eq!(sent["system"], "Be brief.");
+    assert!(
+        up.last_header("anthropic-beta")
+            .unwrap_or_default()
+            .contains("token-counting-2024-11-01"),
+        "{:?}",
+        up.last_header("anthropic-beta")
+    );
+}
+
+/// Without the direct API proxy there is nothing to count with: the protocol's
+/// answer is `501 not_supported` + `x-should-retry: false`, after which the
+/// client counts tokens itself.
+#[tokio::test]
+async fn count_tokens_answers_501_when_the_proxy_is_disabled() {
+    let base = common::start_gateway_without_proxy().await;
 
     let resp = reqwest::Client::new()
         .post(format!("{base}/v1/messages/count_tokens"))
@@ -300,7 +348,6 @@ async fn count_tokens_answers_501_not_supported_without_retry() {
     let body: Value = resp.json().await.expect("json body");
     assert_eq!(body["type"], "error", "{body}");
     assert_eq!(body["error"]["type"], "not_supported", "{body}");
-    assert_eq!(up.request_count(), 0);
 }
 
 /// The session id the upstream request is attributed to (inside the JSON that

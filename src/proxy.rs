@@ -670,6 +670,87 @@ pub async fn check_quota_at_startup(state: &Arc<ProxyState>) {
     }
 }
 
+// ── Token counting and model lookup ────────────────────────────────
+
+/// Request fields the upstream `count_tokens` endpoint accepts. Everything else
+/// a Messages request carries (`max_tokens`, `stream`, `temperature`,
+/// `metadata`, ...) is rejected there as an unknown input, so it is dropped.
+const COUNT_TOKENS_FIELDS: &[&str] = &[
+    "model",
+    "messages",
+    "system",
+    "tools",
+    "tool_choice",
+    "thinking",
+    "mcp_servers",
+    "context_management",
+];
+
+/// The body `count_tokens` is sent: the counting-relevant part of a Messages
+/// request body.
+pub fn count_tokens_body(body: &serde_json::Value) -> serde_json::Value {
+    let kept: serde_json::Map<String, serde_json::Value> = body
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter(|(k, _)| COUNT_TOKENS_FIELDS.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    serde_json::Value::Object(kept)
+}
+
+/// Count the input tokens of a Messages request upstream (`POST
+/// /v1/messages/count_tokens`). Free of charge and outside the Messages rate
+/// limits, so it neither consults nor updates the cached rate-limit state.
+pub async fn count_tokens(
+    state: &Arc<ProxyState>,
+    body: &serde_json::Value,
+    extra_betas: Option<&[String]>,
+    session_id: &str,
+) -> Result<(serde_json::Value, u16), ProxyError> {
+    let counted = count_tokens_body(body);
+    let model = counted.get("model").and_then(|v| v.as_str());
+    let token = auth::get_oauth_token_fresh()
+        .await
+        .map_err(|e| ProxyError::Auth { message: e })?;
+    let headers = build_headers(&token.access_token, extra_betas, model, Some(session_id))
+        .map_err(ProxyError::Internal)?;
+    let url = format!("{}/v1/messages/count_tokens?beta=true", state.base_url);
+    send_json(state.client.post(&url).headers(headers).json(&counted)).await
+}
+
+/// `GET` a JSON resource from the upstream API, e.g. `/v1/models/<id>`, with the
+/// gateway's client identity.
+pub async fn upstream_get(
+    state: &Arc<ProxyState>,
+    path_and_query: &str,
+) -> Result<(serde_json::Value, u16), ProxyError> {
+    let token = auth::get_oauth_token_fresh()
+        .await
+        .map_err(|e| ProxyError::Auth { message: e })?;
+    let headers =
+        build_headers(&token.access_token, None, None, None).map_err(ProxyError::Internal)?;
+    let url = format!("{}{}", state.base_url, path_and_query);
+    send_json(state.client.get(&url).headers(headers)).await
+}
+
+async fn send_json(
+    request: reqwest::RequestBuilder,
+) -> Result<(serde_json::Value, u16), ProxyError> {
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| ProxyError::Transport(format!("{e}")))?;
+    let status = resp.status().as_u16();
+    let body = resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| ProxyError::Transport(format!("Failed to parse response: {e}")))?;
+    Ok((body, status))
+}
+
 // ── API Calls ──────────────────────────────────────────────────────
 
 /// Synchronous (non-streaming) Messages API call.

@@ -194,12 +194,28 @@ async fn upstream_handler(
     (status, headers, Json(scripted.body)).into_response()
 }
 
+/// `count_tokens`: records the request like `/v1/messages` does and answers
+/// with a fixed count.
+async fn count_tokens_handler(
+    State(up): State<Arc<Upstream>>,
+    request_headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    up.requests.lock().expect("lock").push(body);
+    up.request_headers
+        .lock()
+        .expect("lock")
+        .push(request_headers);
+    Json(json!({"input_tokens": 42}))
+}
+
 /// Start the stub on an ephemeral port and a proxy pointed at it.
 pub async fn start() -> (Arc<ProxyState>, Arc<Upstream>) {
     init_env();
     let up = Arc::new(Upstream::default());
     let app = Router::new()
         .route("/v1/messages", post(upstream_handler))
+        .route("/v1/messages/count_tokens", post(count_tokens_handler))
         .with_state(up.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -230,6 +246,18 @@ pub fn user_turns(n: usize) -> Vec<Value> {
 /// base URL, so tests can speak HTTP to the gateway the way a client would.
 pub async fn start_with_gateway() -> (String, Arc<ProxyState>, Arc<Upstream>) {
     let (proxy, up) = start().await;
+    let base = serve_gateway(Some(proxy.clone())).await;
+    (base, proxy, up)
+}
+
+/// The real router with the direct API proxy switched off, as when no OAuth
+/// credentials are available.
+pub async fn start_gateway_without_proxy() -> String {
+    init_env();
+    serve_gateway(None).await
+}
+
+async fn serve_gateway(proxy: Option<Arc<ProxyState>>) -> String {
     let config = Arc::new(AppConfig::default());
     let state = AppState {
         config,
@@ -238,8 +266,10 @@ pub async fn start_with_gateway() -> (String, Arc<ProxyState>, Arc<Upstream>) {
         codex_app_sessions: Arc::new(CodexAppSessionStore::new(4)),
         start_time: std::time::Instant::now(),
         stats: Arc::new(tokio::sync::Mutex::new(Stats::default())),
-        proxy: Some(proxy.clone()),
-        proxy_sessions: Some(Arc::new(ProxySessionStore::new(8, 3600))),
+        proxy_sessions: proxy
+            .is_some()
+            .then(|| Arc::new(ProxySessionStore::new(8, 3600))),
+        proxy,
         local_mlx: None,
         openai: None,
         openai_oauth: None,
@@ -252,5 +282,5 @@ pub async fn start_with_gateway() -> (String, Arc<ProxyState>, Arc<Upstream>) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    (format!("http://{addr}"), proxy, up)
+    format!("http://{addr}")
 }

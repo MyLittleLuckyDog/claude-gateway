@@ -179,3 +179,60 @@ async fn server_participation_in_context_hint_protocol() {
         );
     }
 }
+
+/// Does subscription traffic get through to upstream `count_tokens` and to the
+/// models endpoint, and what context window does upstream report for the 4.6
+/// models? (count_tokens and the models listing cost nothing.)
+#[tokio::test]
+#[ignore = "calls the real Anthropic API with the developer's credentials"]
+async fn count_tokens_and_model_metadata_on_oauth_traffic() {
+    let state = Arc::new(ProxyState::new(1));
+    let messages = json!([{"role": "user", "content": "Reply with the single word: ok"}]);
+
+    for model in ["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"] {
+        let body = json!({"model": model, "max_tokens": 64, "temperature": 0, "stream": false,
+                          "messages": messages});
+        let plain = proxy::count_tokens(&state, &body, None, "live-probe").await;
+        summarize_count(&format!("count_tokens {model} (no billing block)"), plain);
+
+        let mut with_block = body.clone();
+        claude_agent::client_identity::inject_billing_system_block(&mut with_block);
+        let blocked = proxy::count_tokens(&state, &with_block, None, "live-probe").await;
+        summarize_count(
+            &format!("count_tokens {model} (with billing block)"),
+            blocked,
+        );
+    }
+
+    for id in [
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5-5",
+        "claude-opus-4-5",
+    ] {
+        match proxy::upstream_get(&state, &format!("/v1/models/{id}")).await {
+            Ok((m, 200)) => eprintln!(
+                "[probe] model {id}: max_input_tokens={} max_tokens={} display={}",
+                m["max_input_tokens"], m["max_tokens"], m["display_name"]
+            ),
+            Ok((m, status)) => eprintln!(
+                "[probe] model {id}: HTTP {status} {}",
+                m["error"]["message"]
+            ),
+            Err(e) => eprintln!("[probe] model {id}: gateway error: {e}"),
+        }
+    }
+}
+
+fn summarize_count(label: &str, result: Result<(Value, u16), proxy::ProxyError>) {
+    match result {
+        Ok((body, 200)) => eprintln!("[probe] {label}: 200 input_tokens={}", body["input_tokens"]),
+        Ok((body, status)) => {
+            eprintln!(
+                "[probe] {label}: HTTP {status} {}",
+                body["error"]["message"]
+            )
+        }
+        Err(e) => eprintln!("[probe] {label}: gateway error: {e}"),
+    }
+}

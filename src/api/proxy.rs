@@ -4,7 +4,7 @@
 //!   POST /v1/messages       — sync response (passthrough to Anthropic API);
 //!                             `stream: true` is served as SSE, as the SDKs expect
 //!   POST /v1/messages/stream — SSE streaming (passthrough)
-//!   POST /v1/messages/count_tokens — 501 not_supported (protocol fallback)
+//!   POST /v1/messages/count_tokens — counted upstream (501 where it cannot be)
 //!   GET  /v1/rate_limit     — current rate limit status
 
 use std::sync::atomic::Ordering;
@@ -395,17 +395,55 @@ fn resolve_model_alias(state: &AppState, mut body: serde_json::Value) -> serde_j
     body
 }
 
-/// POST /v1/messages/count_tokens — part of the gateway protocol, not served here.
+/// POST /v1/messages/count_tokens — counted by the upstream API.
 ///
-/// `501 not_supported` with `x-should-retry: false` is the protocol's answer
-/// for a backend without it: the client falls back to counting with an
-/// ordinary one-token request instead of asking again.
-async fn count_tokens_handler() -> Response {
-    no_retry(error_response(
-        501,
-        "not_supported",
-        "Token counting is not available on this gateway",
-    ))
+/// The request is the Messages body the caller intends to send (model aliases
+/// and the `anthropic-beta` header are honored as on `/v1/messages`); only the
+/// fields upstream's counter accepts are forwarded. The count leaves out the
+/// billing marker the gateway adds to real requests, since the server does not
+/// bill it either.
+///
+/// Where it cannot be served -- no direct API proxy, or a non-Claude model --
+/// the answer is `501 not_supported` with `x-should-retry: false`, the
+/// protocol's cue for the client to count tokens itself.
+async fn count_tokens_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Response {
+    let not_supported = |why: &str| no_retry(error_response(501, "not_supported", why));
+
+    let body = resolve_model_alias(&state, body);
+    let model = body.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    if transform::is_openai_model(model) {
+        return not_supported("Token counting is only available for Claude models");
+    }
+    let Some(proxy_state) = state.proxy.as_ref() else {
+        return not_supported("Token counting needs the direct API proxy, which is not enabled");
+    };
+
+    let (forward_body, body_betas) = match preprocess_request(&body) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let extra_betas = merge_betas(body_betas, request_betas(&headers));
+    let session_id = session_id_from(&headers);
+
+    match proxy::count_tokens(
+        proxy_state,
+        &forward_body,
+        extra_betas.as_deref(),
+        &session_id,
+    )
+    .await
+    {
+        Ok((resp_body, upstream_status)) => {
+            let status =
+                StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(resp_body)).into_response()
+        }
+        Err(e) => proxy_error_response(e),
+    }
 }
 
 /// POST /v1/messages/stream — SSE streaming Messages API proxy
