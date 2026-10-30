@@ -273,16 +273,17 @@ curl -X POST http://localhost:8765/v1/messages \
 
 | 엔드포인트 | 설명 |
 |-----------|------|
-| `POST /v1/sessions` | 세션 생성. body: `{model, system?, max_tokens?, temperature?, tools?, tool_choice?, betas?, cache_breakpoint?}` (옵션은 아래 설명) |
+| `POST /v1/sessions` | 세션 생성. body: `{model, system?, max_tokens?, temperature?, tools?, tool_choice?, betas?, cache_breakpoint?, microcompact?}` (두 옵션은 아래 설명) |
 | `GET /v1/sessions` | 세션 목록 |
 | `GET /v1/sessions/:id` | 세션 상태 + 메시지 배열 |
 | `DELETE /v1/sessions/:id` | 세션 삭제 |
 | `POST /v1/sessions/:id/msg` | 메시지 전송 (이전 대화 자동 포함) |
 | `POST /v1/sessions/:id/msg/stream` | SSE 스트리밍 버전 |
 
-**세션 옵션 (기본 꺼짐)**
+**세션 옵션 (둘 다 기본 꺼짐)**
 
 - `cache_breakpoint: true` — 매 요청의 마지막 content 블록에 5분 prompt-cache 마커를 1개 붙입니다(Claude Code 방식). 캐시 쓰기는 일반 입력보다 비싸고 읽기는 훨씬 쌉니다.
+- `microcompact: {trigger_tokens, compactable_tools?}` — 세션의 추정 컨텍스트가 `trigger_tokens`에 닿으면 다음 요청 전에 오래된 tool 결과를 비웁니다. 규칙은 Claude Code의 "keep recent"와 같습니다: 최근 compactable tool 호출 5개는 유지하고, 비워서 추정 20,000토큰 이상이 확보될 때만 동작하며, 비워진 결과는 `[Old tool result content cleared]`가 됩니다(tool 호출 자체는 건드리지 않음). `compactable_tools` 기본값은 Claude Code의 목록(`Read, Grep, Glob, WebSearch, WebFetch, Edit, Write, Bash, PowerShell`)입니다. **기본 트리거는 없습니다** — `microcompact`를 생략하면 아무것도 지우지 않습니다. 히스토리는 영구히 다시 쓰이고, 비운 지점부터 prompt cache가 무효화됩니다. 동작하면 응답(non-stream)에 `microcompact: {cleared_tool_results, estimated_tokens_saved}`가 담깁니다.
 
 tool_use 라운드트립은 `POST /v1/sessions/:id/msg` body에 `{"is_tool_result": true, "content": [{"type":"tool_result","tool_use_id":"...","content":"..."}]}` 를 실어보냅니다 (상세: [README.md](../README.md#tool_use-라운드트립)).
 

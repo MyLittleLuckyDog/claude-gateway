@@ -67,6 +67,26 @@ pub struct SessionOptions {
     /// more than plain input; reads cost far less).
     #[serde(default)]
     pub cache_breakpoint: bool,
+    /// Clear old tool results once the session's context reaches
+    /// `trigger_tokens`. Off unless set — there is no default trigger.
+    #[serde(default)]
+    pub microcompact: Option<MicrocompactOptions>,
+}
+
+/// Claude Code's "keep recent" microcompact (2.1.241 bundle: `afl`/`hKf`/`deo`),
+/// run by the gateway on its own trigger. In the CLI the trigger is a
+/// server-side `context_hint` exchange; the server rejects that beta for
+/// subscription traffic (HTTP 400), so there is no server signal to follow and
+/// the caller states the threshold instead.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MicrocompactOptions {
+    /// Run when the estimated context (last turn's input incl. cached tokens +
+    /// output) is at least this many tokens.
+    pub trigger_tokens: u64,
+    /// Tool names whose results may be cleared. Defaults to the tools Claude
+    /// Code itself compacts.
+    #[serde(default)]
+    pub compactable_tools: Option<Vec<String>>,
 }
 
 impl ProxySession {
@@ -175,6 +195,37 @@ impl ProxySession {
         body
     }
 
+    /// Run the opt-in microcompact if the session asked for it and its context
+    /// has reached the caller's `trigger_tokens`.
+    ///
+    /// Rewrites stored history for good, as the CLI does. Clearing tool results
+    /// invalidates the prompt cache from the first cleared block onward, so
+    /// the next request re-writes that part. The context estimate is lowered by
+    /// the savings so the preflight check sees the smaller context; the next
+    /// response replaces it with the real count.
+    pub fn maybe_microcompact(&mut self) -> Option<MicrocompactOutcome> {
+        let opts = self.options.microcompact.clone()?;
+        if self.estimated_context_tokens() < opts.trigger_tokens {
+            return None;
+        }
+        let allowed = opts.compactable_tools;
+        let compactable = |name: &str| match &allowed {
+            Some(list) => list.iter().any(|t| t == name),
+            None => DEFAULT_COMPACTABLE_TOOLS.contains(&name),
+        };
+        let outcome = microcompact_messages(&mut self.messages, &compactable)?;
+        self.last_input_tokens = self
+            .last_input_tokens
+            .saturating_sub(outcome.estimated_tokens_saved);
+        tracing::info!(
+            "[microcompact] session={} cleared={} est_tokens_saved={}",
+            self.id,
+            outcome.cleared_tool_results,
+            outcome.estimated_tokens_saved
+        );
+        Some(outcome)
+    }
+
     /// Append a user message to the conversation.
     /// Returns a unique message ID for safe rollback.
     pub fn add_user_message(&mut self, content: serde_json::Value) -> String {
@@ -257,6 +308,153 @@ impl ProxySession {
     fn is_idle(&self) -> bool {
         epoch_secs() - self.last_activity > self.idle_timeout_secs
     }
+}
+
+// ── Microcompact ───────────────────────────────────────────────────
+
+/// What replaces a cleared tool result (CLI constant `U1i`).
+pub const MICROCOMPACT_PLACEHOLDER: &str = "[Old tool result content cleared]";
+/// Most recent compactable tool results always kept (CLI `Nfh`).
+const MICROCOMPACT_KEEP_RECENT: usize = 5;
+/// Nothing is cleared unless at least this many tokens would be saved (CLI `sfl`).
+const MICROCOMPACT_MIN_TOKENS_SAVED: u64 = 20_000;
+/// Flat estimate for an image or document inside a tool result (CLI `hrH`).
+const MEDIA_TOKEN_ESTIMATE: u64 = 2_000;
+/// Marker the CLI leaves when it persisted a cleared result to disk (`mrH`);
+/// treated as already cleared.
+const PERSISTED_OUTPUT_PREFIX: &str = "<persisted-output>";
+/// Tools the CLI compacts: Read, Grep, Glob, WebSearch, WebFetch, Edit, Write,
+/// Bash, PowerShell.
+const DEFAULT_COMPACTABLE_TOOLS: [&str; 9] = [
+    "Read",
+    "Grep",
+    "Glob",
+    "WebSearch",
+    "WebFetch",
+    "Edit",
+    "Write",
+    "Bash",
+    "PowerShell",
+];
+
+/// What a microcompact pass did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MicrocompactOutcome {
+    pub cleared_tool_results: usize,
+    pub estimated_tokens_saved: u64,
+}
+
+/// CLI token estimate (`vE`): characters / 4, rounded, counted in UTF-16 units
+/// like the JavaScript original.
+fn estimate_text_tokens(text: &str) -> u64 {
+    (text.encode_utf16().count() as f64 / 4.0).round() as u64
+}
+
+/// CLI `yrH`: tokens a tool result's content is worth.
+fn estimate_tool_result_tokens(block: &serde_json::Value) -> u64 {
+    match block.get("content") {
+        Some(serde_json::Value::String(s)) => estimate_text_tokens(s),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .map(
+                |p| match p.get("type").and_then(serde_json::Value::as_str) {
+                    Some("text") => p
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(estimate_text_tokens)
+                        .unwrap_or(0),
+                    Some("image") | Some("document") => MEDIA_TOKEN_ESTIMATE,
+                    _ => 0,
+                },
+            )
+            .sum(),
+        _ => 0,
+    }
+}
+
+/// CLI `brH`: already cleared (or persisted elsewhere).
+fn is_already_cleared(block: &serde_json::Value) -> bool {
+    block
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|c| c == MICROCOMPACT_PLACEHOLDER || c.starts_with(PERSISTED_OUTPUT_PREFIX))
+}
+
+/// Clear the content of old compactable tool results in `messages`.
+///
+/// Keeps the `MICROCOMPACT_KEEP_RECENT` most recent compactable tool calls,
+/// clears the results of the older ones, and does nothing at all unless that
+/// saves `MICROCOMPACT_MIN_TOKENS_SAVED` or more. The tool calls themselves
+/// and every other message are left as they are.
+fn microcompact_messages(
+    messages: &mut [serde_json::Value],
+    compactable: &dyn Fn(&str) -> bool,
+) -> Option<MicrocompactOutcome> {
+    // Ids of compactable tool calls, oldest first.
+    let ids: Vec<String> = messages
+        .iter()
+        .filter(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("assistant"))
+        .filter_map(|m| m.get("content").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("tool_use"))
+        .filter(|b| {
+            b.get("name")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(compactable)
+        })
+        .filter_map(|b| b.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect();
+
+    let keep_from = ids.len().saturating_sub(MICROCOMPACT_KEEP_RECENT);
+    let stale: std::collections::HashSet<&str> =
+        ids[..keep_from].iter().map(String::as_str).collect();
+    if stale.is_empty() {
+        return None;
+    }
+
+    let mut targets: Vec<(usize, usize)> = Vec::new();
+    let mut saved = 0u64;
+    for (mi, m) in messages.iter().enumerate() {
+        if m.get("role").and_then(serde_json::Value::as_str) != Some("user") {
+            continue;
+        }
+        let Some(blocks) = m.get("content").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for (bi, b) in blocks.iter().enumerate() {
+            let is_stale_result = b.get("type").and_then(serde_json::Value::as_str)
+                == Some("tool_result")
+                && b.get("tool_use_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| stale.contains(id));
+            if is_stale_result && !is_already_cleared(b) {
+                saved += estimate_tool_result_tokens(b);
+                targets.push((mi, bi));
+            }
+        }
+    }
+
+    if saved < MICROCOMPACT_MIN_TOKENS_SAVED {
+        return None;
+    }
+    for &(mi, bi) in &targets {
+        if let Some(block) = messages[mi]
+            .get_mut("content")
+            .and_then(serde_json::Value::as_array_mut)
+            .and_then(|blocks| blocks.get_mut(bi))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            block.insert(
+                "content".to_string(),
+                serde_json::Value::String(MICROCOMPACT_PLACEHOLDER.to_string()),
+            );
+        }
+    }
+    Some(MicrocompactOutcome {
+        cleared_tool_results: targets.len(),
+        estimated_tokens_saved: saved,
+    })
 }
 
 // ── Prompt-cache breakpoint ────────────────────────────────────────
@@ -669,5 +867,245 @@ mod tests {
             "usage": {"input_tokens": 100, "output_tokens": 10},
         }));
         assert_eq!(s.estimated_context_tokens(), 110);
+    }
+
+    // ── microcompact ───────────────────────────────────────────────
+
+    /// One tool call and its result; `chars / 4` is the estimated token size.
+    fn exchange(s: &mut ProxySession, id: &str, tool: &str, chars: usize) {
+        s.messages.push(json!({"role": "assistant", "content": [
+            {"type": "text", "text": "calling"},
+            {"type": "tool_use", "id": id, "name": tool, "input": {"path": "/x"}},
+        ]}));
+        s.add_tool_result(vec![json!({
+            "type": "tool_result", "tool_use_id": id, "content": "x".repeat(chars),
+        })]);
+    }
+
+    fn result_content(s: &ProxySession, id: &str) -> serde_json::Value {
+        for m in &s.messages {
+            for b in m["content"].as_array().into_iter().flatten() {
+                if b["type"] == "tool_result" && b["tool_use_id"] == id {
+                    return b["content"].clone();
+                }
+            }
+        }
+        panic!("no tool_result for {id}");
+    }
+
+    fn all_compactable(_: &str) -> bool {
+        true
+    }
+
+    const TEN_K_TOKENS: usize = 40_000;
+
+    #[test]
+    fn keeps_the_five_most_recent_and_clears_older_ones() {
+        let mut s = session();
+        for i in 0..8 {
+            exchange(&mut s, &format!("t{i}"), "Read", TEN_K_TOKENS);
+        }
+        let before_assistant: Vec<_> = s
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .cloned()
+            .collect();
+
+        let out = microcompact_messages(&mut s.messages, &all_compactable).expect("applies");
+        assert_eq!(out.cleared_tool_results, 3);
+        assert_eq!(out.estimated_tokens_saved, 30_000);
+        for i in 0..3 {
+            assert_eq!(
+                result_content(&s, &format!("t{i}")),
+                MICROCOMPACT_PLACEHOLDER
+            );
+        }
+        for i in 3..8 {
+            assert_eq!(
+                result_content(&s, &format!("t{i}")).as_str().map(str::len),
+                Some(TEN_K_TOKENS)
+            );
+        }
+        // Tool calls and assistant text are never touched.
+        let after_assistant: Vec<_> = s
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .cloned()
+            .collect();
+        assert_eq!(before_assistant, after_assistant);
+    }
+
+    #[test]
+    fn does_nothing_below_the_savings_floor() {
+        let mut s = session();
+        for i in 0..6 {
+            exchange(&mut s, &format!("t{i}"), "Read", TEN_K_TOKENS);
+        }
+        // One stale result = 10k tokens, under the 20k floor.
+        let snapshot = s.messages.clone();
+        assert_eq!(
+            microcompact_messages(&mut s.messages, &all_compactable),
+            None
+        );
+        assert_eq!(s.messages, snapshot);
+    }
+
+    #[test]
+    fn the_floor_is_inclusive() {
+        let mut s = session();
+        for i in 0..7 {
+            exchange(&mut s, &format!("t{i}"), "Read", TEN_K_TOKENS);
+        }
+        // Two stale results = exactly 20,000 tokens.
+        let out = microcompact_messages(&mut s.messages, &all_compactable).expect("applies");
+        assert_eq!(out.estimated_tokens_saved, 20_000);
+    }
+
+    #[test]
+    fn other_tools_neither_count_toward_keep_nor_get_cleared() {
+        let mut s = session();
+        for i in 0..8 {
+            exchange(&mut s, &format!("r{i}"), "Read", TEN_K_TOKENS);
+            exchange(&mut s, &format!("c{i}"), "custom_tool", TEN_K_TOKENS);
+        }
+        let default_set = |n: &str| DEFAULT_COMPACTABLE_TOOLS.contains(&n);
+        let out = microcompact_messages(&mut s.messages, &default_set).expect("applies");
+        assert_eq!(
+            out.cleared_tool_results, 3,
+            "only Read results are candidates"
+        );
+        for i in 0..8 {
+            assert_eq!(
+                result_content(&s, &format!("c{i}")).as_str().map(str::len),
+                Some(TEN_K_TOKENS),
+                "custom_tool result {i} must be untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn already_cleared_results_are_not_counted_or_cleared_again() {
+        let mut s = session();
+        for i in 0..8 {
+            exchange(&mut s, &format!("t{i}"), "Read", TEN_K_TOKENS);
+        }
+        assert!(microcompact_messages(&mut s.messages, &all_compactable).is_some());
+        let snapshot = s.messages.clone();
+        assert_eq!(
+            microcompact_messages(&mut s.messages, &all_compactable),
+            None
+        );
+        assert_eq!(s.messages, snapshot);
+    }
+
+    #[test]
+    fn media_in_a_tool_result_counts_two_thousand_tokens_each() {
+        let mut s = session();
+        s.messages.push(json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "img", "name": "Read", "input": {}},
+        ]}));
+        s.add_tool_result(vec![json!({
+            "type": "tool_result", "tool_use_id": "img",
+            "content": (0..10).map(|_| json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "AA"},
+            })).collect::<Vec<_>>(),
+        })]);
+        for i in 0..5 {
+            exchange(&mut s, &format!("t{i}"), "Read", 4);
+        }
+        let out = microcompact_messages(&mut s.messages, &all_compactable).expect("applies");
+        assert_eq!(out.estimated_tokens_saved, 20_000);
+        assert_eq!(result_content(&s, "img"), MICROCOMPACT_PLACEHOLDER);
+    }
+
+    #[test]
+    fn token_estimate_counts_utf16_units_like_the_cli() {
+        // Four emoji: 4 chars but 8 UTF-16 units -> 2 tokens, not 1.
+        assert_eq!(
+            estimate_text_tokens("\u{1F600}\u{1F600}\u{1F600}\u{1F600}"),
+            2
+        );
+        assert_eq!(estimate_text_tokens(""), 0);
+        assert_eq!(estimate_text_tokens("abcdef"), 2); // 1.5 rounds up
+    }
+
+    fn compacting_session(trigger: u64) -> ProxySession {
+        let mut s = ProxySession::new(
+            "s".into(),
+            SessionOptions {
+                microcompact: Some(MicrocompactOptions {
+                    trigger_tokens: trigger,
+                    compactable_tools: None,
+                }),
+                ..Default::default()
+            },
+            3600,
+        );
+        for i in 0..8 {
+            exchange(&mut s, &format!("t{i}"), "Read", TEN_K_TOKENS);
+        }
+        s
+    }
+
+    #[test]
+    fn microcompact_is_off_unless_the_session_asks_for_it() {
+        let mut s = session();
+        for i in 0..8 {
+            exchange(&mut s, &format!("t{i}"), "Read", TEN_K_TOKENS);
+        }
+        s.last_input_tokens = 900_000;
+        assert_eq!(s.maybe_microcompact(), None);
+    }
+
+    #[test]
+    fn microcompact_waits_for_the_callers_trigger() {
+        let mut s = compacting_session(100_000);
+        s.last_input_tokens = 60_000;
+        s.last_output_tokens = 1_000;
+        assert_eq!(s.maybe_microcompact(), None);
+        assert_eq!(
+            result_content(&s, "t0").as_str().map(str::len),
+            Some(TEN_K_TOKENS)
+        );
+    }
+
+    #[test]
+    fn microcompact_runs_at_the_trigger_and_lowers_the_context_estimate() {
+        let mut s = compacting_session(100_000);
+        s.last_input_tokens = 150_000;
+        s.last_output_tokens = 500;
+        let out = s.maybe_microcompact().expect("applies");
+        assert_eq!(out.estimated_tokens_saved, 30_000);
+        assert_eq!(s.last_input_tokens, 120_000);
+        assert_eq!(result_content(&s, "t0"), MICROCOMPACT_PLACEHOLDER);
+    }
+
+    #[test]
+    fn caller_can_name_its_own_compactable_tools() {
+        let mut s = compacting_session(1);
+        s.last_input_tokens = 150_000;
+        s.options.microcompact = Some(MicrocompactOptions {
+            trigger_tokens: 1,
+            compactable_tools: Some(vec!["lookup".to_string()]),
+        });
+        // Every exchange is "Read", which the caller's list excludes.
+        assert_eq!(s.maybe_microcompact(), None);
+    }
+
+    #[test]
+    fn a_session_at_the_edge_of_its_window_passes_preflight_after_microcompact() {
+        let mut s = compacting_session(1);
+        let window = models::context_window(&s.model) as u64;
+        s.last_input_tokens = window - 500;
+        assert!(s.preflight_check(1_000).is_err(), "refused before relief");
+
+        s.maybe_microcompact().expect("applies");
+        assert!(
+            s.preflight_check(1_000).is_ok(),
+            "relieved by clearing old results"
+        );
     }
 }

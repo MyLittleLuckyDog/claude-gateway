@@ -166,6 +166,10 @@ async fn send_message(
                 .or(session.options.max_tokens)
                 .unwrap_or_else(|| crate::models::default_max_tokens(&session.model));
 
+            // Before the preflight check, so a session at the edge of its
+            // window can be relieved instead of refused.
+            let microcompact = session.maybe_microcompact();
+
             if let Err(msg) = session.preflight_check(max_tokens) {
                 return Err(msg);
             }
@@ -184,11 +188,11 @@ async fn send_message(
             let body = session.build_request(req.max_tokens);
             let betas = session.options.betas.clone();
             let upstream_sid = session.id.clone();
-            Ok((body, betas, upstream_sid, msg_id))
+            Ok((body, betas, upstream_sid, msg_id, microcompact))
         })
         .await;
 
-    let (body, extra_betas, upstream_session_id, msg_id) = match prepared {
+    let (body, extra_betas, upstream_session_id, msg_id, microcompact) = match prepared {
         None => {
             return error_response(404, "session_not_found", &format!("Session {id} not found"))
         }
@@ -240,6 +244,9 @@ async fn send_message(
                     obj.insert("session_id".to_string(), json!(sid));
                     obj.insert("estimated_context_tokens".to_string(), json!(ctx_tokens));
                     obj.insert("context_near_limit".to_string(), json!(near_limit));
+                    if let Some(outcome) = &microcompact {
+                        obj.insert("microcompact".to_string(), json!(outcome));
+                    }
 
                     if let Some(ps) = state.proxy.as_ref() {
                         let map = ps.rate_limit.read().await;
@@ -311,6 +318,10 @@ async fn send_message_stream(
                 .or(session.options.max_tokens)
                 .unwrap_or_else(|| crate::models::default_max_tokens(&session.model));
 
+            // Before the preflight check, so a session at the edge of its
+            // window can be relieved instead of refused.
+            let microcompact = session.maybe_microcompact();
+
             if let Err(msg) = session.preflight_check(max_tokens) {
                 return Err(msg);
             }
@@ -329,11 +340,11 @@ async fn send_message_stream(
             let body = session.build_request(req.max_tokens);
             let betas = session.options.betas.clone();
             let upstream_sid = session.id.clone();
-            Ok((body, betas, upstream_sid, msg_id))
+            Ok((body, betas, upstream_sid, msg_id, microcompact))
         })
         .await;
 
-    let (body, extra_betas, upstream_session_id, msg_id) = match prepared {
+    let (body, extra_betas, upstream_session_id, msg_id, _microcompact) = match prepared {
         None => {
             return error_response(404, "session_not_found", &format!("Session {id} not found"))
         }
