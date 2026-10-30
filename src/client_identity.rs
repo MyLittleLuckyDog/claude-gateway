@@ -51,7 +51,16 @@ const USER_AGENT_PREFIX: &str = "claude-cli";
 /// read directly out of the installed CLI's bundled JS
 /// (`~/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe`,
 /// function `PPo`) rather than guessed.
-const CLAUDE_CLI_VERSION: &str = "2.1.302";
+///
+/// Synced to 2.1.314 on 2026-10-30, the CLI installed on this machine, whose
+/// bundle was unpacked to confirm the User-Agent, billing-header and
+/// `X-Claude-Code-Session-Id` shapes used here. Note that the `.N` after the
+/// version in `cc_version` is not a counter: see [`cc_version_fingerprint`].
+const CLAUDE_CLI_VERSION: &str = "2.1.314";
+
+/// Salt of the `cc_version` fingerprint (constant `x0` in the 2.1.314 bundle;
+/// the same value appears in 2.1.241).
+const FINGERPRINT_SALT: &str = "59cf53e54c78";
 
 #[derive(Debug, Deserialize)]
 struct GlobalConfig {
@@ -192,8 +201,16 @@ pub fn get_identity() -> &'static ClientIdentity {
 ///   `claude-cli/<version> (<user_type>, cli)`
 pub fn user_agent() -> String {
     let user_type = std::env::var("USER_TYPE").unwrap_or_else(|_| "external".to_string());
-    let entrypoint = std::env::var("CLAUDE_CODE_ENTRYPOINT").unwrap_or_else(|_| "cli".to_string());
-    format!("{USER_AGENT_PREFIX}/{CLAUDE_CLI_VERSION} ({user_type}, {entrypoint})")
+    format!(
+        "{USER_AGENT_PREFIX}/{CLAUDE_CLI_VERSION} ({user_type}, {})",
+        entrypoint()
+    )
+}
+
+/// The client entrypoint reported upstream (`cli` unless the environment says
+/// otherwise), shared by the User-Agent and the billing header.
+fn entrypoint() -> String {
+    std::env::var("CLAUDE_CODE_ENTRYPOINT").unwrap_or_else(|_| "cli".to_string())
 }
 
 /// Server-side marker the Anthropic Messages API requires to accept OAuth
@@ -212,8 +229,62 @@ pub fn user_agent() -> String {
 /// 2026-10-24 in lockstep with CLAUDE_CLI_VERSION above — see that constant's
 /// comment. Only the version changed; `cc_entrypoint`/`cch` are untouched
 /// since they weren't implicated in the Opus 5.5 rejection this was fixing.
-pub const BILLING_SYSTEM_BLOCK: &str =
-    "x-anthropic-billing-header: cc_version=2.1.302.1; cc_entrypoint=cli; cch=00000;";
+///
+/// `cc_version` is `<cli version>.<fingerprint>` where the fingerprint depends
+/// on the conversation's first user message; the block is therefore built per
+/// request by [`billing_system_block`].
+pub fn billing_system_block(first_user_text: &str) -> String {
+    format!(
+        "x-anthropic-billing-header: cc_version={CLAUDE_CLI_VERSION}.{}; cc_entrypoint={}; cch=00000;",
+        cc_version_fingerprint(first_user_text),
+        entrypoint()
+    )
+}
+
+/// The three-hex-digit suffix of `cc_version`, as Claude Code computes it
+/// (2.1.314 bundle, `Cf`): SHA-256 of
+/// `salt + chars [4, 7, 20] of the first user message + cli version`, first
+/// three hex digits. A missing character counts as `"0"`.
+///
+/// JavaScript indexes strings by UTF-16 code unit and hashes the joined string
+/// as UTF-8, so the units are collected first and decoded together: a valid
+/// surrogate pair formed by neighbouring picks becomes one character, a lone
+/// surrogate becomes U+FFFD, exactly as in Node.
+pub fn cc_version_fingerprint(first_user_text: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let units: Vec<u16> = first_user_text.encode_utf16().collect();
+    let picked: Vec<u16> = [4usize, 7, 20]
+        .iter()
+        .map(|&i| units.get(i).copied().unwrap_or(u16::from(b'0')))
+        .collect();
+    let picked = String::from_utf16_lossy(&picked);
+    let digest = Sha256::digest(format!("{FINGERPRINT_SALT}{picked}{CLAUDE_CLI_VERSION}"));
+    format!("{:02x}{:02x}", digest[0], digest[1])[..3].to_string()
+}
+
+/// Text of the first user message, the way the CLI reads it: a string body as
+/// is, otherwise the first `text` block; empty when there is none.
+fn first_user_text(body: &serde_json::Value) -> String {
+    let first = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|msgs| {
+            msgs.iter()
+                .find(|m| m.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        });
+    match first.and_then(|m| m.get("content")) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .find(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+            .and_then(|b| b.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
+}
 
 /// Prepend the billing-header system block to the request body so Sonnet/
 /// Opus requests are recognized as Claude Code traffic. Idempotent: if the
@@ -221,15 +292,16 @@ pub const BILLING_SYSTEM_BLOCK: &str =
 /// alone. Preserves any existing system content the caller provided by
 /// converting it to an array form and appending after the marker.
 pub fn inject_billing_system_block(body: &mut serde_json::Value) {
+    let first_user = first_user_text(body);
     let obj = match body.as_object_mut() {
         Some(o) => o,
         None => return,
     };
 
-    // Build the marker block once.
+    // Build the marker block once (the fingerprint reads the first user message).
     let marker_block = serde_json::json!({
         "type": "text",
-        "text": BILLING_SYSTEM_BLOCK,
+        "text": billing_system_block(&first_user),
     });
 
     match obj.get_mut("system") {
@@ -340,5 +412,88 @@ mod tests {
     fn user_agent_prefix() {
         let ua = user_agent();
         assert!(ua.starts_with("claude-cli/"));
+    }
+
+    // ── billing header / cc_version fingerprint ────────────────────
+
+    /// Golden values produced by running the CLI's own algorithm (2.1.314
+    /// bundle, `Cf`) in Node: sha256(salt + s[4]s[7]s[20] + version)[..3].
+    const FINGERPRINT_VECTORS: &[(&str, &str)] = &[
+        ("", "cfe"),
+        ("hi", "cfe"),
+        ("abcde", "0f2"),
+        ("Reply with the single word: ok", "d8d"),
+        (
+            "The quick brown fox jumps over the lazy dog, twice over.",
+            "582",
+        ),
+        (
+            "안녕하세요, 오늘 날씨가 어떤가요? 알려주세요 부탁드립니다",
+            "969",
+        ),
+        // Characters outside the BMP are two UTF-16 units, as in JavaScript.
+        ("abcd😀fgh😀jklmnopqrstuvwxyz", "593"),
+        ("abcdefg😀ijklmnopqrstuvwxyz0123", "8c1"),
+        ("0000000000000000000000000", "cfe"),
+    ];
+
+    #[test]
+    fn fingerprint_matches_the_clis_own_algorithm() {
+        for (text, expected) in FINGERPRINT_VECTORS {
+            assert_eq!(&cc_version_fingerprint(text), expected, "input {text:?}");
+        }
+    }
+
+    #[test]
+    fn billing_block_has_the_clis_shape() {
+        let block = billing_system_block("Reply with the single word: ok");
+        assert!(
+            block.starts_with("x-anthropic-billing-header: cc_version=2.1.314.d8d; cc_entrypoint="),
+            "{block}"
+        );
+        assert!(block.ends_with("; cch=00000;"), "{block}");
+    }
+
+    #[test]
+    fn injected_block_fingerprints_the_first_user_message() {
+        let block_for = |messages: serde_json::Value| {
+            let mut body = serde_json::json!({"model": "x", "messages": messages});
+            inject_billing_system_block(&mut body);
+            body["system"][0]["text"].as_str().unwrap_or("").to_string()
+        };
+
+        // String content, and the first text block of block content, agree.
+        let a = block_for(
+            serde_json::json!([{"role": "user", "content": "The quick brown fox jumps"}]),
+        );
+        let b = block_for(serde_json::json!([{"role": "user", "content": [
+            {"type": "image", "source": {}},
+            {"type": "text", "text": "The quick brown fox jumps"},
+        ]}]));
+        assert_eq!(a, b);
+
+        // Only the first *user* message counts, not an earlier assistant turn
+        // and not later turns.
+        let c = block_for(serde_json::json!([
+            {"role": "assistant", "content": "ignored"},
+            {"role": "user", "content": "The quick brown fox jumps"},
+            {"role": "user", "content": "something else entirely"},
+        ]));
+        assert_eq!(a, c);
+
+        // A different opening message gives a different fingerprint.
+        let d = block_for(
+            serde_json::json!([{"role": "user", "content": "Reply with the single word: ok"}]),
+        );
+        assert_ne!(a, d);
+    }
+
+    #[test]
+    fn user_agent_reports_the_synced_cli_version() {
+        assert!(
+            user_agent().starts_with("claude-cli/2.1.314 ("),
+            "{}",
+            user_agent()
+        );
     }
 }

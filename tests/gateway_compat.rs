@@ -363,3 +363,55 @@ async fn claude_code_session_id_header_becomes_the_upstream_session() {
         "no header -> a fresh id per request"
     );
 }
+
+/// What the upstream sees is the client identity the CLI 2.1.314 presents:
+/// its User-Agent, SDK version, session header, and a billing block whose
+/// `cc_version` fingerprint follows the conversation.
+#[tokio::test]
+async fn upstream_sees_the_current_client_identity() {
+    let (base, _proxy, up) = start_with_gateway().await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .header("x-session-id", "sess-identity")
+        .json(&json!({
+            "model": "claude-sonnet-5-5",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 200);
+
+    assert!(
+        up.last_header("user-agent")
+            .unwrap_or_default()
+            .starts_with("claude-cli/2.1.314 ("),
+        "{:?}",
+        up.last_header("user-agent")
+    );
+    assert_eq!(
+        up.last_header("x-stainless-package-version").as_deref(),
+        Some("0.128.0")
+    );
+    // The header and metadata.user_id name the same session.
+    assert_eq!(
+        up.last_header("x-claude-code-session-id").as_deref(),
+        Some("sess-identity")
+    );
+    assert_eq!(upstream_session_id(&up), "sess-identity");
+
+    let body = up
+        .requests
+        .lock()
+        .expect("lock")
+        .last()
+        .cloned()
+        .expect("request");
+    let first_system = body["system"][0]["text"].as_str().expect("system[0].text");
+    assert!(
+        first_system.starts_with("x-anthropic-billing-header: cc_version=2.1.314.d8d;"),
+        "{first_system}"
+    );
+}

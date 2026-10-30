@@ -419,7 +419,7 @@ const NON_HAIKU_BETAS: &[&str] = &[
 /// Confirmed via live testing 2026-10-24: Haiku 5.5 needs the SAME treatment
 /// as Sonnet/Opus — omitting the billing block produces the exact generic
 /// `{type:"rate_limit_error",message:"Error"}` a non-Haiku model gets
-/// without it (see client_identity::BILLING_SYSTEM_BLOCK's doc comment);
+/// without it (see client_identity::billing_system_block's doc comment);
 /// adding just the block (no extra betas needed) fixed it. Only Haiku 4.5 is
 /// confirmed exempt, so exclude 5.5 explicitly rather than matching any
 /// model whose name merely contains "haiku" — a future Haiku should default
@@ -434,6 +434,7 @@ fn build_headers(
     token: &str,
     extra_betas: Option<&[String]>,
     model: Option<&str>,
+    session_id: Option<&str>,
 ) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
 
@@ -489,6 +490,15 @@ fn build_headers(
 
     headers.insert("x-app", HeaderValue::from_static("cli"));
 
+    // The CLI stamps every request with its session id (2.1.314 bundle: the
+    // default headers are x-app, User-Agent and this one). It is the same id
+    // that goes into metadata.user_id, so the two always agree. A caller-chosen
+    // id that is not a valid header value is left off rather than failing the
+    // request.
+    if let Some(value) = session_id.and_then(|sid| HeaderValue::from_str(sid).ok()) {
+        headers.insert("x-claude-code-session-id", value);
+    }
+
     // User-Agent — CLI server-side logging filters on the `claude-cli` prefix.
     // See src/utils/http.ts:getUserAgent() in the reference source.
     let ua = crate::client_identity::user_agent();
@@ -504,7 +514,7 @@ fn build_headers(
     headers.insert("x-stainless-lang", HeaderValue::from_static("js"));
     headers.insert(
         "x-stainless-package-version",
-        HeaderValue::from_static("0.74.0"),
+        HeaderValue::from_static("0.128.0"),
     );
     headers.insert("x-stainless-runtime", HeaderValue::from_static("node"));
     headers.insert(
@@ -596,7 +606,7 @@ pub async fn check_quota_at_startup(state: &Arc<ProxyState>) {
         }
     };
 
-    let headers = match build_headers(&token.access_token, None, Some(models::HAIKU_4_5.id)) {
+    let headers = match build_headers(&token.access_token, None, Some(models::HAIKU_4_5.id), None) {
         Ok(h) => h,
         Err(e) => {
             tracing::warn!("Quota pre-check skipped (header error): {}", e);
@@ -763,8 +773,13 @@ pub async fn messages_sync(
     // Retry loop for 529 (overloaded) only
     let mut last_status = 0u16;
     for attempt in 1..=(MAX_OVERLOAD_RETRIES + 1) {
-        let headers = build_headers(&token.access_token, extra_betas, model_in_body.as_deref())
-            .map_err(ProxyError::Internal)?;
+        let headers = build_headers(
+            &token.access_token,
+            extra_betas,
+            model_in_body.as_deref(),
+            Some(session_id),
+        )
+        .map_err(ProxyError::Internal)?;
         let resp = state
             .client
             .post(&url)
@@ -972,8 +987,13 @@ pub async fn messages_stream(
     let url = format!("{}/v1/messages?beta=true", state.base_url);
     let mut attempted_recovery = false;
     loop {
-        let headers = build_headers(&token.access_token, extra_betas, model_in_body.as_deref())
-            .map_err(ProxyError::Internal)?;
+        let headers = build_headers(
+            &token.access_token,
+            extra_betas,
+            model_in_body.as_deref(),
+            Some(session_id),
+        )
+        .map_err(ProxyError::Internal)?;
 
         let resp = state
             .client
