@@ -278,7 +278,12 @@ Claude Code CLI가 포함한 "gateway protocol" 문서의 요구를 따릅니다
 |------|------|
 | 베타 | `anthropic-beta` 요청 헤더(여러 줄·쉼표 목록 모두)를 업스트림에 그대로 전달합니다. 기존 body의 `betas` 필드와 합쳐지고 중복은 제거됩니다. |
 | 세션 id | 업스트림 세션은 `X-Session-Id` → `X-Claude-Code-Session-Id` → 요청마다 새 id 순서로 정합니다. 같은 대화를 같은 id로 보내야 prompt cache가 이어집니다. |
-| 오류 | `{"type":"error","error":{"type","message"}}` 형식입니다(`error.type` 값은 기존 그대로). |
+| 오류 형식 | `{"type":"error","error":{"type","message"}}`입니다(`error.type` 값은 기존 그대로). 없는 경로(404), 잘못된 메서드(405), JSON이 아닌 본문(400), `Content-Type` 누락(415)처럼 프레임워크가 직접 답하던 빈 본문·평문 오류도 같은 형식이고, 무엇이 문제인지 메시지에 적힙니다. |
+| 오류의 출처 | 모든 오류 응답의 `x-error-source` 헤더가 `gateway`(게이트웨이가 직접 거절·실패)인지 `upstream`(Anthropic이 답한 것을 그대로 전달)인지 알려 줍니다. 성공 응답에는 없습니다. 업스트림이 거절한 429와, 그 뒤 게이트웨이가 자체 캐시로 내는 429를 이 헤더로 구분합니다. |
+| 게이트웨이가 낸 429 메시지 | 업스트림이 실제로 한 말을 되풀이합니다: `Rate limited: ... — upstream said: "<원문>"`. 업스트림이 한도 종류를 알려 주지 않았으면 "usage limit"이라 단정하지 않고 `rate limit (upstream did not name which)`라고 씁니다. |
+| 업스트림에 닿지 못한 경우 (502) | `could not connect` / `timed out` / `the response could not be read` 중 어느 것인지와 원인 사슬 전체를 메시지에 적습니다. |
+| 프록시가 꺼져 있을 때 (501 `proxy_disabled`) | 이유가 메시지에 들어갑니다: 시작 시 사용할 수 있는 OAuth 인증 정보가 없었는지(실제 오류 포함), 설정(`proxy.enabled = false`)으로 꺼졌는지. |
+| 업스트림 오류 본문이 JSON이 아닐 때 | 원문 전체가 오류 형식의 `message`로 보존됩니다(잘리지 않음). 빈 본문이면 그렇다고 적습니다. |
 | 429 | `Retry-After`(초)와 `x-should-retry: false`를 붙입니다. 업스트림이 거절한 요청과, 그 뒤 게이트웨이가 직접 거절하는 요청 모두 해당합니다. 거절은 업스트림이 알려 준 리셋 시각까지, 알려 주지 않으면 60초간 유지됩니다. |
 | `POST /v1/messages/count_tokens` | 업스트림이 센 `{"input_tokens": N}`을 돌려줍니다(무료). 모델 별칭과 `anthropic-beta` 헤더는 `/v1/messages`와 같이 처리하고, 센 쪽이 받는 필드(`model, messages, system, tools, tool_choice, thinking, mcp_servers, context_management`)만 보냅니다. 게이트웨이가 요청에 붙이는 billing 마커는 서버도 과금하지 않으므로 세지 않습니다. 프록시가 꺼져 있거나 Claude 모델이 아니면 `501 not_supported` + `x-should-retry: false`로 답해 클라이언트가 직접 세게 합니다. |
 | `GET /v1/models`, `GET /v1/models/{id}` | 업스트림이 이 계정에 제공하는 모델 목록과 한도(`max_input_tokens`, `max_tokens`)를 그대로 돌려줍니다(SDK의 `models.list()` / `models.retrieve()`). 목록의 쿼리는 `limit`, `before_id`, `after_id`만 전달하고, `{id}`는 모델 id 문자(영문·숫자·`.` `_` `-` `:`)만 허용합니다. 프록시가 꺼져 있으면 `404`(클라이언트가 내장 목록을 쓰라는 신호)입니다. |

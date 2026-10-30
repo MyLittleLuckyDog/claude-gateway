@@ -52,17 +52,43 @@ pub use crate::core::stats::Stats;
 
 pub fn error_response(status: u16, code: &str, message: &str) -> Response {
     let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (
-        status_code,
-        Json(json!({
-            "type": "error",
-            "error": {
-                "type": code,
-                "message": message,
-            }
-        })),
+    from_gateway(
+        (
+            status_code,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": code,
+                    "message": message,
+                }
+            })),
+        )
+            .into_response(),
     )
-        .into_response()
+}
+
+/// Response header saying who produced an error: `gateway` (this process
+/// refused or failed) or `upstream` (Anthropic answered, and the gateway passed
+/// it on). Without it a 429 from the gateway's own cache and one from
+/// Anthropic look the same.
+pub const ERROR_SOURCE_HEADER: &str = "x-error-source";
+
+/// Mark an error response as the gateway's own.
+pub fn from_gateway(mut resp: Response) -> Response {
+    resp.headers_mut()
+        .insert(ERROR_SOURCE_HEADER, HeaderValue::from_static("gateway"));
+    resp
+}
+
+/// Pass an upstream answer on. When it is an error it is marked as upstream's,
+/// so it can be told from the gateway's own; the body is not touched.
+pub fn relay_upstream(status: StatusCode, body: serde_json::Value) -> Response {
+    let mut resp = (status, Json(body)).into_response();
+    if status.is_client_error() || status.is_server_error() {
+        resp.headers_mut()
+            .insert(ERROR_SOURCE_HEADER, HeaderValue::from_static("upstream"));
+    }
+    resp
 }
 
 /// What a client needs to tell one page of a list from the whole list.
@@ -105,6 +131,90 @@ pub fn proxy_disabled_response(state: &AppState) -> Response {
     )
 }
 
+/// Largest body [`json_errors`] will turn into an envelope. Anything declared
+/// larger -- or not declared -- is passed through untouched: it is never read,
+/// so it can never be cut.
+const FRAMEWORK_ERROR_BODY_LIMIT: usize = 8 * 1024;
+
+/// The Anthropic error type for an HTTP status, per the gateway protocol table.
+fn error_type_for(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 | 405 | 415 | 422 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        529 => "overloaded_error",
+        _ => "api_error",
+    }
+}
+
+/// Turn the errors the web framework answers on its own into the gateway's
+/// error envelope.
+///
+/// An unknown path, a wrong method, a body that is not JSON and a missing
+/// content type all produced an empty body or one bare line of text. This layer
+/// recognises those -- an error status whose body is not JSON and was declared
+/// small -- and answers `{"type":"error","error":{"type","message"}}` with a
+/// message that says what was wrong (for a 404 or 405, which request and what is
+/// allowed). Errors the handlers build themselves are already JSON and are left
+/// alone, as is anything it cannot see the whole of.
+async fn json_errors(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let resp = next.run(req).await;
+
+    let status = resp.status();
+    if !(status.is_client_error() || status.is_server_error()) {
+        return resp;
+    }
+    let headers = resp.headers();
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if content_type.starts_with("application/json") || content_type.starts_with("text/event-stream")
+    {
+        return resp;
+    }
+    // The size must be known up front: from the header, or from the body itself
+    // (an in-memory body knows its length before the transport adds the header).
+    let declared: Option<u64> = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .or_else(|| axum::body::HttpBody::size_hint(resp.body()).exact());
+    if !declared.is_some_and(|n| n <= FRAMEWORK_ERROR_BODY_LIMIT as u64) {
+        return resp;
+    }
+
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, FRAMEWORK_ERROR_BODY_LIMIT).await else {
+        // Declared small and not: nothing sensible left to say about its body.
+        return Response::from_parts(parts, axum::body::Body::empty());
+    };
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    let message = if !text.is_empty() {
+        text
+    } else {
+        match status.as_u16() {
+            404 => format!("No such endpoint: {method} {path}"),
+            // The `Allow` header (added outside this layer) lists what is.
+            405 => format!(
+                "{method} is not allowed on {path}; the Allow header lists the methods that are"
+            ),
+            _ => status.canonical_reason().unwrap_or("Error").to_string(),
+        }
+    };
+
+    let mut resp = error_response(status.as_u16(), error_type_for(status), &message);
+    if let Some(allow) = parts.headers.get(header::ALLOW) {
+        resp.headers_mut().insert(header::ALLOW, allow.clone());
+    }
+    resp
+}
+
 /// Mark a 429 for the caller: when to come back (`Retry-After`, whole seconds,
 /// at least 1) if the time is known, and `x-should-retry: false`. The gateway
 /// keeps refusing until then, so an SDK retry loop would only hit the same wall.
@@ -134,7 +244,7 @@ pub fn no_retry(mut resp: Response) -> Response {
 /// triple for the provider-proxy routes that have no `GatewayError` to hand.
 pub fn gateway_error_response(e: &crate::error::GatewayError) -> Response {
     let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (status, Json(crate::error::ErrorResponse::from(e))).into_response()
+    from_gateway((status, Json(crate::error::ErrorResponse::from(e))).into_response())
 }
 
 pub fn proxy_error_response(e: crate::proxy::ProxyError) -> Response {
@@ -155,11 +265,11 @@ pub fn proxy_error_response(e: crate::proxy::ProxyError) -> Response {
         })),
     )
         .into_response();
-    if is_rate_limit {
+    from_gateway(if is_rate_limit {
         with_rate_limit_headers(resp, until)
     } else {
         resp
-    }
+    })
 }
 
 /// Refuse a request that asks for more of the CLI than the policy allows.
@@ -334,6 +444,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(local_mlx::routes())
         .merge(proxy::routes())
         .merge(proxy_sessions::routes())
+        .layer(axum::middleware::from_fn(json_errors))
         .layer(cors)
         .with_state(state)
 }

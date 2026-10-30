@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 
-use super::{error_response, proxy_disabled_response};
+use super::{error_response, proxy_disabled_response, relay_upstream};
 use crate::api::AppState;
 use crate::proxy;
 use crate::proxy_session::SessionOptions;
@@ -318,7 +318,7 @@ async fn send_message(
 
                 let status = StatusCode::from_u16(upstream_status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                (status, Json(resp_body)).into_response()
+                relay_upstream(status, resp_body)
             }
         }
         Err(e) => {
@@ -419,7 +419,7 @@ async fn send_message_stream(
                 let body = proxy::error_body(resp).await;
                 let status = StatusCode::from_u16(upstream_status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                return (status, Json(body)).into_response();
+                return relay_upstream(status, body);
             }
 
             // SSE passthrough with inline parsing: raw bytes are forwarded

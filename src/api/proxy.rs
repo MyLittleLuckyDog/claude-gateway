@@ -80,7 +80,7 @@ fn merge_betas(from_body: Option<Vec<String>>, from_header: Vec<String>) -> Opti
 use serde_json::json;
 
 use super::{
-    error_response, no_retry, proxy_disabled_response, proxy_error_response,
+    error_response, no_retry, proxy_disabled_response, proxy_error_response, relay_upstream,
     with_rate_limit_headers,
 };
 use crate::api::AppState;
@@ -270,7 +270,7 @@ async fn messages_handler(
         Ok((resp_body, upstream_status)) => {
             let status =
                 StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            let resp = (status, Json(resp_body)).into_response();
+            let resp = relay_upstream(status, resp_body);
             if upstream_status == 429 {
                 return with_rate_limit_headers(
                     resp,
@@ -318,7 +318,7 @@ async fn handle_openai_messages(state: &AppState, body: serde_json::Value) -> Re
                 StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             if upstream_status != 200 {
                 // Pass upstream error through as-is
-                return (status, Json(openai_resp)).into_response();
+                return relay_upstream(status, openai_resp);
             }
             let anthropic_resp = transform::openai_chat_to_anthropic(&openai_resp);
             (status, Json(anthropic_resp)).into_response()
@@ -362,7 +362,7 @@ async fn handle_openai_messages_stream(state: &AppState, body: serde_json::Value
                 let body = proxy::error_body(resp).await;
                 let status = StatusCode::from_u16(upstream_status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                return (status, Json(body)).into_response();
+                return relay_upstream(status, body);
             }
 
             let byte_stream = resp.bytes_stream();
@@ -444,7 +444,7 @@ async fn count_tokens_handler(
         Ok((resp_body, upstream_status)) => {
             let status =
                 StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status, Json(resp_body)).into_response()
+            relay_upstream(status, resp_body)
         }
         Err(e) => proxy_error_response(e),
     }
@@ -491,7 +491,7 @@ async fn models_from_upstream(state: &AppState, path_and_query: &str) -> Respons
         Ok((body, upstream_status)) => {
             let status =
                 StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status, Json(body)).into_response()
+            relay_upstream(status, body)
         }
         Err(e) => proxy_error_response(e),
     }
@@ -557,7 +557,7 @@ async fn messages_stream_handler(
                 let body = proxy::error_body(resp).await;
                 let status = StatusCode::from_u16(upstream_status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                let resp = (status, Json(body)).into_response();
+                let resp = relay_upstream(status, body);
                 if upstream_status == 429 {
                     return with_rate_limit_headers(
                         resp,

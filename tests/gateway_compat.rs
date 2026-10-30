@@ -824,3 +824,158 @@ async fn an_unreachable_upstream_is_explained() {
         );
     }
 }
+
+/// What the framework itself answers -- an unknown path, a wrong method, a body
+/// that is not JSON, a missing content type -- used to be an empty 404/405 or a
+/// bare text line. They are errors in the same envelope as everything else, and
+/// say what was wrong.
+#[tokio::test]
+async fn framework_errors_use_the_envelope_and_explain_themselves() {
+    let (base, _proxy, _up) = start_with_gateway().await;
+    let client = reqwest::Client::new();
+
+    async fn envelope(resp: reqwest::Response) -> (u16, Value) {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.expect("body");
+        let body: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|_| panic!("status {status}: not an error envelope: {text:?}"));
+        (status, body)
+    }
+
+    // Unknown path.
+    let (status, body) =
+        envelope(client.get(format!("{base}/v1/nope")).send().await.unwrap()).await;
+    assert_eq!(status, 404);
+    assert_eq!(body["type"], "error", "{body}");
+    assert_eq!(body["error"]["type"], "not_found_error", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("GET /v1/nope"),
+        "{body}"
+    );
+
+    // Known path, wrong method: the message names both, and the Allow header
+    // still lists what would have worked.
+    let resp = client
+        .get(format!("{base}/v1/messages"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(header(&resp, "allow").as_deref(), Some("POST"));
+    let (status, body) = envelope(resp).await;
+    assert_eq!(status, 405);
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("GET") && message.contains("/v1/messages"),
+        "{message}"
+    );
+    // `Allow` itself is added outside the layer, so the message points to it.
+    assert!(message.contains("Allow header"), "{message}");
+
+    // A body that is not JSON.
+    let (status, body) = envelope(
+        client
+            .post(format!("{base}/v1/messages"))
+            .header("content-type", "application/json")
+            .body("this is not json")
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("JSON"),
+        "{body}"
+    );
+
+    // A JSON body sent without saying so.
+    let (status, body) = envelope(
+        client
+            .post(format!("{base}/v1/messages"))
+            .body(messages_body().to_string())
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, 415);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("application/json"),
+        "{body}"
+    );
+}
+
+/// Every error says who produced it in `x-error-source`: `upstream` when
+/// Anthropic answered and the gateway passed it on, `gateway` when the gateway
+/// itself refused or failed. Before, a 429 from Anthropic and the 429 the
+/// gateway then gave on its own cache were indistinguishable from outside.
+#[tokio::test]
+async fn errors_say_whether_the_gateway_or_upstream_made_them() {
+    let (base, _proxy, up) = start_with_gateway().await;
+    let client = reqwest::Client::new();
+    let source = |resp: &reqwest::Response| header(resp, "x-error-source");
+
+    // Upstream rejects: relayed, marked upstream.
+    up.push(bare_429());
+    let first = client
+        .post(format!("{base}/v1/messages"))
+        .json(&messages_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 429);
+    assert_eq!(source(&first).as_deref(), Some("upstream"));
+
+    // The gateway's own refusal that follows: marked gateway.
+    let second = client
+        .post(format!("{base}/v1/messages"))
+        .json(&messages_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 429);
+    assert_eq!(source(&second).as_deref(), Some("gateway"));
+
+    // A request the gateway rejects itself, and a path it does not have.
+    let bad = client
+        .post(format!("{base}/v1/messages"))
+        .json(&json!({"max_tokens": 8}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(source(&bad).as_deref(), Some("gateway"));
+    let missing = client.get(format!("{base}/v1/nope")).send().await.unwrap();
+    assert_eq!(source(&missing).as_deref(), Some("gateway"));
+
+    // A different family is not rejected; a success carries no marker at all.
+    let ok = client
+        .post(format!("{base}/v1/messages"))
+        .json(&json!({
+            "model": "claude-haiku-5-5", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    assert_eq!(source(&ok), None);
+
+    // Disabled proxy and unsupported count_tokens are the gateway's too.
+    let no_proxy = common::start_gateway_without_proxy().await;
+    let resp = client
+        .get(format!("{no_proxy}/v1/rate_limit"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(source(&resp).as_deref(), Some("gateway"));
+}
