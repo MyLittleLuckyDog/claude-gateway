@@ -33,6 +33,34 @@ fn session_id_from(headers: &HeaderMap) -> String {
         .map(|s| s.to_string())
         .unwrap_or_else(crate::client_identity::new_session_id)
 }
+/// Beta features the caller asked for with the `anthropic-beta` request header
+/// — how the SDKs and Claude Code send them. The header may repeat and each
+/// line may hold several comma-separated values.
+fn request_betas(headers: &HeaderMap) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in headers.get_all("anthropic-beta") {
+        let Ok(line) = value.to_str() else { continue };
+        for beta in line.split(',').map(str::trim).filter(|b| !b.is_empty()) {
+            if !out.iter().any(|seen| seen == beta) {
+                out.push(beta.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The gateway's older body `betas` field plus the header values, without
+/// repeating one. `None` when neither names anything.
+fn merge_betas(from_body: Option<Vec<String>>, from_header: Vec<String>) -> Option<Vec<String>> {
+    let mut merged = from_body.unwrap_or_default();
+    for beta in from_header {
+        if !merged.contains(&beta) {
+            merged.push(beta);
+        }
+    }
+    (!merged.is_empty()).then_some(merged)
+}
+
 use serde_json::json;
 
 use super::{error_response, proxy_error_response};
@@ -200,10 +228,11 @@ async fn messages_handler(
         None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
     };
 
-    let (forward_body, extra_betas) = match preprocess_request(&body) {
+    let (forward_body, body_betas) = match preprocess_request(&body) {
         Ok(r) => r,
         Err(e) => return e,
     };
+    let extra_betas = merge_betas(body_betas, request_betas(&headers));
 
     let session_id = session_id_from(&headers);
 
@@ -362,10 +391,11 @@ async fn messages_stream_handler(
         None => return error_response(501, "proxy_disabled", "Direct API proxy is not enabled"),
     };
 
-    let (forward_body, extra_betas) = match preprocess_request(&body) {
+    let (forward_body, body_betas) = match preprocess_request(&body) {
         Ok(r) => r,
         Err(e) => return e,
     };
+    let extra_betas = merge_betas(body_betas, request_betas(&headers));
 
     let session_id = session_id_from(&headers);
 
