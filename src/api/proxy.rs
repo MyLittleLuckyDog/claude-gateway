@@ -1,8 +1,10 @@
 //! HTTP handlers for the direct Messages API proxy.
 //!
 //! Endpoints:
-//!   POST /v1/messages       — sync response (passthrough to Anthropic API)
+//!   POST /v1/messages       — sync response (passthrough to Anthropic API);
+//!                             `stream: true` is served as SSE, as the SDKs expect
 //!   POST /v1/messages/stream — SSE streaming (passthrough)
+//!   POST /v1/messages/count_tokens — 501 not_supported (protocol fallback)
 //!   GET  /v1/rate_limit     — current rate limit status
 
 use std::sync::atomic::Ordering;

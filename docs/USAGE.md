@@ -268,6 +268,19 @@ curl -X POST http://localhost:8765/v1/messages \
 
 #### `POST /v1/messages/stream` — SSE 스트리밍
 동일 body로 `event: message_start`, `content_block_delta`, `message_stop` SSE 이벤트를 받습니다.
+`POST /v1/messages`에 `"stream": true`를 보내도 같은 SSE 응답을 받습니다(Anthropic SDK·Claude Code가 쓰는 표준 방식).
+
+#### Anthropic 호환 동작 (SDK / Claude Code 클라이언트용)
+
+Claude Code CLI가 포함한 "gateway protocol" 문서의 요구를 따릅니다.
+
+| 항목 | 동작 |
+|------|------|
+| 베타 | `anthropic-beta` 요청 헤더(여러 줄·쉼표 목록 모두)를 업스트림에 그대로 전달합니다. 기존 body의 `betas` 필드와 합쳐지고 중복은 제거됩니다. |
+| 세션 id | 업스트림 세션은 `X-Session-Id` → `X-Claude-Code-Session-Id` → 요청마다 새 id 순서로 정합니다. 같은 대화를 같은 id로 보내야 prompt cache가 이어집니다. |
+| 오류 | `{"type":"error","error":{"type","message"}}` 형식입니다(`error.type` 값은 기존 그대로). |
+| 429 | `Retry-After`(초)와 `x-should-retry: false`를 붙입니다. 업스트림이 거절한 요청과, 그 뒤 게이트웨이가 직접 거절하는 요청 모두 해당합니다. 거절은 업스트림이 알려 준 리셋 시각까지, 알려 주지 않으면 60초간 유지됩니다. |
+| `POST /v1/messages/count_tokens` | `501 not_supported` + `x-should-retry: false`. 클라이언트가 스스로 토큰을 세도록 하는 프로토콜상의 응답입니다(업스트림 위임은 미구현). |
 
 #### Proxy 세션 (멀티턴)
 
