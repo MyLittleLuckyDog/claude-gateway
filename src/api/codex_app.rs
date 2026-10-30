@@ -1,4 +1,6 @@
-use super::{gateway_error_response, reject_disallowed_codex_options, AppState};
+use super::{
+    gateway_error_response, page_info, reject_disallowed_codex_options, with_page_info, AppState,
+};
 use crate::codex::options::CodexOptions;
 use crate::codex_app;
 use crate::codex_app::session::CodexAppSessionState;
@@ -210,14 +212,18 @@ async fn get_messages(
         .take(params.limit)
         .map(|entry| entry.event.as_ref().clone())
         .collect();
+    let page = page_info(total, params.offset, params.limit, messages.len());
 
-    Json(json!({
-        "session_id": id,
-        "thread_id": session.thread_id.lock().await.clone(),
-        "turn_id": session.turn_id.lock().await.clone(),
-        "total": total,
-        "messages": messages,
-    }))
+    Json(with_page_info(
+        json!({
+            "session_id": id,
+            "thread_id": session.thread_id.lock().await.clone(),
+            "turn_id": session.turn_id.lock().await.clone(),
+            "total": total,
+            "messages": messages,
+        }),
+        page,
+    ))
     .into_response()
 }
 

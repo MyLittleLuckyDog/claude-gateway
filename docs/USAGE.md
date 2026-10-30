@@ -460,10 +460,16 @@ curl "http://localhost:8765/sessions/abc-123/messages?limit=50&offset=0&include_
 ```json
 {
   "session_id": "abc-123",
-  "total": 10,
-  "messages": [...]
+  "total": 120,
+  "messages": [...],
+  "offset": 0,
+  "limit": 50,
+  "returned": 50,
+  "has_more": true,
+  "next_offset": 50
 }
 ```
+**`limit`의 기본값은 50입니다.** 히스토리가 더 길면 처음 50개만 돌아오므로, `has_more`가 `true`인지 확인하고 `next_offset`으로 이어서 가져오세요(`total`은 전체 개수). 같은 필드가 `GET /codex/sessions/:id/messages`와 `GET /codex/app/sessions/:id/messages`에도 있습니다.
 
 #### `GET /sessions` — 세션 목록
 ```bash

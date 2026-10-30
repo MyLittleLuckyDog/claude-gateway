@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{broadcast, Mutex};
 
-use super::{gateway_error_response, reject_disallowed_codex_options, AppState};
+use super::{
+    gateway_error_response, page_info, reject_disallowed_codex_options, with_page_info, AppState,
+};
 use crate::codex;
 use crate::codex::messages::CodexEvent;
 use crate::codex::options::CodexOptions;
@@ -264,12 +266,16 @@ async fn get_messages(
         .take(params.limit)
         .map(|entry| entry.event.as_ref().clone())
         .collect();
+    let page = page_info(total, params.offset, params.limit, messages.len());
 
-    Json(serde_json::json!({
-        "session_id": id,
-        "thread_id": session.thread_id.lock().await.clone(),
-        "total": total,
-        "messages": messages,
-    }))
+    Json(with_page_info(
+        serde_json::json!({
+            "session_id": id,
+            "thread_id": session.thread_id.lock().await.clone(),
+            "total": total,
+            "messages": messages,
+        }),
+        page,
+    ))
     .into_response()
 }

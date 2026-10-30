@@ -9,7 +9,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{gateway_error_response, reject_disallowed_claude_options, AppState};
+use super::{
+    gateway_error_response, page_info, reject_disallowed_claude_options, with_page_info, AppState,
+};
 use crate::client;
 use crate::core::events::{resume_point, sse_replay_then_follow, Replay, Seq};
 use crate::error::GatewayError;
@@ -246,12 +248,16 @@ async fn get_messages(
         .skip(params.offset)
         .take(params.limit)
         .collect();
+    let page = page_info(total, params.offset, params.limit, messages.len());
 
-    Json(serde_json::json!({
-        "session_id": id,
-        "total": total,
-        "messages": messages,
-    }))
+    Json(with_page_info(
+        serde_json::json!({
+            "session_id": id,
+            "total": total,
+            "messages": messages,
+        }),
+        page,
+    ))
     .into_response()
 }
 

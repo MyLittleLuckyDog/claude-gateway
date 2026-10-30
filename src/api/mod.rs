@@ -62,6 +62,32 @@ pub fn error_response(status: u16, code: &str, message: &str) -> Response {
         .into_response()
 }
 
+/// What a client needs to tell one page of a list from the whole list.
+///
+/// A message list is cut to `limit` entries starting at `offset`; `total` alone
+/// does not say that a cut happened. These fields do: `returned` is how many
+/// entries came back, `has_more` whether any follow, and `next_offset` where to
+/// ask next. They are merged into the response beside `total` and `messages`.
+pub fn page_info(total: usize, offset: usize, limit: usize, returned: usize) -> serde_json::Value {
+    let end = offset.saturating_add(returned);
+    let has_more = end < total;
+    json!({
+        "offset": offset,
+        "limit": limit,
+        "returned": returned,
+        "has_more": has_more,
+        "next_offset": has_more.then_some(end),
+    })
+}
+
+/// Merge the fields of `page` into the JSON object `body`.
+pub fn with_page_info(mut body: serde_json::Value, page: serde_json::Value) -> serde_json::Value {
+    if let (Some(target), serde_json::Value::Object(fields)) = (body.as_object_mut(), page) {
+        target.extend(fields);
+    }
+    body
+}
+
 /// Mark a 429 for the caller: when to come back (`Retry-After`, whole seconds,
 /// at least 1) if the time is known, and `x-should-retry: false`. The gateway
 /// keeps refusing until then, so an SDK retry loop would only hit the same wall.
@@ -403,5 +429,47 @@ mod tests {
     fn an_empty_origin_list_builds_a_closed_policy() {
         let _ = build_cors_layer(&server_config(&[], false, false));
         assert!(!matches("https://anything.example", &[]));
+    }
+
+    #[test]
+    fn a_cut_list_says_so() {
+        // First 50 of 120.
+        let p = page_info(120, 0, 50, 50);
+        assert_eq!(p["has_more"], true);
+        assert_eq!(p["next_offset"], 50);
+        assert_eq!(p["returned"], 50);
+        assert_eq!(p["limit"], 50);
+    }
+
+    #[test]
+    fn the_last_page_has_nothing_after_it() {
+        let p = page_info(120, 100, 50, 20);
+        assert_eq!(p["has_more"], false);
+        assert_eq!(p["next_offset"], serde_json::Value::Null);
+        // A list that fits exactly is not cut either.
+        assert_eq!(page_info(50, 0, 50, 50)["has_more"], false);
+    }
+
+    #[test]
+    fn a_page_past_the_end_is_empty_and_not_cut() {
+        let p = page_info(10, 500, 50, 0);
+        assert_eq!(p["returned"], 0);
+        assert_eq!(p["has_more"], false);
+        // limit 0 returns nothing from a non-empty list: that is a cut.
+        let z = page_info(10, 0, 0, 0);
+        assert_eq!(z["has_more"], true);
+        assert_eq!(z["next_offset"], 0);
+    }
+
+    #[test]
+    fn page_fields_are_merged_beside_the_existing_ones() {
+        let body = with_page_info(
+            json!({"session_id": "s", "total": 3, "messages": [1, 2]}),
+            page_info(3, 0, 2, 2),
+        );
+        assert_eq!(body["total"], 3);
+        assert_eq!(body["messages"], json!([1, 2]));
+        assert_eq!(body["has_more"], true);
+        assert_eq!(body["next_offset"], 2);
     }
 }
