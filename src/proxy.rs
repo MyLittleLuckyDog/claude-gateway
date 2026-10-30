@@ -31,6 +31,20 @@ const BASE_DELAY_MS: u64 = 500;
 /// Max backoff delay (ms)
 const MAX_DELAY_MS: u64 = 32_000;
 
+/// How long a rejection that carried no reset time (no `unified-reset` and no
+/// `retry-after`) is trusted before the next request is let through to probe
+/// upstream again. Without an expiry such a rejection could never be cleared:
+/// the pre-flight check refuses locally, so no response ever arrives to
+/// refresh the cached state.
+pub const REJECTION_FALLBACK_TTL_SECS: f64 = 60.0;
+
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
 // ── Rate Limit State ───────────────────────────────────────────────
 
 /// Rate limit state extracted from API response headers.
@@ -45,6 +59,10 @@ pub struct RateLimitStatus {
     pub utilization_7d: Option<f64>,
     /// Unix timestamp (seconds) when the active limit resets
     pub resets_at: Option<f64>,
+    /// Unix timestamp (seconds) at which this family was last seen rejected.
+    /// Lets `pre_flight_check` expire a rejection that arrived without any
+    /// reset information instead of holding it forever.
+    pub rejected_at: Option<f64>,
     /// Whether a fallback model is available
     pub fallback_available: Option<bool>,
     /// Which limit is the bottleneck: "five_hour" | "seven_day" | "seven_day_opus" | "seven_day_sonnet"
@@ -223,48 +241,103 @@ impl ProxyState {
         if let Some(v) = header_str(headers, "anthropic-ratelimit-unified-7d_oi-status") {
             rl.status = Some(v);
         }
+
+        // Keep `rejected_at` in step with the final status: stamp it when a
+        // rejection first appears, drop it once the family is no longer rejected.
+        if rl.status.as_deref() == Some("rejected") {
+            rl.rejected_at.get_or_insert_with(now_secs);
+        } else {
+            rl.rejected_at = None;
+        }
+    }
+
+    /// Record an upstream 429 for `family`.
+    ///
+    /// The status is forced to `rejected` regardless of the headers (as the CLI
+    /// does), but the expiry is derived from *this* response: its reset header,
+    /// else its `retry-after`, else none (→ `REJECTION_FALLBACK_TTL_SECS`). A
+    /// reset left over from an earlier response describes a different window
+    /// and must not stretch a bare 429 into hours of local rejection.
+    pub async fn mark_rejected(
+        &self,
+        family: models::ModelFamily,
+        headers: &reqwest::header::HeaderMap,
+    ) {
+        let now = now_secs();
+        let mut map = self.rate_limit.write().await;
+        let rl = map.entry(family).or_default();
+        rl.status = Some("rejected".to_string());
+        rl.rejected_at = Some(now);
+
+        let has_reset = [
+            "anthropic-ratelimit-unified-reset",
+            "anthropic-ratelimit-unified-7d_oi-reset",
+        ]
+        .iter()
+        .any(|k| header_f64(headers, k).is_some());
+        if !has_reset {
+            rl.resets_at = parse_retry_after(headers).map(|ms| now + ms as f64 / 1000.0);
+        }
     }
 
     /// Check if we should block a request for `family` before sending
     /// (pre-flight). Returns an error message if that family is rate-limited.
-    /// Auto-clears rejected state if the reset time has passed. A family with
+    /// A rejection expires at its reset time, or — when upstream gave none —
+    /// `REJECTION_FALLBACK_TTL_SECS` after it was recorded; once expired the
+    /// next request is let through to refresh the real status. A family with
     /// no cached status yet (nothing seen for it) is never rejected.
     pub async fn pre_flight_check(&self, family: models::ModelFamily) -> Option<String> {
+        let now = now_secs();
         {
             let map = self.rate_limit.read().await;
-            let rl = match map.get(&family) {
-                Some(rl) => rl,
-                None => return None,
-            };
+            let rl = map.get(&family)?;
             if !rl.is_rejected() {
                 return None;
             }
 
-            // Check if reset time has passed — if so, clear the rejection
-            if let Some(resets_at) = rl.resets_at {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0);
-                if now >= resets_at {
-                    let msg = None;
-                    drop(map);
-                    // Clear rejection — next request for this family will get
-                    // fresh status.
-                    let mut map_mut = self.rate_limit.write().await;
-                    if let Some(rl_mut) = map_mut.get_mut(&family) {
-                        rl_mut.status = Some("allowed".to_string());
-                    }
-                    tracing::info!(
-                        "Rate limit reset time passed for {:?}, allowing requests",
+            let (until, source) = match (rl.resets_at, rl.rejected_at) {
+                (Some(reset), _) => (reset, "reset time"),
+                (None, Some(at)) => (at + REJECTION_FALLBACK_TTL_SECS, "fallback ttl"),
+                // Rejected with no timestamp at all: nothing to expire it by.
+                // Fail open — upstream is the authority, not this cache.
+                (None, None) => {
+                    tracing::warn!(
+                        "[pre-flight] {:?} cached as rejected with no expiry; letting the request through",
                         family
                     );
-                    return msg;
+                    return None;
                 }
-            }
+            };
 
-            Some(rl.rejection_message())
+            if now < until {
+                let remaining = (until - now).ceil() as u64;
+                tracing::warn!(
+                    "[pre-flight] refusing locally, upstream not contacted: family={:?} expiry={} retry_in={}s",
+                    family,
+                    source,
+                    remaining
+                );
+                return Some(format!(
+                    "{} (cached rejection, request not sent upstream; gateway retries in {}s)",
+                    rl.rejection_message(),
+                    remaining
+                ));
+            }
         }
+
+        // Expired: clear it so the next request refreshes the real status.
+        let mut map = self.rate_limit.write().await;
+        if let Some(rl) = map.get_mut(&family) {
+            if rl.is_rejected() {
+                rl.status = Some("allowed".to_string());
+                rl.rejected_at = None;
+                tracing::info!(
+                    "Cached rate-limit rejection for {:?} expired, allowing requests",
+                    family
+                );
+            }
+        }
+        None
     }
 }
 
@@ -724,10 +797,7 @@ pub async fn messages_sync(
 
             429 => {
                 // NO retry for 429 — subscriber rate limits are time-based.
-                {
-                    let mut map = state.rate_limit.write().await;
-                    map.entry(family).or_default().status = Some("rejected".to_string());
-                }
+                state.mark_rejected(family, resp.headers()).await;
 
                 let map = state.rate_limit.read().await;
                 let msg = map
@@ -902,8 +972,7 @@ pub async fn messages_stream(
 
         if status == 429 {
             // Mirror CLI extractQuotaStatusFromError(): force rejected on 429
-            let mut map = state.rate_limit.write().await;
-            map.entry(family).or_default().status = Some("rejected".to_string());
+            state.mark_rejected(family, resp.headers()).await;
         }
 
         return Ok((resp, status));
