@@ -302,3 +302,64 @@ async fn count_tokens_answers_501_not_supported_without_retry() {
     assert_eq!(body["error"]["type"], "not_supported", "{body}");
     assert_eq!(up.request_count(), 0);
 }
+
+/// The session id the upstream request is attributed to (inside the JSON that
+/// `metadata.user_id` carries).
+fn upstream_session_id(up: &common::Upstream) -> String {
+    let body = up
+        .requests
+        .lock()
+        .expect("lock")
+        .last()
+        .cloned()
+        .expect("request");
+    let user_id = body["metadata"]["user_id"]
+        .as_str()
+        .expect("metadata.user_id");
+    let parsed: Value = serde_json::from_str(user_id).expect("user_id is JSON");
+    parsed["session_id"]
+        .as_str()
+        .expect("session_id")
+        .to_string()
+}
+
+/// Claude Code stamps every request with `X-Claude-Code-Session-Id`. Using it
+/// as the upstream session keeps one conversation under one session id, which
+/// is what the prompt cache is keyed on. `X-Session-Id` (the gateway's own
+/// header) still wins when both are present, and with neither every request
+/// gets a fresh id as before.
+#[tokio::test]
+async fn claude_code_session_id_header_becomes_the_upstream_session() {
+    let (base, _proxy, up) = start_with_gateway().await;
+    let client = reqwest::Client::new();
+    let send = |headers: Vec<(&'static str, &'static str)>| {
+        let client = client.clone();
+        let url = format!("{base}/v1/messages");
+        async move {
+            let mut req = client.post(url).json(&messages_body());
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            assert_eq!(req.send().await.expect("request").status(), 200);
+        }
+    };
+
+    send(vec![("x-claude-code-session-id", "sess-from-claude-code")]).await;
+    assert_eq!(upstream_session_id(&up), "sess-from-claude-code");
+
+    send(vec![
+        ("x-session-id", "sess-explicit"),
+        ("x-claude-code-session-id", "sess-from-claude-code"),
+    ])
+    .await;
+    assert_eq!(upstream_session_id(&up), "sess-explicit");
+
+    send(vec![]).await;
+    let first = upstream_session_id(&up);
+    send(vec![]).await;
+    assert_ne!(
+        first,
+        upstream_session_id(&up),
+        "no header -> a fresh id per request"
+    );
+}

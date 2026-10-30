@@ -25,12 +25,20 @@ use axum::Router;
 /// pins a stable id via `X-Session-Id` thus sees its second request hit
 /// the cache. Random ids stay the default so legacy callers behave
 /// exactly as before.
+///
+/// `X-Session-Id` is this gateway's own header and wins. Failing that,
+/// `X-Claude-Code-Session-Id` -- which Claude Code puts on every request --
+/// keeps one CLI conversation under one upstream session.
 fn session_id_from(headers: &HeaderMap) -> String {
-    headers
-        .get("x-session-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+    ["x-session-id", "x-claude-code-session-id"]
+        .iter()
+        .find_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+        })
+        .map(str::to_string)
         .unwrap_or_else(crate::client_identity::new_session_id)
 }
 /// Beta features the caller asked for with the `anthropic-beta` request header
