@@ -152,7 +152,8 @@ pub const OPUS_4_5: ModelDef = ModelDef {
     id: "claude-opus-4-5",
     alias: "opus4.5",
     default_max_tokens: 8_000,
-    max_output_tokens: 32_000,
+    // Upstream's `GET /v1/models/claude-opus-4-5` reports max_tokens=64000.
+    max_output_tokens: 64_000,
     context_window: 200_000,
     family: ModelFamily::Opus,
 };

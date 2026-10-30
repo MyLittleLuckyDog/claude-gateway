@@ -236,3 +236,43 @@ fn summarize_count(label: &str, result: Result<(Value, u16), proxy::ProxyError>)
         Err(e) => eprintln!("[probe] {label}: gateway error: {e}"),
     }
 }
+
+/// Every model in the gateway's catalog against what upstream reports for it
+/// (`GET /v1/models/{id}`: `max_input_tokens`, `max_tokens`). Run it when the
+/// catalog is edited or a new model appears; a model upstream no longer serves
+/// shows up as a 404 line rather than a failure.
+#[tokio::test]
+#[ignore = "calls the real Anthropic API with the developer's credentials"]
+async fn model_catalog_matches_upstream_limits() {
+    let state = Arc::new(ProxyState::new(1));
+    let mut mismatches = Vec::new();
+
+    for model in claude_agent::models::ALL_MODELS {
+        match proxy::upstream_get(&state, &format!("/v1/models/{}", model.id)).await {
+            Ok((m, 200)) => {
+                let window = m["max_input_tokens"].as_u64();
+                let output = m["max_tokens"].as_u64();
+                let ok = window == Some(u64::from(model.context_window))
+                    && output == Some(u64::from(model.max_output_tokens));
+                eprintln!(
+                    "[probe] {:<20} {} window gateway={} upstream={:?} | max_output gateway={} upstream={:?}",
+                    model.id,
+                    if ok { "ok      " } else { "MISMATCH" },
+                    model.context_window,
+                    window,
+                    model.max_output_tokens,
+                    output
+                );
+                if !ok {
+                    mismatches.push(model.id);
+                }
+            }
+            Ok((m, status)) => eprintln!(
+                "[probe] {:<20} HTTP {status} {}",
+                model.id, m["error"]["message"]
+            ),
+            Err(e) => eprintln!("[probe] {:<20} gateway error: {e}", model.id),
+        }
+    }
+    eprintln!("[probe] mismatches: {mismatches:?}");
+}
