@@ -68,7 +68,7 @@ fn merge_betas(from_body: Option<Vec<String>>, from_header: Vec<String>) -> Opti
 
 use serde_json::json;
 
-use super::{error_response, proxy_error_response, with_rate_limit_headers};
+use super::{error_response, no_retry, proxy_error_response, with_rate_limit_headers};
 use crate::api::AppState;
 use crate::proxy;
 use crate::{openai_oauth, openai_proxy, transform};
@@ -77,6 +77,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/messages", post(messages_handler))
         .route("/v1/messages/stream", post(messages_stream_handler))
+        .route("/v1/messages/count_tokens", post(count_tokens_handler))
         .route("/v1/rate_limit", get(rate_limit_handler))
         .route("/v1/proxy_stats", get(proxy_stats_handler))
         .route("/v1/auth_status", get(auth_status_handler))
@@ -382,6 +383,19 @@ fn resolve_model_alias(state: &AppState, mut body: serde_json::Value) -> serde_j
         }
     }
     body
+}
+
+/// POST /v1/messages/count_tokens — part of the gateway protocol, not served here.
+///
+/// `501 not_supported` with `x-should-retry: false` is the protocol's answer
+/// for a backend without it: the client falls back to counting with an
+/// ordinary one-token request instead of asking again.
+async fn count_tokens_handler() -> Response {
+    no_retry(error_response(
+        501,
+        "not_supported",
+        "Token counting is not available on this gateway",
+    ))
 }
 
 /// POST /v1/messages/stream — SSE streaming Messages API proxy

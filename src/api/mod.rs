@@ -66,16 +66,22 @@ pub fn error_response(status: u16, code: &str, message: &str) -> Response {
 /// at least 1) if the time is known, and `x-should-retry: false`. The gateway
 /// keeps refusing until then, so an SDK retry loop would only hit the same wall.
 pub fn with_rate_limit_headers(mut resp: Response, until: Option<f64>) -> Response {
-    let headers = resp.headers_mut();
     if let Some(until) = until {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
         let secs = (until - now).ceil().max(1.0) as u64;
-        headers.insert(header::RETRY_AFTER, HeaderValue::from(secs));
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from(secs));
     }
-    headers.insert("x-should-retry", HeaderValue::from_static("false"));
+    no_retry(resp)
+}
+
+/// Tell the SDK not to retry this response (`x-should-retry: false`).
+pub fn no_retry(mut resp: Response) -> Response {
+    resp.headers_mut()
+        .insert("x-should-retry", HeaderValue::from_static("false"));
     resp
 }
 

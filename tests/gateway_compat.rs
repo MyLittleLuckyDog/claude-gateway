@@ -280,3 +280,25 @@ async fn retry_after_follows_the_upstream_reset_time() {
         "retry-after {retry_after}"
     );
 }
+
+/// `POST /v1/messages/count_tokens` is part of the protocol. A backend that
+/// can't serve it answers `501 not_supported` with `x-should-retry: false`, and
+/// the client then counts tokens itself instead of asking again.
+#[tokio::test]
+async fn count_tokens_answers_501_not_supported_without_retry() {
+    let (base, _proxy, up) = start_with_gateway().await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/messages/count_tokens"))
+        .json(&messages_body())
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(resp.status(), 501);
+    assert_eq!(header(&resp, "x-should-retry").as_deref(), Some("false"));
+    let body: Value = resp.json().await.expect("json body");
+    assert_eq!(body["type"], "error", "{body}");
+    assert_eq!(body["error"]["type"], "not_supported", "{body}");
+    assert_eq!(up.request_count(), 0);
+}
