@@ -73,6 +73,36 @@ pub struct RateLimitStatus {
     pub overage_disabled_reason: Option<String>,
 }
 
+/// When a rejected family may be tried again, and where that time comes from:
+/// the reset time upstream reported, or `REJECTION_FALLBACK_TTL_SECS` after the
+/// rejection was recorded when upstream gave none. `None` when there is no
+/// timestamp at all.
+fn rejection_expiry(rl: &RateLimitStatus) -> Option<(f64, &'static str)> {
+    match (rl.resets_at, rl.rejected_at) {
+        (Some(reset), _) => Some((reset, "reset time")),
+        (None, Some(at)) => Some((at + REJECTION_FALLBACK_TTL_SECS, "fallback ttl")),
+        (None, None) => None,
+    }
+}
+
+/// A request the gateway refused itself, without contacting upstream, because
+/// the family is cached as rejected.
+#[derive(Debug, Clone)]
+pub struct PreflightBlock {
+    pub message: String,
+    /// Unix seconds at which requests are let through again.
+    pub until: f64,
+}
+
+impl PreflightBlock {
+    pub fn into_error(self) -> ProxyError {
+        ProxyError::RateLimited {
+            message: Some(self.message),
+            resets_at: Some(self.until),
+        }
+    }
+}
+
 impl RateLimitStatus {
     /// Is the user currently rate-limited?
     ///
@@ -280,13 +310,24 @@ impl ProxyState {
         }
     }
 
+    /// Unix seconds at which `family` stops being refused, if it currently is.
+    /// Lets callers tell a client when to come back.
+    pub async fn rejection_expires_at(&self, family: models::ModelFamily) -> Option<f64> {
+        let map = self.rate_limit.read().await;
+        let rl = map.get(&family)?;
+        if !rl.is_rejected() {
+            return None;
+        }
+        rejection_expiry(rl).map(|(until, _)| until)
+    }
+
     /// Check if we should block a request for `family` before sending
     /// (pre-flight). Returns an error message if that family is rate-limited.
     /// A rejection expires at its reset time, or — when upstream gave none —
     /// `REJECTION_FALLBACK_TTL_SECS` after it was recorded; once expired the
     /// next request is let through to refresh the real status. A family with
     /// no cached status yet (nothing seen for it) is never rejected.
-    pub async fn pre_flight_check(&self, family: models::ModelFamily) -> Option<String> {
+    pub async fn pre_flight_check(&self, family: models::ModelFamily) -> Option<PreflightBlock> {
         let now = now_secs();
         {
             let map = self.rate_limit.read().await;
@@ -295,18 +336,14 @@ impl ProxyState {
                 return None;
             }
 
-            let (until, source) = match (rl.resets_at, rl.rejected_at) {
-                (Some(reset), _) => (reset, "reset time"),
-                (None, Some(at)) => (at + REJECTION_FALLBACK_TTL_SECS, "fallback ttl"),
+            let Some((until, source)) = rejection_expiry(rl) else {
                 // Rejected with no timestamp at all: nothing to expire it by.
                 // Fail open — upstream is the authority, not this cache.
-                (None, None) => {
-                    tracing::warn!(
-                        "[pre-flight] {:?} cached as rejected with no expiry; letting the request through",
-                        family
-                    );
-                    return None;
-                }
+                tracing::warn!(
+                    "[pre-flight] {:?} cached as rejected with no expiry; letting the request through",
+                    family
+                );
+                return None;
             };
 
             if now < until {
@@ -317,11 +354,14 @@ impl ProxyState {
                     source,
                     remaining
                 );
-                return Some(format!(
-                    "{} (cached rejection, request not sent upstream; gateway retries in {}s)",
-                    rl.rejection_message(),
-                    remaining
-                ));
+                return Some(PreflightBlock {
+                    message: format!(
+                        "{} (cached rejection, request not sent upstream; gateway retries in {}s)",
+                        rl.rejection_message(),
+                        remaining
+                    ),
+                    until,
+                });
             }
         }
 
@@ -655,17 +695,8 @@ pub async fn messages_sync(
     // before this experiment.
 
     // Pre-flight: check cached rate limit (this family only)
-    if let Some(msg) = state.pre_flight_check(family).await {
-        let resets_at = state
-            .rate_limit
-            .read()
-            .await
-            .get(&family)
-            .and_then(|rl| rl.resets_at);
-        return Err(ProxyError::RateLimited {
-            message: Some(msg),
-            resets_at,
-        });
+    if let Some(block) = state.pre_flight_check(family).await {
+        return Err(block.into_error());
     }
 
     let mut token = auth::get_oauth_token_fresh()
@@ -680,17 +711,8 @@ pub async fn messages_sync(
 
     // Re-check after acquiring semaphore: a concurrent request may have just
     // been rejected and updated the cached state while we were waiting.
-    if let Some(msg) = state.pre_flight_check(family).await {
-        let resets_at = state
-            .rate_limit
-            .read()
-            .await
-            .get(&family)
-            .and_then(|rl| rl.resets_at);
-        return Err(ProxyError::RateLimited {
-            message: Some(msg),
-            resets_at,
-        });
+    if let Some(block) = state.pre_flight_check(family).await {
+        return Err(block.into_error());
     }
 
     state.total_requests.fetch_add(1, Ordering::Relaxed);
@@ -906,11 +928,8 @@ pub async fn messages_stream(
     // account combo and broke every call, not just refused ones.
 
     // Pre-flight: check cached rate limit (this family only)
-    if let Some(msg) = state.pre_flight_check(family).await {
-        return Err(ProxyError::RateLimited {
-            message: Some(msg),
-            resets_at: None,
-        });
+    if let Some(block) = state.pre_flight_check(family).await {
+        return Err(block.into_error());
     }
 
     let mut token = auth::get_oauth_token_fresh()
@@ -928,11 +947,8 @@ pub async fn messages_stream(
         .map_err(|_| ProxyError::Internal("Semaphore closed".to_string()))?;
 
     // Re-check after acquiring semaphore
-    if let Some(msg) = state.pre_flight_check(family).await {
-        return Err(ProxyError::RateLimited {
-            message: Some(msg),
-            resets_at: None,
-        });
+    if let Some(block) = state.pre_flight_check(family).await {
+        return Err(block.into_error());
     }
 
     state.total_requests.fetch_add(1, Ordering::Relaxed);

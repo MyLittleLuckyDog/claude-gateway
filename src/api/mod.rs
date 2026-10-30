@@ -52,6 +52,7 @@ pub fn error_response(status: u16, code: &str, message: &str) -> Response {
     (
         status_code,
         Json(json!({
+            "type": "error",
             "error": {
                 "type": code,
                 "message": message,
@@ -59,6 +60,23 @@ pub fn error_response(status: u16, code: &str, message: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+/// Mark a 429 for the caller: when to come back (`Retry-After`, whole seconds,
+/// at least 1) if the time is known, and `x-should-retry: false`. The gateway
+/// keeps refusing until then, so an SDK retry loop would only hit the same wall.
+pub fn with_rate_limit_headers(mut resp: Response, until: Option<f64>) -> Response {
+    let headers = resp.headers_mut();
+    if let Some(until) = until {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let secs = (until - now).ceil().max(1.0) as u64;
+        headers.insert(header::RETRY_AFTER, HeaderValue::from(secs));
+    }
+    headers.insert("x-should-retry", HeaderValue::from_static("false"));
+    resp
 }
 
 /// Render a [`GatewayError`](crate::error::GatewayError) as an HTTP response.
@@ -72,16 +90,27 @@ pub fn gateway_error_response(e: &crate::error::GatewayError) -> Response {
 
 pub fn proxy_error_response(e: crate::proxy::ProxyError) -> Response {
     let status = StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-    (
+    let until = match &e {
+        crate::proxy::ProxyError::RateLimited { resets_at, .. } => *resets_at,
+        _ => None,
+    };
+    let is_rate_limit = matches!(e, crate::proxy::ProxyError::RateLimited { .. });
+    let resp = (
         status,
         Json(json!({
+            "type": "error",
             "error": {
                 "type": e.error_code(),
                 "message": e.to_string(),
             }
         })),
     )
-        .into_response()
+        .into_response();
+    if is_rate_limit {
+        with_rate_limit_headers(resp, until)
+    } else {
+        resp
+    }
 }
 
 /// Refuse a request that asks for more of the CLI than the policy allows.

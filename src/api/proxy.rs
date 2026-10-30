@@ -49,6 +49,11 @@ fn request_betas(headers: &HeaderMap) -> Vec<String> {
     out
 }
 
+/// The model family a request is for -- the key of the gateway's rate-limit cache.
+fn request_family(body: &serde_json::Value) -> crate::models::ModelFamily {
+    crate::models::family_of(body.get("model").and_then(|v| v.as_str()).unwrap_or(""))
+}
+
 /// The gateway's older body `betas` field plus the header values, without
 /// repeating one. `None` when neither names anything.
 fn merge_betas(from_body: Option<Vec<String>>, from_header: Vec<String>) -> Option<Vec<String>> {
@@ -63,7 +68,7 @@ fn merge_betas(from_body: Option<Vec<String>>, from_header: Vec<String>) -> Opti
 
 use serde_json::json;
 
-use super::{error_response, proxy_error_response};
+use super::{error_response, proxy_error_response, with_rate_limit_headers};
 use crate::api::AppState;
 use crate::proxy;
 use crate::{openai_oauth, openai_proxy, transform};
@@ -235,6 +240,7 @@ async fn messages_handler(
     let extra_betas = merge_betas(body_betas, request_betas(&headers));
 
     let session_id = session_id_from(&headers);
+    let family = request_family(&forward_body);
 
     match proxy::messages_sync(
         proxy_state,
@@ -247,7 +253,14 @@ async fn messages_handler(
         Ok((resp_body, upstream_status)) => {
             let status =
                 StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status, Json(resp_body)).into_response()
+            let resp = (status, Json(resp_body)).into_response();
+            if upstream_status == 429 {
+                return with_rate_limit_headers(
+                    resp,
+                    proxy_state.rejection_expires_at(family).await,
+                );
+            }
+            resp
         }
         Err(e) => proxy_error_response(e),
     }
@@ -330,7 +343,7 @@ async fn handle_openai_messages_stream(state: &AppState, body: serde_json::Value
         Ok((resp, upstream_status)) => {
             if upstream_status != 200 {
                 let body = resp.json::<serde_json::Value>().await.unwrap_or_else(
-                    |_| json!({"error": {"type": "unknown", "message": "Unknown upstream error"}}),
+                    |_| json!({"type": "error", "error": {"type": "unknown", "message": "Unknown upstream error"}}),
                 );
                 let status = StatusCode::from_u16(upstream_status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -398,6 +411,7 @@ async fn messages_stream_handler(
     let extra_betas = merge_betas(body_betas, request_betas(&headers));
 
     let session_id = session_id_from(&headers);
+    let family = request_family(&forward_body);
 
     match proxy::messages_stream(
         proxy_state,
@@ -411,11 +425,18 @@ async fn messages_stream_handler(
             if upstream_status != 200 {
                 // Non-200: read body as JSON error
                 let body = resp.json::<serde_json::Value>().await.unwrap_or_else(
-                    |_| json!({"error": {"type": "unknown", "message": "Unknown upstream error"}}),
+                    |_| json!({"type": "error", "error": {"type": "unknown", "message": "Unknown upstream error"}}),
                 );
                 let status = StatusCode::from_u16(upstream_status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                return (status, Json(body)).into_response();
+                let resp = (status, Json(body)).into_response();
+                if upstream_status == 429 {
+                    return with_rate_limit_headers(
+                        resp,
+                        proxy_state.rejection_expires_at(family).await,
+                    );
+                }
+                return resp;
             }
 
             // 200: Raw SSE passthrough — upstream already sends proper SSE format
