@@ -273,12 +273,16 @@ curl -X POST http://localhost:8765/v1/messages \
 
 | 엔드포인트 | 설명 |
 |-----------|------|
-| `POST /v1/sessions` | 세션 생성. body: `{model, system?, max_tokens?, temperature?, tools?, tool_choice?, betas?}` |
+| `POST /v1/sessions` | 세션 생성. body: `{model, system?, max_tokens?, temperature?, tools?, tool_choice?, betas?, cache_breakpoint?}` (옵션은 아래 설명) |
 | `GET /v1/sessions` | 세션 목록 |
 | `GET /v1/sessions/:id` | 세션 상태 + 메시지 배열 |
 | `DELETE /v1/sessions/:id` | 세션 삭제 |
 | `POST /v1/sessions/:id/msg` | 메시지 전송 (이전 대화 자동 포함) |
 | `POST /v1/sessions/:id/msg/stream` | SSE 스트리밍 버전 |
+
+**세션 옵션 (기본 꺼짐)**
+
+- `cache_breakpoint: true` — 매 요청의 마지막 content 블록에 5분 prompt-cache 마커를 1개 붙입니다(Claude Code 방식). 캐시 쓰기는 일반 입력보다 비싸고 읽기는 훨씬 쌉니다.
 
 tool_use 라운드트립은 `POST /v1/sessions/:id/msg` body에 `{"is_tool_result": true, "content": [{"type":"tool_result","tool_use_id":"...","content":"..."}]}` 를 실어보냅니다 (상세: [README.md](../README.md#tool_use-라운드트립)).
 

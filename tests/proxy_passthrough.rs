@@ -158,3 +158,60 @@ async fn session_mode_grows_by_exactly_one_exchange_per_turn() {
     }
     assert_eq!(counts, vec![1, 3, 5, 7, 9]);
 }
+
+/// With `cache_breakpoint` on, exactly one marker reaches upstream, on the last
+/// block of the conversation, and it moves forward each turn instead of piling
+/// up. Off by default: nothing is added to the request.
+#[tokio::test]
+async fn session_cache_breakpoint_is_a_single_moving_marker() {
+    let (state, up) = start().await;
+    let mut session = ProxySession::new(
+        "sess-cache".to_string(),
+        SessionOptions {
+            model: Some("claude-sonnet-5-5".to_string()),
+            cache_breakpoint: true,
+            ..Default::default()
+        },
+        3600,
+    );
+
+    for turn in 0..3usize {
+        session.add_user_message(json!([{"type": "text", "text": format!("turn {turn}")}]));
+        let body = session.build_request(None);
+        let (resp, _) = proxy::messages_sync(&state, body, None, "sess-cache")
+            .await
+            .expect("messages_sync");
+        session.record_assistant_response(&resp);
+
+        let sent = up
+            .requests
+            .lock()
+            .expect("lock")
+            .last()
+            .cloned()
+            .expect("request");
+        let marked: Vec<(usize, usize)> = sent["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .enumerate()
+            .flat_map(|(i, m)| {
+                m["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .enumerate()
+                    .filter(|(_, b)| b.get("cache_control").is_some())
+                    .map(move |(j, _)| (i, j))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            marked,
+            vec![(turn * 2, 0)],
+            "turn {turn}: one marker, on the last block"
+        );
+        // The billing block the gateway adds to `system` must not be marked.
+        assert!(sent["system"].to_string().find("cache_control").is_none());
+    }
+}

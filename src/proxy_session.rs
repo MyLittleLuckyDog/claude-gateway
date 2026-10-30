@@ -60,6 +60,13 @@ pub struct SessionOptions {
     /// Tool choice
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// Put one prompt-cache breakpoint on the last content block of the
+    /// conversation on every request, as Claude Code does, so each turn reads
+    /// the history written by the previous one instead of re-billing it.
+    /// Off by default: it changes how a session is billed (cache writes cost
+    /// more than plain input; reads cost far less).
+    #[serde(default)]
+    pub cache_breakpoint: bool,
 }
 
 impl ProxySession {
@@ -159,6 +166,12 @@ impl ProxySession {
             }
         }
 
+        // Applied to the outgoing copy only — stored history never carries
+        // the marker, so it always sits on the current last block.
+        if self.options.cache_breakpoint {
+            mark_cache_breakpoint(&mut body);
+        }
+
         body
     }
 
@@ -243,6 +256,96 @@ impl ProxySession {
     /// Check if session has been idle too long
     fn is_idle(&self) -> bool {
         epoch_secs() - self.last_activity > self.idle_timeout_secs
+    }
+}
+
+// ── Prompt-cache breakpoint ────────────────────────────────────────
+
+/// The API rejects a request with more than this many `cache_control` markers.
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+fn marked_blocks(content: Option<&serde_json::Value>) -> usize {
+    content
+        .and_then(serde_json::Value::as_array)
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|b| b.get("cache_control").is_some_and(|c| !c.is_null()))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Markers already present in `system`, `tools` and message content.
+fn count_cache_breakpoints(body: &serde_json::Value) -> usize {
+    let in_messages = body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map(|msgs| msgs.iter().map(|m| marked_blocks(m.get("content"))).sum())
+        .unwrap_or(0);
+    marked_blocks(body.get("system")) + marked_blocks(body.get("tools")) + in_messages
+}
+
+/// Can the last content block of `msg` carry a cache marker? Thinking blocks
+/// can't, and neither can an empty text block.
+fn ends_in_cacheable_block(msg: &serde_json::Value) -> bool {
+    match msg.get("content") {
+        Some(serde_json::Value::String(s)) => !s.trim().is_empty(),
+        Some(serde_json::Value::Array(blocks)) => match blocks.last() {
+            Some(last) => match last.get("type").and_then(serde_json::Value::as_str) {
+                Some("thinking") | Some("redacted_thinking") => false,
+                Some("text") => last
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|t| !t.trim().is_empty()),
+                _ => last.is_object(),
+            },
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+/// Mirror of Claude Code's message-cache policy (2.1.241 bundle, `gfh`/`sTE`):
+/// one `ephemeral` marker, on the last content block of the last message that
+/// can carry one, default 5-minute TTL. Skipped when the request already uses
+/// all the breakpoints the API allows, so a caller's own markers never turn
+/// into a 400.
+fn mark_cache_breakpoint(body: &mut serde_json::Value) {
+    if count_cache_breakpoints(body) >= MAX_CACHE_BREAKPOINTS {
+        return;
+    }
+    let Some(messages) = body
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let Some(msg) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| ends_in_cacheable_block(m))
+    else {
+        return;
+    };
+    let marker = serde_json::json!({"type": "ephemeral"});
+    let Some(obj) = msg.as_object_mut() else {
+        return;
+    };
+    match obj.get_mut("content") {
+        Some(serde_json::Value::String(text)) => {
+            let text = std::mem::take(text);
+            obj.insert(
+                "content".to_string(),
+                serde_json::json!([{"type": "text", "text": text, "cache_control": marker}]),
+            );
+        }
+        Some(serde_json::Value::Array(blocks)) => {
+            if let Some(last) = blocks.last_mut().and_then(serde_json::Value::as_object_mut) {
+                last.entry("cache_control").or_insert(marker);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -439,6 +542,123 @@ mod tests {
             },
         }));
         assert!(s.preflight_check(1_000).is_err());
+    }
+
+    fn options_with_cache() -> SessionOptions {
+        SessionOptions {
+            cache_breakpoint: true,
+            ..Default::default()
+        }
+    }
+
+    fn marked(body: &serde_json::Value) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (i, m) in body["messages"].as_array().unwrap().iter().enumerate() {
+            if let Some(blocks) = m["content"].as_array() {
+                for (j, b) in blocks.iter().enumerate() {
+                    if b.get("cache_control").is_some() {
+                        out.push((i, j));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn no_cache_marker_unless_opted_in() {
+        let mut s = session();
+        s.add_user_message(json!("hi"));
+        let body = s.build_request(None);
+        assert!(!body.to_string().contains("cache_control"));
+    }
+
+    #[test]
+    fn marker_goes_on_last_block_of_last_message_only() {
+        let mut s = ProxySession::new("s".into(), options_with_cache(), 3600);
+        s.add_user_message(json!([
+            {"type": "text", "text": "first"},
+            {"type": "text", "text": "second"},
+        ]));
+        s.record_assistant_response(&json!({
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }));
+        s.add_user_message(json!("next question"));
+
+        let body = s.build_request(None);
+        // String content is lifted into a text block to carry the marker.
+        assert_eq!(marked(&body), vec![(2, 0)]);
+        assert_eq!(
+            body["messages"][2]["content"][0]["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+        // Stored history is untouched: the marker never accumulates.
+        assert!(!s
+            .messages
+            .iter()
+            .any(|m| m.to_string().contains("cache_control")));
+    }
+
+    #[test]
+    fn marker_moves_forward_each_turn_without_stacking() {
+        let mut s = ProxySession::new("s".into(), options_with_cache(), 3600);
+        s.add_user_message(json!("q1"));
+        assert_eq!(marked(&s.build_request(None)), vec![(0, 0)]);
+        s.record_assistant_response(&json!({
+            "content": [{"type": "text", "text": "a1"}],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }));
+        s.add_user_message(json!("q2"));
+        assert_eq!(marked(&s.build_request(None)), vec![(2, 0)]);
+    }
+
+    #[test]
+    fn trailing_thinking_block_is_never_marked() {
+        let mut body = json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "q"}]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "a"},
+                {"type": "thinking", "thinking": "hmm", "signature": "sig"},
+            ]},
+        ]});
+        mark_cache_breakpoint(&mut body);
+        assert_eq!(marked(&body), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn empty_text_block_is_never_marked() {
+        let mut body = json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "q"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "  "}]},
+        ]});
+        mark_cache_breakpoint(&mut body);
+        assert_eq!(marked(&body), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn caller_markers_count_toward_the_api_limit() {
+        let cc = json!({"type": "ephemeral"});
+        let mut body = json!({
+            "system": [
+                {"type": "text", "text": "a", "cache_control": cc},
+                {"type": "text", "text": "b", "cache_control": cc},
+            ],
+            "tools": [
+                {"name": "t1", "input_schema": {}, "cache_control": cc},
+                {"name": "t2", "input_schema": {}, "cache_control": cc},
+            ],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "q"}]}],
+        });
+        mark_cache_breakpoint(&mut body);
+        assert!(marked(&body).is_empty(), "no fifth marker may be added");
+
+        body["tools"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("cache_control");
+        mark_cache_breakpoint(&mut body);
+        assert_eq!(marked(&body), vec![(0, 0)]);
     }
 
     #[test]
