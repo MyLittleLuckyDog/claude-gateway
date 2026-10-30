@@ -356,9 +356,7 @@ async fn handle_openai_messages_stream(state: &AppState, body: serde_json::Value
     match raw_result {
         Ok((resp, upstream_status)) => {
             if upstream_status != 200 {
-                let body = resp.json::<serde_json::Value>().await.unwrap_or_else(
-                    |_| json!({"type": "error", "error": {"type": "unknown", "message": "Unknown upstream error"}}),
-                );
+                let body = proxy::error_body(resp).await;
                 let status = StatusCode::from_u16(upstream_status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return (status, Json(body)).into_response();
@@ -553,9 +551,7 @@ async fn messages_stream_handler(
         Ok((resp, upstream_status)) => {
             if upstream_status != 200 {
                 // Non-200: read body as JSON error
-                let body = resp.json::<serde_json::Value>().await.unwrap_or_else(
-                    |_| json!({"type": "error", "error": {"type": "unknown", "message": "Unknown upstream error"}}),
-                );
+                let body = proxy::error_body(resp).await;
                 let status = StatusCode::from_u16(upstream_status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 let resp = (status, Json(body)).into_response();

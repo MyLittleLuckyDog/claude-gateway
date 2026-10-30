@@ -416,9 +416,7 @@ async fn send_message_stream(
                     })
                     .await;
 
-                let body = resp.json::<serde_json::Value>().await.unwrap_or_else(
-                    |_| json!({"error": {"type": "unknown", "message": "Unknown error"}}),
-                );
+                let body = proxy::error_body(resp).await;
                 let status = StatusCode::from_u16(upstream_status)
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 return (status, Json(body)).into_response();

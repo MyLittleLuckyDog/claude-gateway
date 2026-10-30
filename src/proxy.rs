@@ -670,6 +670,45 @@ pub async fn check_quota_at_startup(state: &Arc<ProxyState>) {
     }
 }
 
+// ── Upstream error bodies ──────────────────────────────────────────
+
+/// The Anthropic error envelope, `{"type":"error","error":{"type","message"}}`.
+fn error_envelope(error_type: &str, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "type": "error",
+        "error": {"type": error_type, "message": message.into()},
+    })
+}
+
+/// An upstream error body as JSON, losing nothing it said.
+///
+/// A JSON object is returned as it is. Anything else -- an HTML page from an
+/// edge proxy in front of the API, plain text, an empty body -- becomes the
+/// whole text as the `message` of an error envelope. (These used to be read
+/// with `unwrap_or_default()`, which turned them into `null`.)
+fn error_json(status: u16, text: &str) -> serde_json::Value {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value) if value.is_object() => value,
+        _ if text.trim().is_empty() => error_envelope(
+            "api_error",
+            format!("Upstream answered HTTP {status} with an empty body"),
+        ),
+        _ => error_envelope("api_error", text),
+    }
+}
+
+/// Read an upstream error response into JSON; see [`error_json`].
+pub async fn error_body(resp: reqwest::Response) -> serde_json::Value {
+    let status = resp.status().as_u16();
+    match resp.text().await {
+        Ok(text) => error_json(status, &text),
+        Err(e) => error_envelope(
+            "api_error",
+            format!("Upstream answered HTTP {status}, but its body could not be read: {e}"),
+        ),
+    }
+}
+
 // ── Token counting and model lookup ────────────────────────────────
 
 /// Request fields the upstream `count_tokens` endpoint accepts. Everything else
@@ -914,7 +953,7 @@ async fn messages_sync_once(
             }
 
             401 => {
-                let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let resp_body = error_body(resp).await;
                 match auth::recover_from_401(&token.access_token).await {
                     Ok(Some(new_token)) if new_token.access_token != token.access_token => {
                         tracing::info!("Recovered OAuth token after 401; retrying request once");
@@ -955,15 +994,13 @@ async fn messages_sync_once(
                     raw_body,
                 );
 
-                let resp_body: serde_json::Value =
-                    serde_json::from_str(&raw_body).unwrap_or_else(|_| {
-                        serde_json::json!({
-                            "error": {
-                                "type": "rate_limit_error",
-                                "message": msg,
-                            }
-                        })
-                    });
+                // A JSON body is passed on as it is. Anything else keeps its
+                // text next to the gateway's own rate-limit summary.
+                let resp_body = match serde_json::from_str::<serde_json::Value>(&raw_body) {
+                    Ok(value) if value.is_object() => value,
+                    _ if raw_body.trim().is_empty() => error_envelope("rate_limit_error", msg),
+                    _ => error_envelope("rate_limit_error", format!("{msg}: {raw_body}")),
+                };
                 return Ok((resp_body, 429));
             }
 
@@ -974,7 +1011,7 @@ async fn messages_sync_once(
                         "Overloaded (529): max retries ({}) exceeded",
                         MAX_OVERLOAD_RETRIES
                     );
-                    let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
+                    let resp_body = error_body(resp).await;
                     return Ok((resp_body, 529));
                 }
 
@@ -994,7 +1031,7 @@ async fn messages_sync_once(
 
             _ => {
                 // All other errors: pass through as-is
-                let resp_body: serde_json::Value = resp.json().await.unwrap_or_default();
+                let resp_body = error_body(resp).await;
                 return Ok((resp_body, last_status));
             }
         }
@@ -1479,5 +1516,38 @@ mod tests {
             overflow_retry_max_tokens(&error(150_000, 64_000, 200_000), &serde_json::json!({})),
             Some(49_000)
         );
+    }
+
+    // ── upstream error bodies ──────────────────────────────────────
+
+    #[test]
+    fn a_json_error_is_passed_on_untouched() {
+        let body = r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_1"}"#;
+        assert_eq!(
+            error_json(529, body),
+            serde_json::from_str::<serde_json::Value>(body).expect("json")
+        );
+    }
+
+    #[test]
+    fn other_bodies_keep_their_whole_text() {
+        let html = "<html>\n<h1>502 Bad Gateway</h1>\n</html>\n";
+        let v = error_json(502, html);
+        assert_eq!(v["type"], "error");
+        assert_eq!(v["error"]["message"], html);
+        // JSON that is not an object is text too, not something to drop.
+        assert_eq!(error_json(500, "null")["error"]["message"], "null");
+        assert_eq!(error_json(500, "\"oops\"")["error"]["message"], "\"oops\"");
+    }
+
+    #[test]
+    fn an_empty_body_says_so() {
+        for empty in ["", "  \n"] {
+            let v = error_json(503, empty);
+            assert_eq!(
+                v["error"]["message"],
+                "Upstream answered HTTP 503 with an empty body"
+            );
+        }
     }
 }

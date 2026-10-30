@@ -200,6 +200,12 @@ async fn upstream_handler(
         );
     }
     let status = StatusCode::from_u16(scripted.status).expect("status");
+    // A string body is sent as it is, as text -- what an edge proxy or load
+    // balancer in front of the API sends instead of a JSON error.
+    if let Value::String(text) = scripted.body {
+        headers.insert("content-type", HeaderValue::from_static("text/html"));
+        return (status, headers, text).into_response();
+    }
     (status, headers, Json(scripted.body)).into_response()
 }
 

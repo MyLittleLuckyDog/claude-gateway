@@ -635,3 +635,71 @@ async fn overflow_errors_that_cannot_be_fixed_by_lowering_max_tokens_pass_throug
         assert_eq!(up.request_count(), 1, "{label}: must not retry");
     }
 }
+
+fn raw_error(status: u16, text: &str) -> common::Scripted {
+    common::Scripted {
+        status,
+        // "retry-after: 0" keeps the gateway's overload retries instant.
+        headers: vec![("retry-after", "0".to_string())],
+        body: Value::String(text.to_string()),
+    }
+}
+
+/// An error body that is not JSON -- an edge proxy's HTML page, say -- used to
+/// be replaced by `null` (or a generic "Unknown upstream error"), so the caller
+/// could not tell what went wrong. The text is kept, whole, as the message of
+/// an ordinary error envelope.
+#[tokio::test]
+async fn a_non_json_upstream_error_keeps_what_it_said() {
+    let html = "<html><body><h1>502 Bad Gateway</h1><p>cloudflare edge: origin unreachable</p></body></html>";
+    let client = reqwest::Client::new();
+
+    for (path, stream) in [("/v1/messages", false), ("/v1/messages/stream", true)] {
+        for status in [400_u16, 401, 502, 529] {
+            let (base, _proxy, up) = start_with_gateway().await;
+            // The synchronous path retries an overloaded (529) answer three
+            // times before giving up, so it needs four of them in a row.
+            let times = if status == 529 && !stream { 4 } else { 1 };
+            for _ in 0..times {
+                up.push(raw_error(status, html));
+            }
+            let mut body = messages_body();
+            if stream {
+                body["stream"] = json!(true);
+            }
+            let resp = client
+                .post(format!("{base}{path}"))
+                .json(&body)
+                .send()
+                .await
+                .expect("request");
+
+            assert_eq!(resp.status().as_u16(), status, "{path}");
+            let body: Value = resp.json().await.expect("an error envelope, not null");
+            assert_eq!(body["type"], "error", "{path} {status}: {body}");
+            assert_eq!(body["error"]["message"], html, "{path} {status}: {body}");
+        }
+    }
+}
+
+/// An empty error body says so, rather than turning into `null`.
+#[tokio::test]
+async fn an_empty_upstream_error_body_is_reported_as_such() {
+    let (base, _proxy, up) = start_with_gateway().await;
+    up.push(raw_error(502, ""));
+
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&messages_body())
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(resp.status(), 502);
+    let body: Value = resp.json().await.expect("an error envelope, not null");
+    let message = body["error"]["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("502") && message.contains("empty"),
+        "{body}"
+    );
+}
