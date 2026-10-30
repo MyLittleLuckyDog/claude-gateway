@@ -462,3 +462,71 @@ async fn upstream_sees_the_current_client_identity() {
         "{first_system}"
     );
 }
+
+/// `GET /v1/models` and `GET /v1/models/{id}` (optional in the protocol, and
+/// what the SDKs' `models.list()` / `models.retrieve()` call) are answered by
+/// upstream, query string included.
+#[tokio::test]
+async fn models_endpoints_are_answered_by_upstream() {
+    let (base, _proxy, up) = start_with_gateway().await;
+    let client = reqwest::Client::new();
+
+    let list: Value = client
+        .get(format!("{base}/v1/models?limit=5"))
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(list["data"][0]["id"], "claude-sonnet-5-5", "{list}");
+
+    let one: Value = client
+        .get(format!("{base}/v1/models/claude-opus-4-6"))
+        .send()
+        .await
+        .expect("retrieve")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(one["id"], "claude-opus-4-6", "{one}");
+    assert_eq!(one["max_input_tokens"], 1_000_000);
+
+    assert_eq!(
+        *up.get_requests.lock().expect("lock"),
+        ["/v1/models?limit=5", "/v1/models/claude-opus-4-6"]
+    );
+}
+
+/// The id ends up in the upstream URL, so anything that is not a model id is
+/// refused before a request is made.
+#[tokio::test]
+async fn model_ids_that_are_not_ids_never_reach_upstream() {
+    let (base, _proxy, up) = start_with_gateway().await;
+    let client = reqwest::Client::new();
+
+    for bad in ["..%2F..%2Foauth%2Ftoken", "a%3Fb%3Dc", "a%23b", "a%20b"] {
+        let resp = client
+            .get(format!("{base}/v1/models/{bad}"))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(resp.status(), 400, "{bad}");
+        let body: Value = resp.json().await.expect("json");
+        assert_eq!(body["type"], "error", "{bad}: {body}");
+    }
+    assert!(up.get_requests.lock().expect("lock").is_empty());
+}
+
+/// Without the direct API proxy there is no model list to give: `404`, which
+/// the protocol defines as "use your built-in list".
+#[tokio::test]
+async fn models_answer_404_when_the_proxy_is_disabled() {
+    let base = common::start_gateway_without_proxy().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), 404);
+}

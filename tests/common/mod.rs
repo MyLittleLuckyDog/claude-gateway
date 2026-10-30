@@ -7,10 +7,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
-    extract::State,
+    extract::{Path, RawQuery, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use claude_agent::api::{build_router, AppState, Stats};
@@ -78,6 +78,8 @@ pub struct Upstream {
     pub requests: Mutex<Vec<Value>>,
     /// The headers of each request, in the same order as `requests`.
     pub request_headers: Mutex<Vec<HeaderMap>>,
+    /// Path and query of every `GET` the stub served.
+    pub get_requests: Mutex<Vec<String>>,
     /// Scripted responses, consumed front to back; empty → a normal reply.
     pub script: Mutex<VecDeque<Scripted>>,
 }
@@ -209,6 +211,35 @@ async fn count_tokens_handler(
     Json(json!({"input_tokens": 42}))
 }
 
+fn model_json(id: &str) -> Value {
+    json!({"type": "model", "id": id, "display_name": format!("Model {id}"),
+           "created_at": "2026-01-01T00:00:00Z",
+           "max_input_tokens": 1_000_000, "max_tokens": 128_000})
+}
+
+async fn models_list_handler(
+    State(up): State<Arc<Upstream>>,
+    RawQuery(query): RawQuery,
+) -> Json<Value> {
+    let path = match query {
+        Some(q) => format!("/v1/models?{q}"),
+        None => "/v1/models".to_string(),
+    };
+    up.get_requests.lock().expect("lock").push(path);
+    Json(
+        json!({"data": [model_json("claude-sonnet-5-5")], "has_more": false,
+                "first_id": "claude-sonnet-5-5", "last_id": "claude-sonnet-5-5"}),
+    )
+}
+
+async fn model_get_handler(State(up): State<Arc<Upstream>>, Path(id): Path<String>) -> Json<Value> {
+    up.get_requests
+        .lock()
+        .expect("lock")
+        .push(format!("/v1/models/{id}"));
+    Json(model_json(&id))
+}
+
 /// Start the stub on an ephemeral port and a proxy pointed at it.
 pub async fn start() -> (Arc<ProxyState>, Arc<Upstream>) {
     init_env();
@@ -216,6 +247,8 @@ pub async fn start() -> (Arc<ProxyState>, Arc<Upstream>) {
     let app = Router::new()
         .route("/v1/messages", post(upstream_handler))
         .route("/v1/messages/count_tokens", post(count_tokens_handler))
+        .route("/v1/models", get(models_list_handler))
+        .route("/v1/models/:id", get(model_get_handler))
         .with_state(up.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

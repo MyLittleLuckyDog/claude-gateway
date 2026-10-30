@@ -281,6 +281,7 @@ Claude Code CLI가 포함한 "gateway protocol" 문서의 요구를 따릅니다
 | 오류 | `{"type":"error","error":{"type","message"}}` 형식입니다(`error.type` 값은 기존 그대로). |
 | 429 | `Retry-After`(초)와 `x-should-retry: false`를 붙입니다. 업스트림이 거절한 요청과, 그 뒤 게이트웨이가 직접 거절하는 요청 모두 해당합니다. 거절은 업스트림이 알려 준 리셋 시각까지, 알려 주지 않으면 60초간 유지됩니다. |
 | `POST /v1/messages/count_tokens` | 업스트림이 센 `{"input_tokens": N}`을 돌려줍니다(무료). 모델 별칭과 `anthropic-beta` 헤더는 `/v1/messages`와 같이 처리하고, 센 쪽이 받는 필드(`model, messages, system, tools, tool_choice, thinking, mcp_servers, context_management`)만 보냅니다. 게이트웨이가 요청에 붙이는 billing 마커는 서버도 과금하지 않으므로 세지 않습니다. 프록시가 꺼져 있거나 Claude 모델이 아니면 `501 not_supported` + `x-should-retry: false`로 답해 클라이언트가 직접 세게 합니다. |
+| `GET /v1/models`, `GET /v1/models/{id}` | 업스트림이 이 계정에 제공하는 모델 목록과 한도(`max_input_tokens`, `max_tokens`)를 그대로 돌려줍니다(SDK의 `models.list()` / `models.retrieve()`). 목록의 쿼리는 `limit`, `before_id`, `after_id`만 전달하고, `{id}`는 모델 id 문자(영문·숫자·`.` `_` `-` `:`)만 허용합니다. 프록시가 꺼져 있으면 `404`(클라이언트가 내장 목록을 쓰라는 신호)입니다. |
 
 #### Proxy 세션 (멀티턴)
 

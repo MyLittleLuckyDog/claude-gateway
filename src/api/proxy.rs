@@ -5,11 +5,12 @@
 //!                             `stream: true` is served as SSE, as the SDKs expect
 //!   POST /v1/messages/stream — SSE streaming (passthrough)
 //!   POST /v1/messages/count_tokens — counted upstream (501 where it cannot be)
+//!   GET  /v1/models[/:id]   — model list / limits from upstream (404 without the proxy)
 //!   GET  /v1/rate_limit     — current rate limit status
 
 use std::sync::atomic::Ordering;
 
-use axum::extract::State;
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -88,6 +89,8 @@ pub fn routes() -> Router<AppState> {
         .route("/v1/messages", post(messages_handler))
         .route("/v1/messages/stream", post(messages_stream_handler))
         .route("/v1/messages/count_tokens", post(count_tokens_handler))
+        .route("/v1/models", get(models_list_handler))
+        .route("/v1/models/:id", get(model_get_handler))
         .route("/v1/rate_limit", get(rate_limit_handler))
         .route("/v1/proxy_stats", get(proxy_stats_handler))
         .route("/v1/auth_status", get(auth_status_handler))
@@ -446,6 +449,70 @@ async fn count_tokens_handler(
     }
 }
 
+/// Characters a model id may contain. The id becomes part of the upstream URL,
+/// so anything else (`/`, `?`, `#`, spaces, `..`) is refused outright.
+fn is_model_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
+        && !id.contains("..")
+}
+
+/// The pagination parameters of the models list, and nothing else.
+fn models_query(raw: Option<&str>) -> Option<String> {
+    let kept: Vec<&str> = raw?
+        .split('&')
+        .filter(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            matches!(key, "limit" | "before_id" | "after_id")
+                && !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b':'))
+        })
+        .collect();
+    (!kept.is_empty()).then(|| kept.join("&"))
+}
+
+/// Answer a models request from upstream; without the direct API proxy there is
+/// nothing to ask, and `404` is the protocol's cue to use the built-in list.
+async fn models_from_upstream(state: &AppState, path_and_query: &str) -> Response {
+    let Some(proxy_state) = state.proxy.as_ref() else {
+        return error_response(
+            404,
+            "not_found_error",
+            "The model list needs the direct API proxy, which is not enabled",
+        );
+    };
+    match proxy::upstream_get(proxy_state, path_and_query).await {
+        Ok((body, upstream_status)) => {
+            let status =
+                StatusCode::from_u16(upstream_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            (status, Json(body)).into_response()
+        }
+        Err(e) => proxy_error_response(e),
+    }
+}
+
+/// GET /v1/models — the models upstream offers this account.
+async fn models_list_handler(State(state): State<AppState>, RawQuery(query): RawQuery) -> Response {
+    let path = match models_query(query.as_deref()) {
+        Some(q) => format!("/v1/models?{q}"),
+        None => "/v1/models".to_string(),
+    };
+    models_from_upstream(&state, &path).await
+}
+
+/// GET /v1/models/:id — one model, with its token limits.
+async fn model_get_handler(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    if !is_model_id(&id) {
+        return error_response(400, "invalid_request_error", "Not a valid model id");
+    }
+    models_from_upstream(&state, &format!("/v1/models/{id}")).await
+}
+
 /// POST /v1/messages/stream — SSE streaming Messages API proxy
 async fn messages_stream_handler(
     State(state): State<AppState>,
@@ -585,5 +652,49 @@ async fn auth_status_handler() -> Response {
             "error": msg,
         }))
         .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_ids_allow_only_id_characters() {
+        for ok in [
+            "claude-sonnet-5-5",
+            "claude-opus-4-6",
+            "claude-haiku-4-5-20251001",
+            "a.b_c:d",
+        ] {
+            assert!(is_model_id(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "a/b",
+            "../x",
+            "a..b",
+            "a?b=c",
+            "a#b",
+            "a b",
+            "a%2Fb",
+            &"x".repeat(129),
+        ] {
+            assert!(!is_model_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn models_query_forwards_only_pagination() {
+        assert_eq!(models_query(None), None);
+        assert_eq!(models_query(Some("")), None);
+        assert_eq!(
+            models_query(Some("limit=5&evil=1&after_id=model-1")).as_deref(),
+            Some("limit=5&after_id=model-1")
+        );
+        // Empty or non-id values are dropped, so nothing can be smuggled in.
+        assert_eq!(models_query(Some("limit=")), None);
+        assert_eq!(models_query(Some("limit=5%26x%3D1")), None);
+        assert_eq!(models_query(Some("before_id=a/b")), None);
     }
 }
