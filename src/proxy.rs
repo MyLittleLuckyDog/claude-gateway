@@ -166,6 +166,10 @@ impl RateLimitStatus {
 /// Proxy-level concurrency, stats, and rate limit tracking
 pub struct ProxyState {
     pub client: reqwest::Client,
+    /// Upstream API origin. `ANTHROPIC_API_BASE` in production; tests point it
+    /// at a local stub so the outgoing request can be inspected without
+    /// calling the real API.
+    pub base_url: String,
     /// Serialize concurrent requests (conservative: 1 at a time)
     pub semaphore: Semaphore,
     pub total_requests: AtomicU64,
@@ -190,6 +194,10 @@ pub struct ProxyState {
 
 impl ProxyState {
     pub fn new(max_concurrent: usize) -> Self {
+        Self::with_base_url(max_concurrent, ANTHROPIC_API_BASE)
+    }
+
+    pub fn with_base_url(max_concurrent: usize, base_url: impl Into<String>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(600))
             .build()
@@ -197,6 +205,7 @@ impl ProxyState {
 
         Self {
             client,
+            base_url: base_url.into().trim_end_matches('/').to_string(),
             semaphore: Semaphore::new(max_concurrent),
             total_requests: AtomicU64::new(0),
             total_input_tokens: AtomicU64::new(0),
@@ -557,7 +566,7 @@ pub async fn check_quota_at_startup(state: &Arc<ProxyState>) {
     // `client.beta.messages.create()` endpoint). Without `?beta=true` the
     // request is routed to the legacy Messages handler that rejects
     // non-Haiku OAuth traffic with 429 `{message:"Error"}`.
-    let url = format!("{ANTHROPIC_API_BASE}/v1/messages?beta=true");
+    let url = format!("{}/v1/messages?beta=true", state.base_url);
     let mut body = serde_json::json!({
         "model": models::HAIKU_4_5.id,
         "max_tokens": 1,
@@ -720,7 +729,7 @@ pub async fn messages_sync(
     // `client.beta.messages.create()` endpoint). Without `?beta=true` the
     // request is routed to the legacy Messages handler that rejects
     // non-Haiku OAuth traffic with 429 `{message:"Error"}`.
-    let url = format!("{ANTHROPIC_API_BASE}/v1/messages?beta=true");
+    let url = format!("{}/v1/messages?beta=true", state.base_url);
 
     // Measurement, not inference: log the actual outgoing request shape so a
     // long-context rejection can be matched to the request that caused it.
@@ -1041,7 +1050,7 @@ pub async fn messages_stream(
 
     state.total_requests.fetch_add(1, Ordering::Relaxed);
 
-    let url = format!("{ANTHROPIC_API_BASE}/v1/messages?beta=true");
+    let url = format!("{}/v1/messages?beta=true", state.base_url);
     let mut attempted_recovery = false;
     loop {
         let headers = build_headers(&token.access_token, extra_betas, model_in_body.as_deref())
