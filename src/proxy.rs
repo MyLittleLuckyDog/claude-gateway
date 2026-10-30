@@ -623,6 +623,66 @@ fn parse_retry_after_value(val: &str, now: chrono::DateTime<chrono::Utc>) -> Opt
     Some(ms.max(0) as u64)
 }
 
+// ── Startup ────────────────────────────────────────────────────────
+
+/// The direct API proxy as the server starts it.
+pub struct ProxyStartup {
+    /// The running proxy, or `None` when it cannot or should not run.
+    pub state: Option<Arc<ProxyState>>,
+    /// Why `state` is `None`; shown in the 501 the proxy routes then answer.
+    pub unavailable: Option<String>,
+}
+
+/// Start the direct API proxy, or work out why it cannot run.
+///
+/// With the proxy enabled and a usable OAuth token it builds the state and runs
+/// the startup quota check, which fills the rate-limit cache and logs a warning
+/// when a window is nearly used up. `base_url` points it somewhere other than
+/// the real API (for tests); `None` is production.
+///
+/// This lives here, rather than in `main`, so the order of those steps can be
+/// tested: a change to the surrounding code once dropped the quota check without
+/// any test noticing.
+pub async fn start(enabled: bool, max_concurrent: usize, base_url: Option<&str>) -> ProxyStartup {
+    if !enabled {
+        tracing::info!("Direct API proxy disabled by config");
+        return ProxyStartup {
+            state: None,
+            unavailable: Some(
+                "it is turned off in the configuration (proxy.enabled = false)".to_string(),
+            ),
+        };
+    }
+    match auth::get_oauth_token() {
+        Ok(token) => {
+            tracing::info!(
+                "OAuth token loaded (subscription: {:?}, tier: {:?})",
+                token.subscription_type,
+                token.rate_limit_tier
+            );
+            let state = Arc::new(match base_url {
+                Some(url) => ProxyState::with_base_url(max_concurrent, url),
+                None => ProxyState::new(max_concurrent),
+            });
+            check_quota_at_startup(&state).await;
+            ProxyStartup {
+                state: Some(state),
+                unavailable: None,
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Direct API proxy disabled: {}", e);
+            ProxyStartup {
+                state: None,
+                unavailable: Some(format!(
+                    "no usable Claude OAuth credentials at startup ({e}); \
+                     fix them and restart the gateway"
+                )),
+            }
+        }
+    }
+}
+
 // ── Quota Pre-check ────────────────────────────────────────────────
 
 /// Lightweight quota check at startup — sends a minimal request (max_tokens=1)

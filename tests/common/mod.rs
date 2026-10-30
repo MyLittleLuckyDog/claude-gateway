@@ -287,8 +287,8 @@ async fn model_get_handler(State(up): State<Arc<Upstream>>, Path(id): Path<Strin
     Json(model_json(&id))
 }
 
-/// Start the stub on an ephemeral port and a proxy pointed at it.
-pub async fn start() -> (Arc<ProxyState>, Arc<Upstream>) {
+/// Start just the upstream stub on an ephemeral port; returns its base URL.
+pub async fn start_stub() -> (String, Arc<Upstream>) {
     init_env();
     let up = Arc::new(Upstream::default());
     let app = Router::new()
@@ -304,7 +304,13 @@ pub async fn start() -> (Arc<ProxyState>, Arc<Upstream>) {
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    let state = Arc::new(ProxyState::with_base_url(4, format!("http://{addr}")));
+    (format!("http://{addr}"), up)
+}
+
+/// Start the stub on an ephemeral port and a proxy pointed at it.
+pub async fn start() -> (Arc<ProxyState>, Arc<Upstream>) {
+    let (base, up) = start_stub().await;
+    let state = Arc::new(ProxyState::with_base_url(4, base));
     (state, up)
 }
 

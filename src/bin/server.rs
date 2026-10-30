@@ -105,41 +105,13 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Initialize direct API proxy. When it cannot start, the reason is kept so
-    // that the 501 every proxy route then answers can say why, not just "not
-    // enabled".
-    let (proxy, proxy_unavailable) = if config.proxy.enabled {
-        match claude_agent::auth::get_oauth_token() {
-            Ok(token) => {
-                tracing::info!(
-                    "OAuth token loaded (subscription: {:?}, tier: {:?})",
-                    token.subscription_type,
-                    token.rate_limit_tier
-                );
-                (
-                    Some(Arc::new(claude_agent::proxy::ProxyState::new(
-                        config.proxy.max_concurrent,
-                    ))),
-                    None,
-                )
-            }
-            Err(e) => {
-                tracing::warn!("Direct API proxy disabled: {}", e);
-                (
-                    None,
-                    Some(format!(
-                        "no usable Claude OAuth credentials at startup ({e}); fix them and restart the gateway"
-                    )),
-                )
-            }
-        }
-    } else {
-        tracing::info!("Direct API proxy disabled by config");
-        (
-            None,
-            Some("it is turned off in the configuration (proxy.enabled = false)".to_string()),
-        )
-    };
+    // Initialize direct API proxy (and run its startup quota check). When it
+    // cannot start, the reason is kept so that the 501 every proxy route then
+    // answers can say why.
+    let claude_agent::proxy::ProxyStartup {
+        state: proxy,
+        unavailable: proxy_unavailable,
+    } = claude_agent::proxy::start(config.proxy.enabled, config.proxy.max_concurrent, None).await;
 
     let proxy_sessions = proxy.as_ref().map(|_| {
         Arc::new(claude_agent::proxy_session::ProxySessionStore::new(
